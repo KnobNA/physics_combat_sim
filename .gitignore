@@ -1,0 +1,58 @@
+# Build trees
+/build/
+/out/
+/install/
+/cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+CMakeUserPresets.json
+compile_commands.json
+Makefile
+
+# Compilers / linkers
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.idb
+*.pch
+*.gch
+
+# IDEs
+.vs/
+.idea/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.VC.db
+*.VC.opendb
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# Logs and caches
+*.log
+.cache/
+.clangd/
+.cache/clangd/

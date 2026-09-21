@@ -1,0 +1,15 @@
+[submodule "external/chrono"]
+	path = external/chrono
+	url = https://github.com/projectchrono/chrono.git
+[submodule "external/magnum"]
+	path = external/magnum
+	url = https://github.com/mosra/magnum.git
+[submodule "external/corrade"]
+	path = external/corrade
+	url = https://github.com/mosra/corrade.git
+[submodule "external/magnum-plugins"]
+	path = external/magnum-plugins
+	url = https://github.com/mosra/magnum-plugins.git
+[submodule "external/assimp"]
+	path = external/assimp
+	url = https://github.com/assimp/assimp.git
