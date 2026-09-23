@@ -1,4 +1,5 @@
 #include "editor/ui.hpp"
+#include "physics_core/material.hpp"
 
 #include <Magnum/Math/Color.h>
 #include <imgui.h>
@@ -28,6 +29,13 @@ bool scalarControl(const char* label, double& value, float speed, float low, flo
         return false;
     value = temp;
     return true;
+}
+
+const char* presetName(void* data, int index) {
+    const auto* list = static_cast<const std::vector<Material>*>(data);
+    if (!list || index < 0 || index >= static_cast<int>(list->size()))
+        return "";
+    return (*list)[static_cast<std::size_t>(index)].name.c_str();
 }
 
 std::string formatStress(float pascals) {
@@ -91,6 +99,69 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
         ImGui::EndListBox();
     }
 
+    if (state.selectedPart && context.definition &&
+        *state.selectedPart < context.definition->parts.size()) {
+        PartDefinition& part = context.definition->parts[*state.selectedPart];
+        const auto presets = materialPresets();
+        int preset = presetIndex(part.material);
+        if (ImGui::Combo("Material##preset", &preset, presetName,
+                         const_cast<std::vector<Material>*>(&presets),
+                         static_cast<int>(presets.size()))) {
+            part.material = presets[static_cast<std::size_t>(preset)];
+            state.rebuildRequested = true;
+        }
+        Material& material = part.material;
+        bool edited = false;
+        int mode = static_cast<int>(material.fracture);
+        const char* modes[] = {"Ductile", "Brittle", "Compliant"};
+        if (ImGui::Combo("Fracture", &mode, modes, 3)) {
+            material.fracture = static_cast<FractureMode>(mode);
+            edited = true;
+        }
+        edited |= ImGui::Checkbox("Dice on first crack", &material.shatterToDust);
+
+        if (ImGui::TreeNode("Elastic")) {
+            edited |= scalarControl("Density (kg/m3)", material.density, 10.0f, 1.0f, 2.0e4f, "%.0f");
+            edited |= scalarControl("Young's modulus", material.youngsModulus, 1.0e8f, 1.0e5f, 1.0e12f, "%.4g");
+            edited |= scalarControl("Poisson", material.poissonRatio, 0.005f, 0.0f, 0.49f, "%.3f");
+            edited |= scalarControl("Rayleigh beta", material.dampingBeta, 1.0e-5f, 0.0f, 0.05f, "%.5f");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Failure")) {
+            edited |= scalarControl("Yield (Pa)", material.yieldStress, 1.0e6f, 0.0f, 5.0e9f, "%.4g");
+            edited |= scalarControl("Ultimate (Pa)", material.ultimateStress, 1.0e6f, 0.0f, 5.0e9f, "%.4g");
+            edited |= scalarControl("Weld shear (Pa)", material.weldShearStrength, 1.0e6f, 0.0f, 5.0e9f, "%.4g");
+            edited |= scalarControl("Tear stretch", material.tearStretch, 0.01f, 1.0f, 8.0f, "%.3f");
+            edited |= scalarControl("Plastic fail", material.failPlasticStrain, 0.005f, 0.0f, 2.0f, "%.3f");
+            edited |= scalarControl("Fracture strength", material.fractureStrength, 1.0e6f, 0.0f, 5.0e9f, "%.4g");
+            edited |= scalarControl("Toughness Kic", material.fractureToughness, 1.0e4f, 0.0f, 1.0e8f, "%.4g");
+            edited |= scalarControl("Min shard (m)", material.minimumShardSize, 0.001f, 0.005f, 0.25f, "%.3f");
+            ImGui::TextDisabled("Pieces smaller than this become rigid bodies.");
+            ImGui::TreePop();
+        }
+        if (ImGui::TreeNode("Thermal")) {
+            edited |= scalarControl("Expansion (1/K)", material.thermalExpansion, 1.0e-7f, 0.0f, 5.0e-4f, "%.3g");
+            edited |= scalarControl("Specific heat", material.specificHeat, 5.0f, 0.0f, 5000.0f, "%.0f");
+            edited |= scalarControl("Conductivity", material.conductivity, 0.5f, 0.0f, 500.0f, "%.2f");
+            ImGui::TextDisabled("Temperature stays at the reference until heat is simulated.");
+            ImGui::TreePop();
+        }
+        if (edited) {
+            material.allowPlasticity =
+                material.fracture == FractureMode::Ductile && material.yieldStress > 0.0;
+            state.rebuildRequested = true;
+        }
+        ImGui::TextDisabled("Contact stiffness and floor restitution are under Scenario.");
+        if (context.frame && *state.selectedPart < context.frame->parts.size()) {
+            const auto& strains = context.frame->parts[*state.selectedPart].plasticStrain;
+            float peak = 0.0f;
+            for (float value : strains)
+                peak = std::max(peak, value);
+            if (peak > 0.0f)
+                ImGui::Text("Plastic strain %.4f", peak);
+        }
+    }
+
     if (ImGui::TreeNode("Joints")) {
         for (std::size_t i = 0; i < context.layout->joints.size(); ++i) {
             const JointLayout& joint = context.layout->joints[i];
@@ -111,11 +182,15 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
         ImGui::TreePop();
     }
 
-    ImGui::BeginDisabled(true);
-    ImGui::Button("Import CAD...", {-1.0f, 0.0f});
+    char path[512] = {};
+    std::snprintf(path, sizeof(path), "%s", state.importPath.c_str());
+    if (ImGui::InputText("OBJ / STL", path, sizeof(path)))
+        state.importPath = path;
+    ImGui::BeginDisabled(state.importPath.empty() || context.simulating);
+    if (ImGui::Button("Import surface", {-1.0f, 0.0f}))
+        state.importRequested = true;
     ImGui::EndDisabled();
-    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-        ImGui::SetTooltip("Not wired up yet: one part per body, one screw per fastener.");
+    ImGui::TextDisabled("One part per object. Welds stay manual. Solids are skipped.");
 }
 
 void drawScenarioPanel(EditorState& state) {
@@ -125,7 +200,7 @@ void drawScenarioPanel(EditorState& state) {
     SimulationSettings& settings = state.scenario.settings;
     bool dirty = false;
 
-    scalarControl("Duration (s)", settings.duration, 0.05f, 0.05f, 60.0f, "%.2f");
+    scalarControl("Duration (s)##run", settings.duration, 0.05f, 0.05f, 60.0f, "%.2f");
     scalarControl("Timestep (s)", settings.timestep, 1.0e-5f, 1.0e-5f, 1.0e-2f, "%.5f");
     scalarControl("Capture (fps)", settings.captureRate, 1.0f, 10.0f, 1000.0f, "%.0f");
     ImGui::TextDisabled("%.0f steps, %.0f frames",
@@ -222,7 +297,7 @@ void drawLoadsPanel(EditorState& state, const UiContext& context) {
     scalarControl("Force (N)", load.force, 50.0f, 0.0f, 1.0e7f, "%.0f");
     scalarControl("Patch radius (m)", load.radius, 0.002f, 0.001f, 1.0f, "%.3f");
     scalarControl("Start (s)", load.startTime, 0.005f, 0.0f, 60.0f, "%.3f");
-    scalarControl("Duration (s)", load.duration, 0.001f, 0.0001f, 10.0f, "%.4f");
+    scalarControl("Duration (s)##load", load.duration, 0.001f, 0.0001f, 10.0f, "%.4f");
     ImGui::TextDisabled("Impulse %.1f N*s", load.force * load.duration);
 
     if (std::size_t(state.selectedLoad) < context.loadAdvice.size()) {
@@ -255,6 +330,10 @@ void drawRunPanel(EditorState& state, const UiContext& context) {
 
     if (!state.status.empty())
         ImGui::TextWrapped("%s", state.status.c_str());
+
+    scalarControl("Tolerance", state.scenario.settings.solverTolerance, 1.0e-5f, 1.0e-12f, 1.0e6f,
+                  "%.4g");
+    ImGui::TextDisabled("Looser lets a very large load finish instead of aborting the step.");
 }
 
 void drawPlaybackWindow(EditorState& state, const UiContext& context) {
@@ -317,7 +396,7 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
 
     ImGui::SeparatorText("View");
     int shade = state.shade == ShadeMode::Stress ? 1 : 0;
-    if (ImGui::RadioButton("Material", shade == 0))
+    if (ImGui::RadioButton("Material##shade", shade == 0))
         state.shade = ShadeMode::Material;
     ImGui::SameLine();
     if (ImGui::RadioButton("Stress", shade == 1))

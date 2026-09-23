@@ -137,24 +137,29 @@ void SceneRenderer::update(const RecordingLayout& layout,
         Vector3 lo{std::numeric_limits<float>::max()};
         Vector3 hi{std::numeric_limits<float>::lowest()};
 
-        for (std::size_t q = 0; q < partLayout.quads.size(); ++q) {
-            const auto& quad = partLayout.quads[q];
-            if (quad[0] >= int(partFrame.positions.size()) ||
-                quad[1] >= int(partFrame.positions.size()) ||
-                quad[2] >= int(partFrame.positions.size()) ||
-                quad[3] >= int(partFrame.positions.size()))
-                continue;
+        const auto& quads = partFrame.quads.empty() ? partLayout.quads : partFrame.quads;
+        const auto& triangles = partFrame.triangles.empty() ? partLayout.triangles : partFrame.triangles;
+        const std::size_t nodes = partFrame.nodeCount();
 
-            const Vector3 a = toMagnum(partFrame.positions[quad[0]]);
-            const Vector3 b = toMagnum(partFrame.positions[quad[1]]);
-            const Vector3 c = toMagnum(partFrame.positions[quad[2]]);
-            const Vector3 d = toMagnum(partFrame.positions[quad[3]]);
+        auto drawQuad = [&](int i0, int i1, int i2, int i3, std::size_t colorIndex) {
+            if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0)
+                return;
+            if (static_cast<std::size_t>(i0) >= nodes || static_cast<std::size_t>(i1) >= nodes ||
+                static_cast<std::size_t>(i2) >= nodes || static_cast<std::size_t>(i3) >= nodes)
+                return;
+            const Vector3 a = toMagnum(partFrame.position(static_cast<std::size_t>(i0)));
+            const Vector3 b = toMagnum(partFrame.position(static_cast<std::size_t>(i1)));
+            const Vector3 c = toMagnum(partFrame.position(static_cast<std::size_t>(i2)));
+            const Vector3 d = toMagnum(partFrame.position(static_cast<std::size_t>(i3)));
 
             Color3 color = selected ? 0xd4af37_rgbf : 0xb0b7be_rgbf;
-            if (mode == ShadeMode::Stress && q < partFrame.stress.size()) {
-                color = stressColor(partFrame.stress[q] / scale);
+            if (mode == ShadeMode::Stress && colorIndex < partFrame.stress.size()) {
+                color = stressColor(partFrame.stress[colorIndex] / scale);
                 if (selected)
                     color = Math::lerp(color, 0xffffff_rgbf, 0.25f);
+            } else if (mode == ShadeMode::Stress && colorIndex < partFrame.plasticStrain.size() &&
+                       partFrame.plasticStrain[colorIndex] > 0.0f) {
+                color = Math::lerp(color, 0x8d6e63_rgbf, 0.35f);
             }
 
             appendPlateBox(vertices, a, b, c, d, partLayout.thickness * 0.5f, color);
@@ -162,6 +167,14 @@ void SceneRenderer::update(const RecordingLayout& layout,
                 lo = Math::min(lo, p);
                 hi = Math::max(hi, p);
             }
+        };
+
+        if (!quads.empty()) {
+            for (std::size_t q = 0; q < quads.size(); ++q)
+                drawQuad(quads[q][0], quads[q][1], quads[q][2], quads[q][3], q);
+        } else {
+            for (std::size_t t = 0; t < triangles.size(); ++t)
+                drawQuad(triangles[t][0], triangles[t][1], triangles[t][2], triangles[t][2], t);
         }
 
         PartMesh& gpu = *_parts[i];

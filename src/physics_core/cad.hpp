@@ -20,8 +20,9 @@ struct TestCubeOptions {
 /// every edge is an explicit manual weld, exactly as a CAD import would produce.
 AssemblyDefinition makeTestCube(const TestCubeOptions& options = {});
 
-/// Load an assembly from a CAD file, one part per solid body in the file.
-/// Not implemented yet; returns false and fills `error`.
+/// Load an OBJ or STL surface. One part per object. Coincident circular holes
+/// become screws. Watertight chunky solids are skipped and named in `error`.
+/// Welds are not inferred.
 bool importAssembly(const std::string& path, AssemblyDefinition& out, std::string& error);
 
 }  // namespace rcs

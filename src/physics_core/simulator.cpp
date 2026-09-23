@@ -65,6 +65,15 @@ void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scen
     _assembly.build(_system, definition);
     _assembly.place(scenario.initial);
     _assembly.bindLoads(scenario.loads);
+
+    // Relative tolerance, plus the two absolute ones kept in the same ratio as
+    // the constructor defaults (states 100x tighter, multipliers equal).
+    if (auto hht = std::dynamic_pointer_cast<chrono::ChTimestepperHHT>(_system.GetTimestepper())) {
+        const double tol = std::max(scenario.settings.solverTolerance, 1.0e-12);
+        hht->SetRelTolerance(tol);
+        hht->SetAbsTolerances(tol * 1.0e-2, tol);
+    }
+
     _system.Setup();
     _system.Update(chrono::UpdateFlags::UPDATE_ALL);
     refreshLinearSolver();
@@ -81,8 +90,18 @@ bool Simulator::step(double dt, double time, const Environment& environment,
         // Newton solve still will not converge. That is a diverged run.
         return false;
     }
-    if (_assembly.updateJoints(dt))
+    _assembly.integrateShards(dt, environment);
+    const bool joints = _assembly.updateJoints(dt);
+    const bool torn = _assembly.tearOverstretched();
+    const bool spanned = (joints || torn) && _assembly.respan();
+    if (joints || torn || spanned) {
+        // New nodes change the coordinate count. Constraint-only edits (a weld
+        // breaking) already reanalyse from ForceUpdate, which is what the
+        // weak-weld run depends on.
+        if (torn)
+            _system.Setup();
         refreshLinearSolver();
+    }
     return _assembly.finite();
 }
 

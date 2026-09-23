@@ -227,6 +227,22 @@ void CombatApp::handleEditorRequests() {
         _job.cancel();
     }
 
+    if (_editor.importRequested) {
+        _editor.importRequested = false;
+        if (editingAllowed()) {
+            AssemblyDefinition loaded;
+            std::string error;
+            if (importAssembly(_editor.importPath, loaded, error)) {
+                _definition = std::move(loaded);
+                _editor.selectedPart.reset();
+                rebuildPreview();
+                _editor.status = error.empty() ? "Imported " + _definition.name : error;
+            } else {
+                _editor.status = error.empty() ? "Import failed." : error;
+            }
+        }
+    }
+
     if (_editor.simulateRequested) {
         _editor.simulateRequested = false;
         if (editingAllowed())

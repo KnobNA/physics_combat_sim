@@ -38,13 +38,16 @@ struct EditorState {
     bool rebuildRequested = false;
     bool addLoadRequested = false;
     int removeLoadIndex = -1;
+    bool importRequested = false;
+    std::string importPath;
 
     std::string status;
 };
 
-/// Read-only view of everything the panels display.
+/// View of everything the panels display. The assembly definition is mutable
+/// so a selected part's material can be edited in place.
 struct UiContext {
-    const AssemblyDefinition* definition = nullptr;
+    AssemblyDefinition* definition = nullptr;
     const RecordingLayout* layout = nullptr;
     const Recording* recording = nullptr;
     const Frame* frame = nullptr;

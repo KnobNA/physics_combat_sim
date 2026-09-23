@@ -52,9 +52,19 @@ public:
                     double time,
                     double dt);
 
+    /// Move rigid shards outside the shell solve, then sit them on the floor.
+    void integrateShards(double dt, const Environment& environment);
+
     /// Update joint reactions and fail overloaded links.
     /// Returns true when the constraint topology changed.
     bool updateJoints(double dt);
+
+    /// Detach shell elements past the material's tear limit. True if nodes were added.
+    bool tearOverstretched();
+
+    /// Promote a weld that was skipped as redundant, once a tree link has broken.
+    /// True when a new constraint was added.
+    bool respan();
 
     void writeLayout(RecordingLayout& layout) const;
     void writeFrame(Frame& frame) const;
@@ -87,6 +97,18 @@ private:
                     const ScrewDefinition& definition,
                     std::vector<int>& translationSet,
                     std::vector<int>& rotationSet);
+    void reindexNodes();
+    void createLink(chrono::ChSystem& system,
+                    Joint& joint,
+                    std::size_t partA,
+                    std::size_t nodeA,
+                    std::size_t partB,
+                    std::size_t nodeB,
+                    double breakForce,
+                    double breakTorque,
+                    bool wantRotationLock,
+                    bool lockRotation);
+
     void addLink(chrono::ChSystem& system,
                  Joint& joint,
                  std::size_t partA,
@@ -102,6 +124,8 @@ private:
     void applyGravity(const chrono::ChVector3d& gravity);
     void applyAerodynamics(const Environment& environment);
     void applyFloorContact(const Environment& environment, double dt);
+    void applyShardContact(const Environment& environment, double dt);
+    void separateShards();
     void applyPartContact(const Environment& environment, double dt);
     void applyUserLoads(const std::vector<ImpactLoad>& loads, double time);
     void refreshAdjacency();
@@ -110,8 +134,22 @@ private:
         return _nodeOffset[part] + node;
     }
 
+    struct DeferredLink {
+        std::size_t partA = 0;
+        std::size_t nodeA = 0;
+        std::size_t partB = 0;
+        std::size_t nodeB = 0;
+        double breakForce = 0.0;
+        double breakTorque = 0.0;
+        bool wantRotation = false;
+        std::string label;
+        JointKind kind = JointKind::Weld;
+    };
+
     std::vector<Part> _parts;
     std::vector<Joint> _joints;
+    std::vector<DeferredLink> _deferred;
+    chrono::ChSystem* _system = nullptr;
     chrono::ChVector3d _authoredCenter{0, 0, 0};
     chrono::ChQuaterniond _placementRotation{1, 0, 0, 0};
     chrono::ChVector3d _placementPosition{0, 0, 0};
@@ -122,10 +160,17 @@ private:
     /// Per part pair: whether contact between them has been armed. See
     /// applyPartContact for why a pair starts disarmed.
     std::vector<char> _contactArmed;
-    /// Deepest floor penetration of each node during the current contact.
-    /// The rebound spring is scaled from this so concrete does not return the
-    /// energy it just absorbed. Cleared when the node leaves the floor.
+    /// Deepest floor penetration of each node during a real inbound impact.
+    /// Restitution reads it once on the way out. A resting sag does not.
     std::vector<std::vector<double>> _floorPeak;
+    /// 0 resting, 1 a fast inbound impact is in progress.
+    std::vector<std::vector<char>> _floorPhase;
+    /// 1 when the node was clear of the floor on the previous step. An impact
+    /// is latched only on entry, so a resting sag cannot turn the stiff spring
+    /// back on.
+    std::vector<std::vector<char>> _floorClear;
+    /// Last part-pair contact normal, so a closest-point jump cannot kick sideways.
+    std::vector<chrono::ChVector3d> _contactNormal;
     struct LoadTarget {
         std::size_t part = 0;
         std::size_t node = 0;

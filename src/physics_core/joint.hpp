@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chrono/core/ChVector3.h"
+#include "chrono/fea/ChLinkNodeNode.h"
 #include "chrono/physics/ChLinkMate.h"
 
 #include <cstddef>
@@ -45,6 +46,8 @@ enum class JointKind { Weld, Screw };
 /// One constraint inside a joint, with its own failure budget.
 struct JointLink {
     std::shared_ptr<chrono::ChLinkMateGeneric> link;
+    /// Translation-only joint used by triangle shells, which have no rotation.
+    std::shared_ptr<chrono::fea::ChLinkNodeNode> pointLink;
     std::size_t partA = 0;
     std::size_t nodeA = 0;
     std::size_t partB = 0;

@@ -26,7 +26,7 @@ void OrbitCamera::pan(const Vector2& deltaPixels) {
     const Vector3 right = Math::cross(forward, Vector3::yAxis()).normalized();
     const Vector3 up = Math::cross(right, forward).normalized();
     const float scale = _distance * 0.0025f;
-    _target += right * deltaPixels.x() * scale;
+    _target -= right * deltaPixels.x() * scale;
     _target += up * deltaPixels.y() * scale;
 }
 

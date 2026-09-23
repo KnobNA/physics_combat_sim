@@ -70,6 +70,10 @@ struct SimulationSettings {
     /// The loads panel reports the per-step velocity jump it implies.
     double timestep = 5.0e-4;   ///< integrator step, s
     double captureRate = 120.0; ///< playback frames recorded per simulated second
+    /// Newton convergence tolerance. A step that cannot get inside this is
+    /// aborted, which is what stops a very large applied load. Looser values
+    /// accept a less exact step so that load can finish.
+    double solverTolerance = 1.0e-4;
 };
 
 struct Scenario {

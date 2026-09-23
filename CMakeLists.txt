@@ -279,6 +279,7 @@ add_subdirectory(external/magnum-integration EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 set(COMBAT_SIM_PHYSICS_SOURCES
     src/physics_core/part.cpp
+    src/physics_core/reissner_j2.cpp
     src/physics_core/assembly.cpp
     src/physics_core/cad.cpp
     src/physics_core/simulator.cpp
