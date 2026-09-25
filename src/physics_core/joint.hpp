@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chrono/core/ChVector3.h"
+#include "chrono/fea/ChLinkNodeFrame.h"
 #include "chrono/fea/ChLinkNodeNode.h"
 #include "chrono/physics/ChLinkMate.h"
 
@@ -48,6 +49,8 @@ struct JointLink {
     std::shared_ptr<chrono::ChLinkMateGeneric> link;
     /// Translation-only joint used by triangle shells, which have no rotation.
     std::shared_ptr<chrono::fea::ChLinkNodeNode> pointLink;
+    /// Position tie between a shell node (xyzrot) and a solid node (xyz).
+    std::shared_ptr<chrono::fea::ChLinkNodeFrame> frameLink;
     std::size_t partA = 0;
     std::size_t nodeA = 0;
     std::size_t partB = 0;

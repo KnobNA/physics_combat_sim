@@ -2,9 +2,11 @@
 
 #include "chrono/core/ChMatrix33.h"
 #include "chrono/core/ChRotation.h"
+#include "chrono/fea/ChLinkNodeFrame.h"
 
 #include <algorithm>
 #include <cmath>
+#include <fstream>
 #include <limits>
 #include <unordered_map>
 
@@ -159,15 +161,21 @@ void Assembly::build(chrono::ChSystem& system, const AssemblyDefinition& definit
     _nodeOffset.clear();
     _loadTargets.clear();
     _contactArmed.clear();
-    _floorPeak.clear();
+    _contacts.clear();
+    _contactShape.clear();
+    _contactContainer.reset();
+    _contactWorld.reset();
 
     _parts.resize(definition.parts.size());
     std::size_t offset = 0;
     for (std::size_t i = 0; i < definition.parts.size(); ++i) {
-        _parts[i].build(definition.parts[i]);
         _nodeOffset.push_back(offset);
-        offset += _parts[i].nodes().size();
-        system.Add(_parts[i].mesh());
+        if (!definition.parts[i].simulate)
+            continue;
+        _parts[i].build(definition.parts[i]);
+        offset += _parts[i].nodeCount();
+        if (_parts[i].mesh())
+            system.Add(_parts[i].mesh());
     }
 
     // Coincident nodes welded in a loop (three plates meeting at a box corner,
@@ -181,6 +189,7 @@ void Assembly::build(chrono::ChSystem& system, const AssemblyDefinition& definit
         rotationSet[i] = static_cast<int>(i);
     }
 
+    _weldDefs = definition.welds;
     for (const auto& weld : definition.welds)
         buildWeld(system, weld, translationSet, rotationSet);
     for (const auto& screw : definition.screws)
@@ -214,11 +223,24 @@ void Assembly::createLink(chrono::ChSystem& system,
     entry.breakTorque = breakTorque;
     entry.locksRotation = lockRotation;
 
-    if (!_parts[partA].rotational() && !_parts[partB].rotational()) {
+    const bool rotA = _parts[partA].rotational();
+    const bool rotB = _parts[partB].rotational();
+    if (!rotA && !rotB) {
         auto link = chrono_types::make_shared<fea::ChLinkNodeNode>();
         link->Initialize(_parts[partA].xyzNodes()[nodeA], _parts[partB].xyzNodes()[nodeB]);
         system.Add(link);
         entry.pointLink = link;
+        entry.locksRotation = false;
+    } else if (rotA != rotB) {
+        const std::size_t xyzPart = rotA ? partB : partA;
+        const std::size_t xyzNode = rotA ? nodeB : nodeA;
+        const std::size_t framePart = rotA ? partA : partB;
+        const std::size_t frameNode = rotA ? nodeA : nodeB;
+        auto link = chrono_types::make_shared<fea::ChLinkNodeFrame>();
+        link->Initialize(_parts[xyzPart].xyzNodes()[xyzNode],
+                         std::static_pointer_cast<ChBodyFrame>(_parts[framePart].nodes()[frameNode]));
+        system.Add(link);
+        entry.frameLink = link;
         entry.locksRotation = false;
     } else {
         const auto& a = _parts[partA].nodes()[nodeA];
@@ -435,6 +457,15 @@ void Assembly::place(const InitialState& state) {
             } else if (entry.pointLink) {
                 entry.pointLink->Initialize(_parts[entry.partA].xyzNodes()[entry.nodeA],
                                             _parts[entry.partB].xyzNodes()[entry.nodeB]);
+            } else if (entry.frameLink) {
+                const bool rotA = _parts[entry.partA].rotational();
+                const std::size_t xyzPart = rotA ? entry.partB : entry.partA;
+                const std::size_t xyzNode = rotA ? entry.nodeB : entry.nodeA;
+                const std::size_t framePart = rotA ? entry.partA : entry.partB;
+                const std::size_t frameNode = rotA ? entry.nodeA : entry.nodeB;
+                entry.frameLink->Initialize(
+                    _parts[xyzPart].xyzNodes()[xyzNode],
+                    std::static_pointer_cast<ChBodyFrame>(_parts[framePart].nodes()[frameNode]));
             }
         }
     }
@@ -491,7 +522,7 @@ Assembly::LoadAdvisory Assembly::adviseLoad(std::size_t loadIndex,
     if (loadIndex >= loads.size() || loadIndex >= _loadTargets.size())
         return advisory;
 
-    const double total = loads[loadIndex].force;
+    const double total = loadMaxStepChange(loads[loadIndex], dt);
     for (const auto& target : _loadTargets[loadIndex]) {
         const double force = total * target.share;
         const double mass = _parts[target.part].nodeMass()[target.node];
@@ -503,7 +534,23 @@ Assembly::LoadAdvisory Assembly::adviseLoad(std::size_t loadIndex,
     return advisory;
 }
 
-void Assembly::applyLoads(const Environment& environment,
+void Assembly::advanceHeat(double dt, double time, const Environment& environment,
+                           const std::vector<HeatSource>& sources)
+{
+    std::vector<HeatBridge> bridges;
+    for (const auto& joint : _joints) {
+        for (const auto& link : joint.links) {
+            if (link.broken)
+                continue;
+            bridges.push_back({link.partA, link.nodeA, link.partB, link.nodeB});
+        }
+    }
+    for (const auto& link : _deferred)
+        bridges.push_back({link.partA, link.nodeA, link.partB, link.nodeB});
+    _heat.advance(dt, time, _parts, environment, sources, bridges);
+}
+
+bool Assembly::applyLoads(const Environment& environment,
                           const std::vector<ImpactLoad>& loads,
                           double time,
                           double dt)
@@ -514,14 +561,16 @@ void Assembly::applyLoads(const Environment& environment,
     applyGravity(environment.gravity);
     if (environment.aerodynamicsEnabled)
         applyAerodynamics(environment);
-    if (environment.floorEnabled)
-        applyFloorContact(environment, dt);
+    // The floor, the walls and the ceiling are implicit loads. They are only
+    // refreshed here; the integrator evaluates them inside the step.
+    const bool contactsChanged = syncContacts(environment);
     applyPartContact(environment, dt);
     applyShardContact(environment, dt);
     applyUserLoads(loads, time);
 
     for (auto& part : _parts)
         part.commitLoads();
+    return contactsChanged;
 }
 
 void Assembly::applyGravity(const chrono::ChVector3d& gravity) {
@@ -580,9 +629,11 @@ void Assembly::applyShardContact(const Environment& environment, double dt) {
     for (auto& owner : _parts) {
         if (owner.shards().empty())
             continue;
-        const double ownerReach = 0.5 * owner.thickness();
+        const double ownerReach = owner.contactOffset();
         for (auto& shard : owner.shards()) {
-            if (shard.mass <= 0.0)
+            // A chip that has landed is scenery. It keeps its pose, and it
+            // does not push the body it fell off.
+            if (shard.asleep || shard.mass <= 0.0)
                 continue;
             ChVector3d corner[4];
             ChVector3d lo{1.0e9, 1.0e9, 1.0e9};
@@ -597,7 +648,7 @@ void Assembly::applyShardContact(const Environment& environment, double dt) {
                 continue;
             const ChVector3d normal = face.GetNormalized();
             for (auto& other : _parts) {
-                const double reach = ownerReach + 0.5 * other.thickness();
+                const double reach = ownerReach + other.contactOffset();
                 for (std::size_t i = 0; i < other.nodeCount(); ++i) {
                     if (other.nodeRigid(i))
                         continue;
@@ -633,11 +684,6 @@ void Assembly::applyShardContact(const Environment& environment, double dt) {
                     if (fn <= 0.0)
                         continue;
                     other.addLoad(i, outward * fn);
-                    // A sleeping chip is a fixed obstacle unless the shell is
-                    // still arriving hard enough to knock it loose.
-                    if (shard.asleep && vn > -0.2)
-                        continue;
-                    shard.asleep = false;
                     shard.pendingForce -= outward * fn;
                     shard.pendingTorque -= arm.Cross(outward * fn);
                 }
@@ -664,9 +710,9 @@ void Assembly::separateShards() {
         for (std::size_t j = i + 1; j < all.size(); ++j) {
             auto& a = all[i].part->shards()[all[i].index];
             auto& b = all[j].part->shards()[all[j].index];
-            if (a.asleep && b.asleep)
+            if (a.asleep || b.asleep)
                 continue;
-            const double reach = 0.5 * (all[i].part->thickness() + all[j].part->thickness());
+            const double reach = all[i].part->contactOffset() + all[j].part->contactOffset();
             auto push = [&](Part::RigidShard& mover, Part::RigidShard& wall, bool wakeWall) {
                 ChVector3d face[4];
                 for (int k = 0; k < 4; ++k)
@@ -709,103 +755,141 @@ void Assembly::separateShards() {
 
 void Assembly::integrateShards(double dt, const Environment& environment) {
     bool any = false;
-    for (const auto& part : _parts)
+    std::size_t awake = 0;
+    std::size_t asleep = 0;
+    for (const auto& part : _parts) {
         any = any || !part.shards().empty();
+        for (const auto& shard : part.shards())
+            (shard.asleep ? asleep : awake) += 1;
+    }
+    // #region agent log
+    {
+        static int shardIters = 0;
+        if (any && (asleep > 0 || shardIters < 8) && shardIters < 40) {
+            ++shardIters;
+            std::ofstream dbg("c:/Users/nirav/Documents/Projects/Robot Sim/robot_combat_sim/debug-b58308.log",
+                              std::ios::app);
+            if (dbg)
+                dbg << "{\"sessionId\":\"b58308\",\"hypothesisId\":\"B\",\"location\":\"assembly.cpp:integrateShards\","
+                       "\"message\":\"shard iteration\",\"data\":{\"awake\":"
+                    << awake << ",\"asleep\":" << asleep << "},\"timestamp\":0}\n";
+        }
+    }
+    // #endregion
     if (!any)
         return;
     for (auto& part : _parts)
         part.advanceShards(dt, environment.gravity);
     separateShards();
     for (auto& part : _parts)
-        part.finishShards(environment.floorEnabled, environment.floorHeight);
+        part.finishShards(environment.floorEnabled, environment.floorHeight, environment.boundsSize);
 }
 
-void Assembly::applyFloorContact(const Environment& environment, double dt) {
-    const double mu = environment.contactFriction;
-    const double vStick = std::max(1.0e-4, environment.frictionRegularization);
+bool Assembly::syncContacts(const Environment& environment) {
+    if (!_system)
+        return false;
+    if (!_contactWorld)
+        _contactWorld = std::make_shared<ContactWorld>();
+    bool structureChanged = false;
+    if (!_contactContainer) {
+        _contactContainer = chrono_types::make_shared<chrono::ChLoadContainer>();
+        _system->Add(_contactContainer);
+        structureChanged = true;
+    }
 
-    if (_floorPeak.size() != _parts.size())
-        _floorPeak.assign(_parts.size(), {});
-    if (_floorPhase.size() != _parts.size())
-        _floorPhase.assign(_parts.size(), {});
-    if (_floorClear.size() != _parts.size())
-        _floorClear.assign(_parts.size(), {});
+    _contactWorld->floorEnabled = environment.floorEnabled;
+    _contactWorld->floorHeight = environment.floorHeight;
+    _contactWorld->friction = environment.contactFriction;
+    _contactWorld->stickSpeed = std::max(1.0e-5, environment.frictionRegularization);
+    _contactWorld->halfX = std::max(0.5, environment.boundsSize.x() * 0.5);
+    _contactWorld->halfZ = std::max(0.5, environment.boundsSize.z() * 0.5);
+    _contactWorld->ceiling = environment.floorHeight + std::max(1.0, environment.boundsSize.y());
+
+    _contacts.resize(_parts.size());
+    _contactShape.resize(_parts.size(), {static_cast<std::size_t>(-1), 0, 0});
 
     for (std::size_t p = 0; p < _parts.size(); ++p) {
-        auto& part = _parts[p];
-        auto& peak = _floorPeak[p];
-        auto& phase = _floorPhase[p];
-        auto& clear = _floorClear[p];
-        if (peak.size() != part.nodeCount())
-            peak.assign(part.nodeCount(), 0.0);
-        if (phase.size() != part.nodeCount())
-            phase.assign(part.nodeCount(), 0);
-        if (clear.size() != part.nodeCount())
-            clear.assign(part.nodeCount(), 1);
-
-        const double radius = 0.5 * part.thickness();
-        // A resting node has to rise this far clear before the next arrival
-        // counts as a new impact. One solver step of liftoff is not a bounce.
-        constexpr double kClearGap = 1.0e-3;
+        Part& part = _parts[p];
+        const auto& area = part.contactAreas();
+        const std::size_t skin = static_cast<std::size_t>(std::max(0, part.skinTriangleCount()));
+        // A fixed node has no solver variables, so a load may not reference
+        // it: its Jacobian block would point at a disabled column.
+        auto eligible = [&](std::size_t i) {
+            return i < area.size() && area[i] > 0.0 && i < part.xyzNodes().size() && part.xyzNodes()[i] &&
+                   !part.xyzNodes()[i]->IsFixed();
+        };
+        // A digest of which nodes are eligible, not how many. Counting them is
+        // not enough: one node freezing in the same step that another thaws
+        // leaves the count alone, and the contact on the frozen node survives
+        // pointing at a column the solver has switched off. That is an invalid
+        // matrix, and Pardiso either rejects it or reads off the end of it.
+        std::size_t pattern = 1469598103934665603ull;
         for (std::size_t i = 0; i < part.nodeCount(); ++i) {
-            if (part.nodeRigid(i))
+            if (!eligible(i))
                 continue;
-            const double penetration = (environment.floorHeight + radius) - part.nodePosition(i).y();
-            const ChVector3d v = part.nodeVelocity(i);
-            const double vy = v.y();
-            // phase: 0 resting, 1 inbound impact that started in clear air.
-            // The support is never scaled down while the node is inside the
-            // floor. A resting sag keeps the soft spring the whole time.
-            if (penetration <= 0.0) {
-                if (penetration < -kClearGap || phase[i] != 0) {
-                    peak[i] = 0.0;
-                    phase[i] = 0;
-                    clear[i] = 1;
-                }
+            pattern = (pattern ^ i) * 1099511628211ull;
+        }
+        // Every free surface node owns an element for as long as the mesh
+        // holds still, so the sparsity pattern only moves when the mesh does.
+        // A node that is not touching contributes a zero block rather than
+        // appearing and disappearing, which would refactorise every step.
+        const std::array<std::size_t, 3> shape{part.nodeCount(), skin, pattern};
+        if (_contactShape[p] != shape) {
+            auto& list = _contactContainer->GetLoadList();
+            for (auto& contact : _contacts[p]) {
+                if (!contact)
+                    continue;
+                list.erase(std::remove(list.begin(), list.end(),
+                                       std::static_pointer_cast<chrono::ChLoadBase>(contact)),
+                           list.end());
+            }
+            _contacts[p].assign(part.nodeCount(), nullptr);
+            _contactShape[p] = shape;
+            for (std::size_t i = 0; i < part.nodeCount(); ++i) {
+                if (!eligible(i))
+                    continue;
+                _contacts[p][i] = chrono_types::make_shared<NodeContact>(part.xyzNodes()[i], _contactWorld);
+                _contactContainer->Add(_contacts[p][i]);
+            }
+            structureChanged = true;
+        }
+
+        // A contact patch behaves as an elastic foundation: the material under
+        // it compresses over roughly its own width. That gives E*A/L with
+        // L = sqrt(A), the real stiffness of metal on concrete, and it is only
+        // usable because the integrator differentiates it.
+        const double modulus = std::max(1.0e5, part.material().youngsModulus);
+        const double offset = part.contactOffset();
+        for (std::size_t i = 0; i < part.nodeCount() && i < _contacts[p].size(); ++i) {
+            if (!_contacts[p][i])
                 continue;
-            }
-
-            const bool entered = clear[i] != 0;
-            if (entered && vy < -kRestSpeed)
-                phase[i] = 1;
-            clear[i] = 0;
-            // The stiff spring only acts while the node is still arriving.
-            // Keeping it on the way back up, or scaling it down and then
-            // catching the fall, is what tips a panel that had nearly stopped.
-            if (phase[i] == 1 && vy >= -kRestSpeed) {
-                phase[i] = 0;
-                peak[i] = 0.0;
-            }
-
-            // The usual explicit clamp k = m/dt^2 is applied a step late and
-            // pumps a rocking mode. One eighth of that stops a fast arrival
-            // and still leaves the contact overdamped.
-            ContactGains gains = restGains(part.nodeMass()[i], dt);
-            if (phase[i] == 1 && part.nodeMass()[i] > 0.0 && dt > 0.0) {
-                const double nodeMass = part.nodeMass()[i];
-                const double k = nodeMass / (8.0 * dt * dt);
-                const double c = std::min(2.0 * std::sqrt(k * nodeMass), 0.5 * nodeMass / dt);
-                gains = {k, c};
-            }
-            double support = penetration;
-            if (entered)
-                support = std::min(penetration, std::max(0.0, -vy) * dt + 1.0e-4);
-            double fn = gains.stiffness * support - gains.damping * vy;
-            if (fn <= 0.0)
+            const double patch = i < area.size() ? area[i] : 0.0;
+            const bool live = eligible(i) && !part.nodeRigid(i);
+            _contacts[p][i]->setActive(live);
+            if (!live)
                 continue;
-
-            ChVector3d force{0.0, fn, 0.0};
-            const ChVector3d vt{v.x(), 0.0, v.z()};
-            const double vtMagnitude = vt.Length();
-            if (vtMagnitude > 1.0e-9) {
-                double ft = mu * fn;
-                if (vtMagnitude < vStick)
-                    ft *= vtMagnitude / vStick;
-                force -= vt * (ft / vtMagnitude);
-            }
-            part.addLoad(i, force);
+            // `E*sqrt(A)` is the true foundation stiffness, but past a point
+            // extra stiffness buys no realism: it only shrinks a penetration
+            // that is already microscopic, while making the Newton solve
+            // harder for a load carried by a handful of nodes. Scaling it back
+            // leaves the penetration far below any modelled feature and keeps
+            // the step convergent. This is the usual penalty-scale factor.
+            constexpr double kPenaltyScale = 0.02;
+            const double stiffness = kPenaltyScale * modulus * std::sqrt(patch);
+            // Hunt-Crossley dissipation, in s/m, saturating inside the contact
+            // element. Metal arriving on concrete at a metre a second comes
+            // back at roughly half speed and less than that as it gets faster,
+            // which is what drop tests on hard floors show. Slow contacts stay
+            // nearly elastic, so a part settling under its own weight is not
+            // artificially glued down.
+            static const double kDissipation = [] {
+                const char* override = std::getenv("RCS_CONTACT_DISSIPATION");
+                return override ? std::atof(override) : 0.5;
+            }();
+            _contacts[p][i]->configure(offset, stiffness, kDissipation);
         }
     }
+    return structureChanged;
 }
 
 void Assembly::applyPartContact(const Environment& environment, double dt) {
@@ -839,7 +923,9 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
         bool touching = false;
         Part& nodePart = _parts[nodeSide];
         Part& facePart = _parts[faceSide];
-        const double reach = 0.5 * (nodePart.thickness() + facePart.thickness());
+        // A tet volume already carries its own outer faces, so the surfaces
+        // meet where the meshes meet. Only a shell midsurface stands off.
+        const double reach = nodePart.contactOffset() + facePart.contactOffset();
         const auto& faces = facePart.triangles();
         if (faces.empty() || nodePart.nodeCount() == 0)
             return false;
@@ -1083,7 +1169,7 @@ void Assembly::applyUserLoads(const std::vector<ImpactLoad>& loads, double time)
         direction.Normalize();
 
         for (const auto& target : _loadTargets[i])
-            _parts[target.part].addLoad(target.node, direction * (load.force * target.share));
+            _parts[target.part].addStructuralLoad(target.node, direction * (loadMagnitude(load, time) * target.share));
     }
 }
 
@@ -1093,8 +1179,48 @@ bool Assembly::updateJoints(double dt) {
 
     for (auto& joint : _joints) {
         for (auto& entry : joint.links) {
-            if (entry.broken || (!entry.link && !entry.pointLink))
+            if (entry.broken || (!entry.link && !entry.pointLink && !entry.frameLink))
                 continue;
+
+            if (entry.partA < _parts.size() && entry.partB < _parts.size()) {
+                Part& sideA = _parts[entry.partA];
+                Part& sideB = _parts[entry.partB];
+                const bool hot = sideA.heatActive(entry.nodeA) || sideB.heatActive(entry.nodeB);
+                auto fixedNode = [](const Part& part, std::size_t index) {
+                    const auto& nodes = part.xyzNodes();
+                    return index < nodes.size() && nodes[index] && nodes[index]->IsFixed();
+                };
+                // A link whose ends have both left the deformable mesh is a
+                // constraint on two fixed nodes. That singularises HHT.
+                if (fixedNode(sideA, entry.nodeA) && fixedNode(sideB, entry.nodeB)) {
+                    if (entry.link)
+                        entry.link->SetBroken(true);
+                    if (entry.pointLink)
+                        entry.pointLink->SetBroken(true);
+                    if (entry.frameLink)
+                        entry.frameLink->SetBroken(true);
+                    entry.broken = true;
+                    changed = true;
+                    continue;
+                }
+                if (hot) {
+                    const double solidus =
+                        std::min(sideA.material().meltTemperature, sideB.material().meltTemperature);
+                    const double cooler = std::min(sideA.nodeTemperature(entry.nodeA),
+                                                   sideB.nodeTemperature(entry.nodeB));
+                    if (cooler >= solidus) {
+                        if (entry.link)
+                            entry.link->SetBroken(true);
+                        if (entry.pointLink)
+                            entry.pointLink->SetBroken(true);
+                        if (entry.frameLink)
+                            entry.frameLink->SetBroken(true);
+                        entry.broken = true;
+                        changed = true;
+                        continue;
+                    }
+                }
+            }
 
             double force = 0.0;
             double torque = 0.0;
@@ -1104,6 +1230,8 @@ bool Assembly::updateJoints(double dt) {
                 torque = reaction.torque.Length();
             } else if (entry.pointLink) {
                 force = entry.pointLink->GetReactionOnNode1().Length();
+            } else if (entry.frameLink) {
+                force = entry.frameLink->GetReactionOnNode().Length();
             }
             if (!std::isfinite(force))
                 force = entry.breakForce * 10.0;
@@ -1131,6 +1259,8 @@ bool Assembly::updateJoints(double dt) {
                     entry.link->SetBroken(true);
                 if (entry.pointLink)
                     entry.pointLink->SetBroken(true);
+                if (entry.frameLink)
+                    entry.frameLink->SetBroken(true);
                 entry.broken = true;
                 changed = true;
             }
@@ -1148,6 +1278,149 @@ void Assembly::reindexNodes() {
     for (std::size_t i = 0; i < _parts.size(); ++i) {
         _nodeOffset[i] = offset;
         offset += _parts[i].nodeCount();
+    }
+}
+
+bool Assembly::discardAwakeShards() {
+    bool any = false;
+    for (auto& part : _parts)
+        any = part.discardAwakeShards() || any;
+    return any;
+}
+
+bool Assembly::maintainVolume(double dt) {
+    for (auto& part : _parts)
+        part.clearLinkedNodes();
+    for (const auto& joint : _joints) {
+        for (const auto& link : joint.links) {
+            if (link.broken)
+                continue;
+            if (link.partA < _parts.size())
+                _parts[link.partA].markLinkedNode(static_cast<int>(link.nodeA));
+            if (link.partB < _parts.size())
+                _parts[link.partB].markLinkedNode(static_cast<int>(link.nodeB));
+        }
+    }
+    _volumeWait += dt;
+    const bool refine = _dynamicResolution && _volumeWait >= 0.02;
+    if (refine)
+        _volumeWait = 0.0;
+    bool changed = false;
+    for (auto& part : _parts)
+        changed = part.maintainVolume(refine) || changed;
+    if (changed)
+        inheritWeldNodes();
+    return changed;
+}
+
+bool Assembly::prepareBrittleImpact(const Environment& environment, double dt) {
+    if (!environment.floorEnabled)
+        return false;
+    bool changed = false;
+    for (auto& part : _parts)
+        changed = part.prepareBrittleImpact(environment.floorHeight, dt) || changed;
+    if (changed)
+        inheritWeldNodes();
+    return changed;
+}
+
+int Assembly::compliantImpactSubsteps(const Environment& environment, double dt) const {
+    if (!environment.floorEnabled)
+        return 1;
+    int steps = 1;
+    for (const auto& part : _parts) {
+        if (part.material().fracture != FractureMode::Compliant)
+            continue;
+        const double offset = part.contactOffset();
+        const double reach = std::max(dt, 1.0e-4);
+        for (int index : part.boundaryNodes()) {
+            if (index < 0 || static_cast<std::size_t>(index) >= part.nodeCount())
+                continue;
+            const double gap = part.nodePosition(static_cast<std::size_t>(index)).y() -
+                               (environment.floorHeight + offset);
+            const double closing = -part.nodeVelocity(static_cast<std::size_t>(index)).y();
+            if (closing <= 8.0 || gap > closing * reach + 5.0e-3)
+                continue;
+            const int need = static_cast<int>(std::ceil(closing * dt / 4.0e-3));
+            steps = std::max(steps, std::clamp(need, 1, 8));
+        }
+    }
+    return steps;
+}
+
+void Assembly::inheritWeldNodes() {
+    if (!_system)
+        return;
+    for (const auto& weld : _weldDefs) {
+        if (weld.partA >= _parts.size() || weld.partB >= _parts.size())
+            continue;
+        Joint* joint = nullptr;
+        for (auto& existing : _joints) {
+            if (existing.kind == JointKind::Weld && existing.partA == weld.partA && existing.partB == weld.partB) {
+                joint = &existing;
+                break;
+            }
+        }
+        if (!joint || joint->links.empty())
+            continue;
+        const double breakForce = joint->links.front().breakForce;
+        auto linked = [&](std::size_t nodeA, std::size_t nodeB) {
+            for (const auto& link : joint->links) {
+                if (link.broken)
+                    continue;
+                if (link.nodeA == nodeA && link.nodeB == nodeB)
+                    return true;
+            }
+            return false;
+        };
+        const Part& a = _parts[weld.partA];
+        const Part& b = _parts[weld.partB];
+        std::vector<std::pair<std::size_t, std::size_t>> pairs;
+        for (const auto& link : joint->links) {
+            if (!link.broken)
+                pairs.emplace_back(link.nodeA, link.nodeB);
+        }
+        auto nearBoundary = [](const Part& part, const ChVector3d& point) {
+            std::size_t best = part.nodeCount();
+            double bestDistance = 1.0e-3;
+            for (int index : part.boundaryNodes()) {
+                if (index < 0)
+                    continue;
+                const double distance = (part.nodePosition(static_cast<std::size_t>(index)) - point).Length();
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    best = static_cast<std::size_t>(index);
+                }
+            }
+            return best;
+        };
+        const std::size_t count = pairs.size();
+        for (std::size_t i = 0; i < count; ++i) {
+            for (std::size_t j = i + 1; j < count; ++j) {
+                const ChVector3d midA =
+                    0.5 * (a.nodePosition(pairs[i].first) + a.nodePosition(pairs[j].first));
+                const std::size_t midNodeA = nearBoundary(a, midA);
+                if (midNodeA >= a.nodeCount() || midNodeA == pairs[i].first || midNodeA == pairs[j].first)
+                    continue;
+                bool has = false;
+                for (const auto& link : joint->links)
+                    has = has || (!link.broken && link.nodeA == midNodeA);
+                if (has)
+                    continue;
+                const ChVector3d midB =
+                    0.5 * (b.nodePosition(pairs[i].second) + b.nodePosition(pairs[j].second));
+                std::size_t midNodeB = nearBoundary(b, midB);
+                if (midNodeB >= b.nodeCount() || linked(midNodeA, midNodeB))
+                    midNodeB = (midA - b.nodePosition(pairs[i].second)).Length() <=
+                                       (midA - b.nodePosition(pairs[j].second)).Length()
+                                   ? pairs[i].second
+                                   : pairs[j].second;
+                if (linked(midNodeA, midNodeB))
+                    continue;
+                createLink(*_system, *joint, weld.partA, midNodeA, weld.partB, midNodeB, breakForce, 0.0, false,
+                           false);
+            }
+        }
     }
 }
 
@@ -1274,6 +1547,9 @@ void Assembly::writeLayout(RecordingLayout& layout) const {
         entry.materialName = part.material().name;
         entry.thickness = static_cast<float>(part.thickness());
         entry.nodeCount = static_cast<int>(part.nodeCount());
+        entry.volume = part.hasVolume();
+        entry.flatTriangles = part.skinTriangleCount();
+        entry.tetCount = part.tetCount();
         entry.quads = part.quads();
         entry.triangles = part.triangles();
         layout.parts.push_back(std::move(entry));
@@ -1301,9 +1577,14 @@ void Assembly::writeFrame(Frame& frame) const {
         }
         part.evaluateStress(out.stress);
         part.evaluatePlasticStrain(out.plasticStrain);
+        part.evaluateTemperature(out.temperature);
+        out.nodeTemperature.resize(part.nodeCount());
+        for (std::size_t n = 0; n < part.nodeCount(); ++n)
+            out.nodeTemperature[n] = static_cast<float>(part.nodeTemperature(n));
         for (float s : out.stress)
             frame.maxStress = std::max(frame.maxStress, s);
     }
+    _heat.writeAir(frame.air);
 
     frame.joints.resize(_joints.size());
     for (std::size_t i = 0; i < _joints.size(); ++i) {
@@ -1326,6 +1607,14 @@ bool Assembly::finite() const {
             return false;
     }
     return true;
+}
+
+bool Assembly::hasFreeSolve() const {
+    for (const auto& part : _parts) {
+        if (part.hasFreeNodes())
+            return true;
+    }
+    return false;
 }
 
 chrono::ChVector3d Assembly::center() const {

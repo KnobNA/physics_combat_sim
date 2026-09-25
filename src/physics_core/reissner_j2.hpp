@@ -1,6 +1,11 @@
 #pragma once
 
+#include "physics_core/material.hpp"
+
+#include "chrono/core/ChMatrix.h"
 #include "chrono/fea/ChMaterialShellReissner.h"
+
+#include <algorithm>
 
 namespace rcs {
 
@@ -25,6 +30,10 @@ public:
 
     void SetThermalStrain(double strain) { _thermal = strain; }
     double thermalStrain() const { return _thermal; }
+    /// Scales the tangent and the stress. The floor keeps the shell invertible
+    /// once the handbook curve has fallen past the solidus.
+    void SetStiffnessScale(double scale) { _stiffness = std::clamp(scale, kThermalFloor, 1.0); }
+    double stiffnessScale() const { return _stiffness; }
 
     void ComputeStress(chrono::ChVector3d& nU,
                        chrono::ChVector3d& nV,
@@ -38,8 +47,18 @@ public:
                        double zSup,
                        double angle) override;
 
+    void ComputeStiffnessMatrix(chrono::ChMatrixRef mC,
+                                const chrono::ChVector3d& epsU,
+                                const chrono::ChVector3d& epsV,
+                                const chrono::ChVector3d& kurU,
+                                const chrono::ChVector3d& kurV,
+                                double zInf,
+                                double zSup,
+                                double angle) override;
+
 private:
     double _thermal = 0.0;
+    double _stiffness = 1.0;
 };
 
 /// J2 / Ilyushin return mapping on the shell resultants. The trial stress
@@ -49,6 +68,8 @@ private:
 class ReissnerJ2 : public chrono::fea::ChPlasticityReissner {
 public:
     ReissnerJ2(double yieldStress, double youngsModulus);
+
+    void SetYieldScale(double scale) { _yieldScale = std::clamp(scale, kThermalFloor, 1.0); }
 
     bool ComputeStressWithReturnMapping(
         chrono::ChVector3d& nU,
@@ -69,9 +90,62 @@ public:
         int numpoints,
         std::vector<std::unique_ptr<chrono::fea::ChShellReissnerInternalData>>& plasticData) override;
 
+    /// Temperature-scaled elastic tangent. Chrono's numerical perfect-plastic
+    /// tangent is singular once the stress sits on a very low yield surface,
+    /// and the step then aborts. The return mapping still holds the stress
+    /// on the real yield surface, shear included.
+    void ComputeStiffnessMatrixElastoplastic(
+        chrono::ChMatrixRef K,
+        const chrono::ChVector3d& epsU,
+        const chrono::ChVector3d& epsV,
+        const chrono::ChVector3d& kurU,
+        const chrono::ChVector3d& kurV,
+        const chrono::fea::ChShellReissnerInternalData& data,
+        double zInf,
+        double zSup,
+        double angle) override;
+
 private:
     double _yield = 0.0;
+    double _yieldScale = 1.0;
     double _young = 1.0;
+};
+
+/// Rayleigh damping that follows the current thermal stiffness. Chrono's own
+/// Rayleigh model freezes the stiffness matrix on first use, so a panel heated
+/// after the first step stays damped as if it were still cold.
+class ThermalRayleighDamping : public chrono::fea::ChDampingReissner {
+public:
+    ThermalRayleighDamping(std::shared_ptr<ThermalReissnerElasticity> elasticity, double beta);
+
+    void ComputeStress(chrono::ChVector3d& nU,
+                       chrono::ChVector3d& nV,
+                       chrono::ChVector3d& mU,
+                       chrono::ChVector3d& mV,
+                       const chrono::ChVector3d& depsU,
+                       const chrono::ChVector3d& depsV,
+                       const chrono::ChVector3d& dkurU,
+                       const chrono::ChVector3d& dkurV,
+                       double zInf,
+                       double zSup,
+                       double angle) override;
+
+    void ComputeDampingMatrix(chrono::ChMatrixRef R,
+                              const chrono::ChVector3d& depsU,
+                              const chrono::ChVector3d& depsV,
+                              const chrono::ChVector3d& dkurU,
+                              const chrono::ChVector3d& dkurV,
+                              double zInf,
+                              double zSup,
+                              double angle) override;
+
+private:
+    void refresh(double zInf, double zSup, double angle);
+
+    std::shared_ptr<ThermalReissnerElasticity> _elasticity;
+    chrono::ChMatrixNM<double, 12, 12> _stiffness;
+    double _beta = 0.0;
+    double _cachedScale = -1.0;
 };
 
 }  // namespace rcs

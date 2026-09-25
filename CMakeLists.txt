@@ -277,9 +277,22 @@ add_subdirectory(external/magnum-integration EXCLUDE_FROM_ALL)
 # ---------------------------------------------------------------------------
 # Application
 # ---------------------------------------------------------------------------
+add_library(tetgen STATIC
+    external/tetgen/tetgen.cxx
+    external/tetgen/predicates.cxx)
+target_include_directories(tetgen PUBLIC external/tetgen)
+target_compile_definitions(tetgen PUBLIC TETLIBRARY)
+if(MSVC)
+    target_compile_options(tetgen PRIVATE /w /bigobj)
+endif()
+
 set(COMBAT_SIM_PHYSICS_SOURCES
     src/physics_core/part.cpp
+    src/physics_core/heat.cpp
     src/physics_core/reissner_j2.cpp
+    src/physics_core/thermal_tet.cpp
+    src/physics_core/contact_load.cpp
+    src/physics_core/mesh_split.cpp
     src/physics_core/assembly.cpp
     src/physics_core/cad.cpp
     src/physics_core/simulator.cpp
@@ -297,6 +310,7 @@ add_executable(combat_sim
 target_include_directories(combat_sim PRIVATE src)
 
 target_link_libraries(combat_sim PRIVATE
+    tetgen
     ${CHRONO_TARGETS}
     MKL::MKL
     Magnum::Magnum
@@ -316,7 +330,7 @@ add_executable(combat_sim_physics_smoke EXCLUDE_FROM_ALL
     ${COMBAT_SIM_PHYSICS_SOURCES}
 )
 target_include_directories(combat_sim_physics_smoke PRIVATE src)
-target_link_libraries(combat_sim_physics_smoke PRIVATE ${CHRONO_TARGETS} MKL::MKL)
+target_link_libraries(combat_sim_physics_smoke PRIVATE tetgen ${CHRONO_TARGETS} MKL::MKL)
 add_dependencies(combat_sim_physics_smoke chrono_build)
 set_target_properties(combat_sim_physics_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}

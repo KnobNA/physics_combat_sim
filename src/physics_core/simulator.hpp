@@ -30,7 +30,8 @@ public:
 
     /// One integrator step at simulated time `time`. False if the state blew up.
     bool step(double dt, double time, const Environment& environment,
-              const std::vector<ImpactLoad>& loads);
+              const std::vector<ImpactLoad>& loads,
+              const std::vector<HeatSource>& heat = {});
 
     /// Snapshot the current state as a single-frame recording, for the
     /// authoring viewport.

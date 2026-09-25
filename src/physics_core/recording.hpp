@@ -54,6 +54,10 @@ struct PartLayout {
     std::string materialName;
     float thickness = 0.0f;
     int nodeCount = 0;
+    bool volume = false;
+    /// Leading triangles are the solid boundary and are drawn flat.
+    int flatTriangles = 0;
+    int tetCount = 0;
     std::vector<std::array<int, 4>> quads;
     std::vector<std::array<int, 3>> triangles;
 };
@@ -73,6 +77,8 @@ struct PartFrame {
     std::vector<std::uint16_t> xyz;
     std::vector<float> stress;          ///< von Mises per quad (or triangle), Pa
     std::vector<float> plasticStrain;   ///< accumulated equivalent plastic strain
+    std::vector<float> temperature;     ///< mean corner temperature, K
+    std::vector<float> nodeTemperature; ///< kelvin at each node, for a point readout
     /// Filled once tearing changes connectivity. Empty means "use the layout".
     std::vector<std::array<int, 4>> quads;
     std::vector<std::array<int, 3>> triangles;
@@ -106,10 +112,27 @@ struct JointFrame {
     std::vector<std::uint8_t> broken;
 };
 
+/// Coarse still-air sample. Empty `temperature` means the whole arena is at
+/// ambient, so a cold run stores nothing extra.
+struct AirFrame {
+    int nx = 0;
+    int ny = 0;
+    int nz = 0;
+    float originX = 0.0f;
+    float originY = 0.0f;
+    float originZ = 0.0f;
+    float dx = 0.0f;
+    float dy = 0.0f;
+    float dz = 0.0f;
+    float ambient = 293.15f;
+    std::vector<float> temperature;
+};
+
 struct Frame {
     double time = 0.0;
     std::vector<PartFrame> parts;
     std::vector<JointFrame> joints;
+    AirFrame air;
     float maxStress = 0.0f;
     int brokenLinks = 0;
 };

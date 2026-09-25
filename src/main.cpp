@@ -1,5 +1,6 @@
 #include "editor/ui.hpp"
 #include "physics_core/cad.hpp"
+#include "physics_core/mesh_split.hpp"
 #include "physics_core/simulator.hpp"
 #include "render_core/gizmos.hpp"
 #include "render_core/orbit_camera.hpp"
@@ -28,6 +29,86 @@ using namespace Magnum;
 using namespace Magnum::Math::Literals;
 
 namespace {
+
+bool rayTriangle(const Vector3& origin, const Vector3& dir,
+                const Vector3& v0, const Vector3& v1, const Vector3& v2,
+                float& t, float& u, float& v)
+{
+    const Vector3 edge1 = v1 - v0;
+    const Vector3 edge2 = v2 - v0;
+    const Vector3 p = Math::cross(dir, edge2);
+    const float det = Math::dot(edge1, p);
+    if (std::abs(det) < 1.0e-8f)
+        return false;
+    const float inv = 1.0f / det;
+    const Vector3 s = origin - v0;
+    u = Math::dot(s, p) * inv;
+    if (u < 0.0f || u > 1.0f)
+        return false;
+    const Vector3 q = Math::cross(s, edge1);
+    v = Math::dot(dir, q) * inv;
+    if (v < 0.0f || u + v > 1.0f)
+        return false;
+    t = Math::dot(edge2, q) * inv;
+    return t > 1.0e-4f;
+}
+
+Vector3 frameNode(const PartFrame& part, int index) {
+    if (index < 0)
+        return {};
+    const Vec3f p = part.position(static_cast<std::size_t>(index));
+    return {p.x, p.y, p.z};
+}
+
+float nodeKelvin(const PartFrame& part, int index, float fallback) {
+    if (index < 0 || static_cast<std::size_t>(index) >= part.nodeTemperature.size())
+        return fallback;
+    return part.nodeTemperature[static_cast<std::size_t>(index)];
+}
+
+/// Closest hit on the visible shells. Temperature is interpolated from the
+/// triangle corners. Stress is the quad the point lands on.
+bool sampleSurface(const Frame& frame, const RecordingLayout& layout,
+                   const Vector3& origin, const Vector3& dir, ShadeMode shade, float& value)
+{
+    float bestT = 1.0e8f;
+    bool hit = false;
+    const std::size_t count = std::min(frame.parts.size(), layout.parts.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const PartFrame& part = frame.parts[i];
+        const PartLayout& partLayout = layout.parts[i];
+        const auto& quads = part.quads.empty() ? partLayout.quads : part.quads;
+        const auto& triangles = part.triangles.empty() ? partLayout.triangles : part.triangles;
+        auto consider = [&](int i0, int i1, int i2, std::size_t fieldIndex) {
+            float t = 0.0f, u = 0.0f, v = 0.0f;
+            const Vector3 a = frameNode(part, i0);
+            const Vector3 b = frameNode(part, i1);
+            const Vector3 c = frameNode(part, i2);
+            if (!rayTriangle(origin, dir, a, b, c, t, u, v) || t >= bestT)
+                return;
+            bestT = t;
+            hit = true;
+            if (shade == ShadeMode::Stress) {
+                value = fieldIndex < part.stress.size() ? part.stress[fieldIndex] : 0.0f;
+                return;
+            }
+            const float fallback = fieldIndex < part.temperature.size() ? part.temperature[fieldIndex] : 293.15f;
+            const float w = 1.0f - u - v;
+            value = w * nodeKelvin(part, i0, fallback) + u * nodeKelvin(part, i1, fallback) +
+                    v * nodeKelvin(part, i2, fallback);
+        };
+        if (!quads.empty()) {
+            for (std::size_t q = 0; q < quads.size(); ++q) {
+                consider(quads[q][0], quads[q][1], quads[q][2], q);
+                consider(quads[q][0], quads[q][2], quads[q][3], q);
+            }
+        } else {
+            for (std::size_t t = 0; t < triangles.size(); ++t)
+                consider(triangles[t][0], triangles[t][1], triangles[t][2], t);
+        }
+    }
+    return hit;
+}
 
 bool rayAabb(const Vector3& origin, const Vector3& dir, const Range3D& box, float& tHit) {
     float tmin = 0.0f;
@@ -170,6 +251,8 @@ void CombatApp::rebuildPreview() {
     _editor.playback.playing = false;
     if (_editor.selectedPart && *_editor.selectedPart >= _pose.layout.parts.size())
         _editor.selectedPart.reset();
+    if (_editor.selectedGroup && *_editor.selectedGroup >= _definition.groups.size())
+        _editor.selectedGroup.reset();
     _renderer.setLayout(_pose.layout);
 }
 
@@ -186,10 +269,26 @@ bool CombatApp::editingAllowed() const {
 }
 
 void CombatApp::startSimulation() {
+    _editor.status = "Meshing...";
+    AssemblyDefinition meshed = _definition;
+    const double resolution = std::clamp(_editor.scenario.settings.meshResolution, 0.25, 8.0);
+    for (auto& part : meshed.parts) {
+        if (!part.simulate)
+            continue;
+        if (part.source.empty() && (part.patch.uSize <= 1.0e-6 || part.patch.vSize <= 1.0e-6))
+            continue;
+        part.sizing.tetBudget = std::clamp(static_cast<int>(2500.0 * resolution), 400, 8000);
+        part.sizing.refineLimit = part.sizing.minElement;
+        part.sizing.cached = false;
+        part.volume = {};
+        part.surface = {};
+        if (!ensurePartMesh(part))
+            _editor.status = "Could not mesh " + part.name + ".";
+    }
     _editor.status = "Simulating...";
     _editor.playback.playing = false;
     _editor.playback.time = 0.0;
-    _job.start(_definition, _editor.scenario);
+    _job.start(meshed, _editor.scenario);
 }
 
 void CombatApp::handleEditorRequests() {
@@ -198,12 +297,38 @@ void CombatApp::handleEditorRequests() {
         ImpactLoad load;
         load.name = "Load " + std::to_string(_editor.scenario.loads.size() + 1);
         load.partIndex = _editor.selectedPart.value_or(0);
+        load.initialForce = 0.0;
+        load.finalForce = 1000.0;
+        load.rampTime = 0.1;
+        load.duration = 1.0;
+        load.ramp = LoadRamp::Linear;
+        load.polynomialDegree = 2;
         load.point = toChrono(selectionGroup().empty()
                                   ? toMagnum(_preview.assembly().center())
                                   : selectionCenter());
         _editor.scenario.loads.push_back(load);
         _editor.selectedLoad = int(_editor.scenario.loads.size()) - 1;
         _editor.rebuildRequested = true;
+    }
+
+    if (_editor.addHeatRequested) {
+        _editor.addHeatRequested = false;
+        HeatSource source;
+        source.name = "Heat " + std::to_string(_editor.scenario.heatSources.size() + 1);
+        source.point = toChrono(selectionGroup().empty()
+                                    ? toMagnum(_preview.assembly().center())
+                                    : selectionCenter());
+        _editor.scenario.heatSources.push_back(source);
+        _editor.selectedHeat = int(_editor.scenario.heatSources.size()) - 1;
+    }
+
+    if (_editor.removeHeatIndex >= 0) {
+        const int index = _editor.removeHeatIndex;
+        _editor.removeHeatIndex = -1;
+        if (index < int(_editor.scenario.heatSources.size())) {
+            _editor.scenario.heatSources.erase(_editor.scenario.heatSources.begin() + index);
+            _editor.selectedHeat = -1;
+        }
     }
 
     if (_editor.removeLoadIndex >= 0) {
@@ -227,6 +352,30 @@ void CombatApp::handleEditorRequests() {
         _job.cancel();
     }
 
+    if (_editor.addGroupRequested) {
+        _editor.addGroupRequested = false;
+        if (editingAllowed()) {
+            GroupDefinition folder;
+            folder.name = "Folder " + std::to_string(_definition.groups.size() + 1);
+            if (_editor.selectedGroup)
+                folder.parent = static_cast<int>(*_editor.selectedGroup);
+            _definition.groups.push_back(folder);
+            _editor.selectedGroup = _definition.groups.size() - 1;
+            _editor.selectedPart.reset();
+            _editor.status = "Added " + folder.name + ".";
+        }
+    }
+
+    if (_editor.addSolidCubeRequested) {
+        _editor.addSolidCubeRequested = false;
+        if (editingAllowed()) {
+            _definition.parts.push_back(makeSolidCube(0.40, {0.50, 0.0, 0.0}));
+            _editor.selectedPart = _definition.parts.size() - 1;
+            rebuildPreview();
+            _editor.status = "Added a 400 mm solid aluminum cube.";
+        }
+    }
+
     if (_editor.importRequested) {
         _editor.importRequested = false;
         if (editingAllowed()) {
@@ -235,6 +384,7 @@ void CombatApp::handleEditorRequests() {
             if (importAssembly(_editor.importPath, loaded, error)) {
                 _definition = std::move(loaded);
                 _editor.selectedPart.reset();
+                _editor.selectedGroup.reset();
                 rebuildPreview();
                 _editor.status = error.empty() ? "Imported " + _definition.name : error;
             } else {
@@ -286,9 +436,37 @@ float CombatApp::gizmoScale() const {
 }
 
 std::vector<std::size_t> CombatApp::selectionGroup() const {
-    if (!_editor.selectedPart)
-        return {};
-    return _preview.assembly().connectedParts(*_editor.selectedPart);
+    std::vector<std::size_t> group;
+    const auto& parts = _definition.parts;
+    const auto& folders = _definition.groups;
+    std::vector<char> folder(_definition.groups.size(), 0);
+    if (_editor.selectedGroup && *_editor.selectedGroup < folders.size()) {
+        std::vector<int> stack{static_cast<int>(*_editor.selectedGroup)};
+        while (!stack.empty()) {
+            const int current = stack.back();
+            stack.pop_back();
+            if (current < 0 || static_cast<std::size_t>(current) >= folder.size() || folder[static_cast<std::size_t>(current)])
+                continue;
+            folder[static_cast<std::size_t>(current)] = 1;
+            for (int child = 0; child < static_cast<int>(folders.size()); ++child)
+                if (folders[static_cast<std::size_t>(child)].parent == current)
+                    stack.push_back(child);
+        }
+        for (std::size_t i = 0; i < parts.size(); ++i)
+            if (parts[i].group >= 0 && static_cast<std::size_t>(parts[i].group) < folder.size() &&
+                folder[static_cast<std::size_t>(parts[i].group)] && parts[i].parentPart < 0)
+                group.push_back(i);
+    } else if (_editor.selectedPart && *_editor.selectedPart < parts.size()) {
+        group.push_back(*_editor.selectedPart);
+    }
+    for (std::size_t n = 0; n < group.size(); ++n) {
+        for (std::size_t i = 0; i < parts.size(); ++i) {
+            if (parts[i].parentPart == static_cast<int>(group[n]) &&
+                std::find(group.begin(), group.end(), i) == group.end())
+                group.push_back(i);
+        }
+    }
+    return group;
 }
 
 Vector3 CombatApp::selectionCenter() const {
@@ -312,6 +490,8 @@ void CombatApp::selectAt(const Vector2& windowPosition) {
         }
     }
     _editor.selectedPart = hit;
+    if (hit)
+        _editor.selectedGroup.reset();
 }
 
 void CombatApp::applyTranslation(const Vector3& delta) {
@@ -338,15 +518,27 @@ void CombatApp::applyTranslation(const Vector3& delta) {
     std::size_t movedNodes = 0;
     std::size_t totalNodes = 0;
     for (const auto& part : assembly.parts())
-        totalNodes += part.nodes().size();
+        totalNodes += part.nodeCount();
 
+    auto shiftMesh = [&](SurfaceMesh& mesh) {
+        for (auto& vertex : mesh.vertices)
+            vertex += local;
+    };
+    auto shiftVolume = [&](VolumeMesh& mesh) {
+        for (auto& vertex : mesh.vertices)
+            vertex += local;
+    };
     for (std::size_t index : group) {
         if (index >= _definition.parts.size())
             continue;
         inGroup[index] = 1;
-        _definition.parts[index].patch.origin += local;
+        PartDefinition& part = _definition.parts[index];
+        part.patch.origin += local;
+        shiftMesh(part.source);
+        shiftMesh(part.surface);
+        shiftVolume(part.volume);
         if (index < assembly.parts().size())
-            movedNodes += assembly.parts()[index].nodes().size();
+            movedNodes += assembly.parts()[index].nodeCount();
     }
 
     // Screws and optional weld regions live in authoring space. A joint only
@@ -395,10 +587,18 @@ void CombatApp::applyRotation(const Vector3& axis, Rad angle) {
     for (std::size_t index : group) {
         if (index >= _definition.parts.size())
             continue;
-        PlatePatch& patch = _definition.parts[index].patch;
-        patch.origin = pivot + rotation.Rotate(patch.origin - pivot);
-        patch.uAxis = rotation.Rotate(patch.uAxis);
-        patch.vAxis = rotation.Rotate(patch.vAxis);
+        PartDefinition& part = _definition.parts[index];
+        auto spin = [&](chrono::ChVector3d& point) {
+            point = pivot + rotation.Rotate(point - pivot);
+        };
+        spin(part.patch.origin);
+        part.patch.uAxis = rotation.Rotate(part.patch.uAxis);
+        part.patch.vAxis = rotation.Rotate(part.patch.vAxis);
+        for (auto* mesh : {&part.source, &part.surface})
+            for (auto& vertex : mesh->vertices)
+                spin(vertex);
+        for (auto& vertex : part.volume.vertices)
+            spin(vertex);
     }
     rebuildPreview();
 }
@@ -417,7 +617,7 @@ void CombatApp::drawEvent() {
 
     if (frame) {
         _renderer.update(recording.layout, *frame, _editor.shade, _editor.stressScale,
-                         _editor.selectedPart);
+                         selectionGroup(), _editor.showAir);
     }
 
     GL::Renderer::setClearColor(0x1b1e23_rgbf);
@@ -425,10 +625,11 @@ void CombatApp::drawEvent() {
 
     const Matrix4 view = _camera.viewMatrix();
     const Matrix4 projection = _camera.projectionMatrix();
-    _renderer.draw(view, projection, _editor.scenario.environment);
+    _renderer.draw(view, projection, _editor.scenario.environment, _editor.scenario.heatSources,
+                   _editor.playback.time);
 
     const bool showGizmo = editingAllowed() && _run.frames.empty() &&
-                           _editor.selectedPart && _editor.tool != Tool::Select;
+                           !selectionGroup().empty() && _editor.tool != Tool::Select;
     if (showGizmo) {
         _gizmos.draw(view, projection, selectionCenter(), gizmoScale(),
                      _editor.tool, _activeHandle != GizmoHandle::None ? _activeHandle : _hoverHandle);
@@ -454,6 +655,7 @@ void CombatApp::drawEvent() {
             i, _editor.scenario.loads, _editor.scenario.settings.timestep));
     }
     drawEditorUi(_editor, context);
+    drawArenaOverlay(_editor.scenario.environment, view, projection);
     _imgui.updateApplicationCursor(*this);
 
     GL::Renderer::enable(GL::Renderer::Feature::Blending);
@@ -503,7 +705,7 @@ void CombatApp::pointerPressEvent(PointerEvent& event) {
         return;
 
     const bool canEdit = editingAllowed() && _run.frames.empty();
-    if (canEdit && _editor.selectedPart && _editor.tool != Tool::Select) {
+    if (canEdit && !selectionGroup().empty() && _editor.tool != Tool::Select) {
         Vector3 origin, dir;
         rayAt(event.position(), origin, dir);
         const Vector3 center = selectionCenter();
@@ -548,8 +750,19 @@ void CombatApp::pointerReleaseEvent(PointerEvent& event) {
 
 void CombatApp::pointerMoveEvent(PointerMoveEvent& event) {
     if (_imgui.handlePointerMoveEvent(event)) {
+        _editor.probeVisible = false;
         event.setAccepted();
         return;
+    }
+
+    Vector3 origin, dir;
+    rayAt(event.position(), origin, dir);
+    _editor.probeVisible = false;
+    if (_editor.shade == ShadeMode::Temperature || _editor.shade == ShadeMode::Stress) {
+        if (const Frame* frame = activeFrame()) {
+            _editor.probeVisible = sampleSurface(*frame, activeRecording().layout, origin, dir, _editor.shade,
+                                                 _editor.probeValue);
+        }
     }
 
     if (_orbiting && (event.pointers() & Pointer::MouseRight)) {
@@ -563,11 +776,8 @@ void CombatApp::pointerMoveEvent(PointerMoveEvent& event) {
         return;
     }
 
-    Vector3 origin, dir;
-    rayAt(event.position(), origin, dir);
-
     const bool canEdit = editingAllowed() && _run.frames.empty();
-    if (canEdit && _editor.selectedPart && _editor.tool != Tool::Select &&
+    if (canEdit && !selectionGroup().empty() && _editor.tool != Tool::Select &&
         _activeHandle == GizmoHandle::None) {
         const Vector3 center = selectionCenter();
         _hoverHandle = (_editor.tool == Tool::Move)

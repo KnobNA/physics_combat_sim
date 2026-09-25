@@ -1,11 +1,18 @@
 #pragma once
 
+#include "physics_core/contact_load.hpp"
+#include "physics_core/heat.hpp"
 #include "physics_core/joint.hpp"
 #include "physics_core/part.hpp"
 #include "physics_core/recording.hpp"
 #include "physics_core/scenario.hpp"
 
+#include "chrono/physics/ChLoadContainer.h"
 #include "chrono/physics/ChSystem.h"
+
+#include <array>
+#include <memory>
+#include <utility>
 
 #include <cstddef>
 #include <string>
@@ -13,10 +20,21 @@
 
 namespace rcs {
 
+/// An empty folder in the assembly. It has no mesh. Translating it moves every
+/// part that lists it as `group`, and the parts parented under those.
+struct GroupDefinition {
+    std::string name = "Group";
+    /// Another folder. -1 is a root folder.
+    int parent = -1;
+    /// Copied onto every child when the folder checkbox is used.
+    bool simulate = true;
+};
+
 /// Authoring-time description of a whole machine: a bag of parts plus the
 /// manual joints that hold them together. CAD import produces one of these.
 struct AssemblyDefinition {
     std::string name = "Assembly";
+    std::vector<GroupDefinition> groups;
     std::vector<PartDefinition> parts;
     std::vector<WeldDefinition> welds;
     std::vector<ScrewDefinition> screws;
@@ -46,8 +64,14 @@ public:
                             const std::vector<ImpactLoad>& loads,
                             double dt) const;
 
-    /// Accumulate every external nodal force for the coming step.
-    void applyLoads(const Environment& environment,
+    /// Conduction, still air, and heat sources. Skipped entirely when the
+    /// scene is still at its initial temperature and no source is on.
+    void advanceHeat(double dt, double time, const Environment& environment,
+                     const std::vector<HeatSource>& sources);
+
+    /// Accumulate every external nodal force for the coming step. True when
+    /// the implicit contact set changed and the solver needs a fresh setup.
+    bool applyLoads(const Environment& environment,
                     const std::vector<ImpactLoad>& loads,
                     double time,
                     double dt);
@@ -61,6 +85,17 @@ public:
 
     /// Detach shell elements past the material's tear limit. True if nodes were added.
     bool tearOverstretched();
+    /// Refine and detach solid tetrahedra on the same slow clock as heat.
+    bool maintainVolume(double dt);
+    /// Shatter brittle solids that are about to take an over-strength hit.
+    bool prepareBrittleImpact(const Environment& environment, double dt);
+    /// Compliant solids have to stay in the solve, so a fast floor hit is
+    /// split into a few fixed substeps instead of one inverted tet.
+    int compliantImpactSubsteps(const Environment& environment, double dt) const;
+    /// When clear, molten tetrahedra still leave but nothing is split finer.
+    void setDynamicResolution(bool enabled) { _dynamicResolution = enabled; }
+    /// Remove chips that have not settled, so a bad one cannot abort the run.
+    bool discardAwakeShards();
 
     /// Promote a weld that was skipped as redundant, once a tree link has broken.
     /// True when a new constraint was added.
@@ -70,6 +105,8 @@ public:
     void writeFrame(Frame& frame) const;
 
     bool finite() const;
+    /// True when at least one part still has a free FEA node for HHT to solve.
+    bool hasFreeSolve() const;
     chrono::ChVector3d center() const;
     chrono::ChVector3d centerOf(const std::vector<std::size_t>& partIndices) const;
     double mass() const;
@@ -123,12 +160,17 @@ private:
 
     void applyGravity(const chrono::ChVector3d& gravity);
     void applyAerodynamics(const Environment& environment);
-    void applyFloorContact(const Environment& environment, double dt);
+    /// Create or refresh one implicit contact element per surface node, and
+    /// copy the current arena into the shared world. Called before the solve.
+    /// True when elements were added or removed, so the caller has to re-run
+    /// Setup and rebuild the sparsity pattern.
+    bool syncContacts(const Environment& environment);
     void applyShardContact(const Environment& environment, double dt);
     void separateShards();
     void applyPartContact(const Environment& environment, double dt);
     void applyUserLoads(const std::vector<ImpactLoad>& loads, double time);
     void refreshAdjacency();
+    void inheritWeldNodes();
 
     std::size_t globalNode(std::size_t part, std::size_t node) const {
         return _nodeOffset[part] + node;
@@ -146,6 +188,10 @@ private:
         JointKind kind = JointKind::Weld;
     };
 
+    HeatField _heat;
+    std::vector<WeldDefinition> _weldDefs;
+    double _volumeWait = 0.0;
+    bool _dynamicResolution = true;
     std::vector<Part> _parts;
     std::vector<Joint> _joints;
     std::vector<DeferredLink> _deferred;
@@ -160,15 +206,16 @@ private:
     /// Per part pair: whether contact between them has been armed. See
     /// applyPartContact for why a pair starts disarmed.
     std::vector<char> _contactArmed;
-    /// Deepest floor penetration of each node during a real inbound impact.
-    /// Restitution reads it once on the way out. A resting sag does not.
-    std::vector<std::vector<double>> _floorPeak;
-    /// 0 resting, 1 a fast inbound impact is in progress.
-    std::vector<std::vector<char>> _floorPhase;
-    /// 1 when the node was clear of the floor on the previous step. An impact
-    /// is latched only on entry, so a resting sag cannot turn the stiff spring
-    /// back on.
-    std::vector<std::vector<char>> _floorClear;
+    /// Arena and friction as the contact elements see them.
+    std::shared_ptr<ContactWorld> _contactWorld;
+    std::shared_ptr<chrono::ChLoadContainer> _contactContainer;
+    /// One element per node of each part, indexed the same way. Null where the
+    /// node has no outside face.
+    std::vector<std::vector<std::shared_ptr<NodeContact>>> _contacts;
+    /// Node count, skin count, and free-surface-node count the contact
+    /// elements were built against. A refine, a detach, or a node being
+    /// frozen rebuilds them; nothing else does.
+    std::vector<std::array<std::size_t, 3>> _contactShape;
     /// Last part-pair contact normal, so a closest-point jump cannot kick sideways.
     std::vector<chrono::ChVector3d> _contactNormal;
     struct LoadTarget {

@@ -29,7 +29,13 @@ double peakVonMises(const chrono::ChVector3d& nU,
     const double mxy = 0.5 * (mU.x() + mV.y()) * factor;
     const double top = vonMisesPlane(nxx + mxx, nyy + myy, nxy + mxy);
     const double bottom = vonMisesPlane(nxx - mxx, nyy - myy, nxy - mxy);
-    return std::max(top, bottom);
+    // Transverse shear and drilling are resultants too. Leaving them out of
+    // the yield check lets a soft shell build a huge shear force while the
+    // membrane still looks elastic, and the node then flies in one step.
+    const double shear = std::sqrt(nU.z() * nU.z() + nV.z() * nV.z()) / h;
+    const double drill = factor * std::sqrt(mU.z() * mU.z() + mV.z() * mV.z());
+    const double plane = std::max(top, bottom);
+    return std::sqrt(plane * plane + 3.0 * shear * shear + drill * drill);
 }
 
 const ReissnerPlasticData* asPlastic(const chrono::fea::ChShellReissnerInternalData& data) {
@@ -73,6 +79,27 @@ void ThermalReissnerElasticity::ComputeStress(chrono::ChVector3d& nU,
     ev.y() -= _thermal;
     chrono::fea::ChElasticityReissnerIsothropic::ComputeStress(nU, nV, mU, mV, eu, ev, kurU, kurV, zInf,
                                                                zSup, angle);
+    if (_stiffness != 1.0) {
+        nU *= _stiffness;
+        nV *= _stiffness;
+        mU *= _stiffness;
+        mV *= _stiffness;
+    }
+}
+
+void ThermalReissnerElasticity::ComputeStiffnessMatrix(chrono::ChMatrixRef mC,
+                                                       const chrono::ChVector3d& epsU,
+                                                       const chrono::ChVector3d& epsV,
+                                                       const chrono::ChVector3d& kurU,
+                                                       const chrono::ChVector3d& kurV,
+                                                       double zInf,
+                                                       double zSup,
+                                                       double angle)
+{
+    chrono::fea::ChElasticityReissnerIsothropic::ComputeStiffnessMatrix(mC, epsU, epsV, kurU, kurV, zInf,
+                                                                        zSup, angle);
+    if (_stiffness != 1.0)
+        mC *= _stiffness;
 }
 
 ReissnerJ2::ReissnerJ2(double yieldStress, double youngsModulus)
@@ -111,6 +138,7 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
 
     elasticity->ComputeStress(nU, nV, mU, mV, epsU, epsV, kurU, kurV, zInf, zSup, angle);
     const double thickness = std::abs(zSup - zInf);
+    const double yield = _yield * _yieldScale;
     const double vm = peakVonMises(nU, nV, mU, mV, thickness);
 
     auto store = [&](const ReissnerPlasticData& state, bool yielded) {
@@ -121,26 +149,140 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
         return yielded;
     };
 
-    if (!(vm > _yield) || _yield <= 0.0) {
+    if (!(vm > yield) || yield <= 0.0) {
         ReissnerPlasticData kept = old;
         kept.p_strain_acc = old.p_strain_acc;
         return store(kept, false);
     }
 
-    const double scale = std::clamp(_yield / vm, 0.0, 1.0);
-    epsU *= scale;
-    epsV *= scale;
+    double scale = std::clamp(yield / vm, 0.0, 1.0);
+    double thermal = 0.0;
+    if (const auto* law = dynamic_cast<const ThermalReissnerElasticity*>(elasticity))
+        thermal = law->thermalStrain();
+    const double halfH = 0.5 * thickness;
+    const double trialShear = std::sqrt(epsU.z() * epsU.z() + epsV.z() * epsV.z());
+    const double kurY = kurU.y();
+    const double kurX = kurV.x();
+    // Thermal strain is a stress offset, not plastic strain. Scale only the
+    // mechanical part that remains after it is removed, or the next step
+    // subtracts the full thermal strain again and the residual runs away.
+    chrono::ChVector3d mechU = epsU;
+    chrono::ChVector3d mechV = epsV;
+    mechU.x() = thermal + scale * (epsU.x() - thermal);
+    mechV.y() = thermal + scale * (epsV.y() - thermal);
+    mechU.y() *= scale;
+    mechU.z() *= scale;
+    mechV.x() *= scale;
+    mechV.z() *= scale;
     kurU *= scale;
     kurV *= scale;
-    elasticity->ComputeStress(nU, nV, mU, mV, epsU, epsV, kurU, kurV, zInf, zSup, angle);
+    elasticity->ComputeStress(nU, nV, mU, mV, mechU, mechV, kurU, kurV, zInf, zSup, angle);
+    const double vmBack = peakVonMises(nU, nV, mU, mV, thickness);
+    if (vmBack > yield && vmBack > 0.0) {
+        const double extra = yield / vmBack;
+        nU *= extra;
+        nV *= extra;
+        mU *= extra;
+        mV *= extra;
+        scale *= extra;
+    }
 
     ReissnerPlasticData updated;
-    updated.epsU = epsUTrial - epsU;
-    updated.epsV = epsVTrial - epsV;
+    updated.epsU = epsUTrial - mechU;
+    updated.epsV = epsVTrial - mechV;
     updated.kurU = kurUTrial - kurU;
     updated.kurV = kurVTrial - kurV;
-    updated.p_strain_acc = old.p_strain_acc + (1.0 - scale) * vm / _young;
+    // Equivalent plastic strain from the geometric increment. Dividing the
+    // trial stress by the cold modulus under-counts ductility once the
+    // handbook has softened the metal, so a molten sheet never reached its
+    // tear strain.
+    const double dexx = (1.0 - scale) * (epsU.x() - thermal);
+    const double deyy = (1.0 - scale) * (epsV.y() - thermal);
+    const double dexy = (1.0 - scale) * 0.5 * (epsU.y() + epsV.x());
+    const double membrane = std::sqrt(std::max(0.0, dexx * dexx - dexx * deyy + deyy * deyy + 3.0 * dexy * dexy));
+    const double bkxx = (1.0 - scale) * kurY * halfH;
+    const double bkyy = (1.0 - scale) * kurX * halfH;
+    const double bend = std::sqrt(std::max(0.0, bkxx * bkxx - bkxx * bkyy + bkyy * bkyy));
+    const double shearInc = (1.0 - scale) * trialShear;
+    updated.p_strain_acc = old.p_strain_acc + std::max(membrane, std::max(bend, shearInc));
     return store(updated, true);
+}
+
+void ReissnerJ2::ComputeStiffnessMatrixElastoplastic(
+    chrono::ChMatrixRef K,
+    const chrono::ChVector3d& epsU,
+    const chrono::ChVector3d& epsV,
+    const chrono::ChVector3d& kurU,
+    const chrono::ChVector3d& kurV,
+    const chrono::fea::ChShellReissnerInternalData& data,
+    double zInf,
+    double zSup,
+    double angle)
+{
+    (void)data;
+    if (!section || !section->GetElasticity())
+        return;
+    // Chrono's numerical perfect-plastic tangent is singular on a molten yield
+    // surface and the step aborts. The temperature-scaled elastic tangent
+    // stays positive definite. The return mapping still caps the stress, so
+    // the face cannot carry a real load.
+    section->GetElasticity()->ComputeStiffnessMatrix(K, epsU, epsV, kurU, kurV, zInf, zSup, angle);
+}
+
+ThermalRayleighDamping::ThermalRayleighDamping(std::shared_ptr<ThermalReissnerElasticity> elasticity, double beta)
+    : _elasticity(std::move(elasticity)), _beta(beta) {}
+
+void ThermalRayleighDamping::refresh(double zInf, double zSup, double angle) {
+    if (!_elasticity)
+        return;
+    const double scale = _elasticity->stiffnessScale();
+    if (std::abs(scale - _cachedScale) <= 1.0e-6)
+        return;
+    const chrono::ChVector3d zero(0.0, 0.0, 0.0);
+    _elasticity->ComputeStiffnessMatrix(_stiffness, zero, zero, zero, zero, zInf, zSup, angle);
+    _cachedScale = scale;
+}
+
+void ThermalRayleighDamping::ComputeStress(chrono::ChVector3d& nU,
+                                           chrono::ChVector3d& nV,
+                                           chrono::ChVector3d& mU,
+                                           chrono::ChVector3d& mV,
+                                           const chrono::ChVector3d& depsU,
+                                           const chrono::ChVector3d& depsV,
+                                           const chrono::ChVector3d& dkurU,
+                                           const chrono::ChVector3d& dkurV,
+                                           double zInf,
+                                           double zSup,
+                                           double angle)
+{
+    refresh(zInf, zSup, angle);
+    chrono::ChVectorN<double, 12> rate;
+    rate.segment(0, 3) = depsU.eigen();
+    rate.segment(3, 3) = depsV.eigen();
+    rate.segment(6, 3) = dkurU.eigen();
+    rate.segment(9, 3) = dkurV.eigen();
+    const chrono::ChVectorN<double, 12> stress = _beta * _stiffness * rate;
+    nU = stress.segment(0, 3);
+    nV = stress.segment(3, 3);
+    mU = stress.segment(6, 3);
+    mV = stress.segment(9, 3);
+}
+
+void ThermalRayleighDamping::ComputeDampingMatrix(chrono::ChMatrixRef R,
+                                                  const chrono::ChVector3d& depsU,
+                                                  const chrono::ChVector3d& depsV,
+                                                  const chrono::ChVector3d& dkurU,
+                                                  const chrono::ChVector3d& dkurV,
+                                                  double zInf,
+                                                  double zSup,
+                                                  double angle)
+{
+    (void)depsU;
+    (void)depsV;
+    (void)dkurU;
+    (void)dkurV;
+    refresh(zInf, zSup, angle);
+    R = _beta * _stiffness;
 }
 
 void ReissnerJ2::CreatePlasticityData(

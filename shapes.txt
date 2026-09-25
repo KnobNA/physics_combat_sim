@@ -1,0 +1,52 @@
+﻿
+sphere: 5192 tets, faceted volume 8.792e-04 m^3 (analytic 9.048e-04)
+sphere meshes into tets                        ok
+sphere needs no shell skin                     ok
+sphere surface encloses the expected volume    ok
+  mass 2.3738 kg (surface volume gives 2.3739 kg)
+sphere fills its volume to within 6% by mass   ok
+    t=0.000 com y 0.1000 x 0.0001 lowest 0.04005
+    t=0.050 com y 0.0877 x 0.0002 lowest 0.02774
+    t=0.100 com y 0.0653 x 0.0014 lowest -0.00033
+    t=0.150 com y 0.0824 x 0.0077 lowest -0.00033
+    t=0.200 com y 0.0750 x 0.0140 lowest -0.00033
+    t=0.250 com y 0.0686 x 0.0212 lowest -0.00033
+    t=0.300 com y 0.0725 x 0.0296 lowest -0.00033
+    t=0.350 com y 0.0639 x 0.0389 lowest -0.00033
+    t=0.400 com y 0.0663 x 0.0505 lowest -0.00033
+    t=0.450 com y 0.0666 x 0.0606 lowest -0.00033
+    t=0.500 com y 0.0608 x 0.0695 lowest -0.00033
+    t=0.550 com y 0.0661 x 0.0757 lowest -0.00033
+  finite=1 lowest -0.00033 m, com travelled +0.0819 m in x
+sphere lands without diverging                 ok
+sphere does not sink into the floor            ok
+sphere rolls on its spin instead of locking    ok
+
+cylinder: 4549 tets, faceted volume 9.317e-04 m^3 (analytic 9.425e-04)
+cylinder meshes into tets                      ok
+cylinder needs no shell skin                   ok
+cylinder surface encloses the expected volume  ok
+  mass 2.5157 kg (surface volume gives 2.5157 kg)
+cylinder fills its volume to within 6% by mass ok
+    t=0.000 com y 0.0999 x 0.0001 lowest 0.03984
+    t=0.050 com y 0.0876 x 0.0000 lowest 0.01543
+    t=0.100 com y 0.0858 x -0.0040 lowest -0.00023
+    t=0.150 com y 0.0853 x -0.0110 lowest -0.00023
+    t=0.200 com y 0.0698 x -0.0217 lowest -0.00023
+    t=0.250 com y 0.0718 x -0.0398 lowest -0.00023
+    t=0.300 com y 0.0792 x -0.0448 lowest -0.00023
+    t=0.350 com y 0.0748 x -0.0456 lowest -0.00023
+    t=0.400 com y 0.0705 x -0.0380 lowest -0.00023
+    t=0.450 com y 0.0676 x -0.0265 lowest -0.00023
+    t=0.500 com y 0.0700 x -0.0205 lowest -0.00023
+    t=0.550 com y 0.0696 x -0.0235 lowest -0.00023
+  finite=1 lowest -0.00023 m, com travelled -0.0322 m in x
+cylinder lands without diverging               ok
+cylinder does not sink into the floor          ok
+
+cone: 4741 tets, faceted volume 5.218e-04 m^3 (analytic 5.278e-04)
+cone meshes into tets                          ok
+cone needs no shell skin                       ok
+cone surface encloses the expected volume      ok
+  mass 1.4088 kg (surface volume gives 1.4088 kg)
+cone fills its volume to within 6% by mass     ok

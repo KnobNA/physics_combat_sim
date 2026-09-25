@@ -1,0 +1,45 @@
+﻿solid cube meshes                              ok
+solid cube is only tetrahedra                  ok
+resting solid stays under the tet budget       ok
+solid cube tets 4931
+thin panel meshes                              ok
+thin panel is a tet volume                     ok
+brittle and compliant solids mesh the same way ok
+hollow six-panel box is thin tets with an empty cavity ok
+a resting solid cube does not diverge          ok
+hollow box rest finite broken 0
+hollow welded box rests without diverging      ok
+self-weight does not open a hollow-box seam    ok
+hit 6000 N over 20 ms, patch r=0.120 m, dt=0.00050 s
+Simulated 121 frames over 1.000000 s
+mass 19.91 kg, frames 121, peak stress 3.3 MPa, broken links 0
+run completed without diverging                ok
+recorded a full playback timeline              ok
+assembly mass is plausible                     ok
+start y [0.232, 0.868] -> end y [0.037, 0.549]
+touchdown 0.217 s, deepest 0.0010 m, rebound 0.087 m
+box starts clear of the floor                  ok
+the box reaches the floor                      ok
+box never sinks through the floor              ok
+the box does not bounce back off the floor     FAILED
+the box is still on the floor when the run ends ok
+no pre-stress at t = 0                         ok
+impact and landing produced stress             ok
+sound welds survive a 0.5 m drop               ok
+free fall at 0.092 s: 0.0413 m (expected 0.0415 m)
+free fall matches 1 g                          ok
+vertical span 0.512 m at t = 1.00 s (corner 0.69, edge 0.57, flat 0.40)
+box tips off its corner instead of balancing   ok
+.\build\bin\Release\combat_sim_physics_smoke.exe :   [ERROR] Integrator at minimum stepsize. Exiting.
+At C:\Users\nirav\AppData\Local\Temp\ps-script-11724e2e-46dc-47c4-819a-c5cf35c15405.ps1:107 char:1
++ .\build\bin\Release\combat_sim_physics_smoke.exe 2>&1 | Out-File -Enc ...
++ ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (  [ERROR] Integ...psize. Exiting.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+
+weak welds: diverged, broken links 60, peak stress 8.0 MPa
+weak-weld run stays stable after breaks        FAILED
+overloaded welds actually break                ok
+panels keep simulating after the box comes apart FAILED
+  [ERROR] Integrator at minimum stepsize. Exiting.

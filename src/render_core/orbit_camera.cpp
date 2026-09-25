@@ -32,7 +32,7 @@ void OrbitCamera::pan(const Vector2& deltaPixels) {
 
 void OrbitCamera::zoom(float scroll) {
     _distance *= Math::pow(0.9f, scroll);
-    _distance = Math::clamp(_distance, 0.4f, 20.0f);
+    _distance = Math::clamp(_distance, 0.4f, 400.0f);
 }
 
 Vector3 OrbitCamera::position() const {
@@ -48,7 +48,8 @@ Matrix4 OrbitCamera::viewMatrix() const {
 }
 
 Matrix4 OrbitCamera::projectionMatrix() const {
-    return Matrix4::perspectiveProjection(35.0_degf, _aspect, 0.05f, 80.0f);
+    const float far = Math::max(80.0f, _distance * 8.0f);
+    return Matrix4::perspectiveProjection(35.0_degf, _aspect, 0.05f, far);
 }
 
 void OrbitCamera::rayFromFramebuffer(const Vector2& framebufferPos,

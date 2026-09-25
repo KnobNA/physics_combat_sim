@@ -1,4 +1,5 @@
 #include "physics_core/simulator.hpp"
+#include "physics_core/mesh_split.hpp"
 
 #include "chrono/ChConfig.h"
 #include "chrono/solver/ChDirectSolverLS.h"
@@ -45,7 +46,7 @@ Simulator::Simulator() {
     _system.SetTimestepperType(ChTimestepper::Type::HHT);
     if (auto hht = std::dynamic_pointer_cast<ChTimestepperHHT>(_system.GetTimestepper())) {
         hht->SetAlpha(-0.05);
-        hht->SetMaxIters(10);
+        hht->SetMaxIters(30);
         hht->SetRelTolerance(1e-4);
         hht->SetAbsTolerances(1e-6, 1e-4);
         hht->SetStepControl(true);
@@ -62,7 +63,13 @@ Simulator::Simulator() {
 void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scenario) {
     _system.Clear();
     _assembly = Assembly{};
-    _assembly.build(_system, definition);
+    AssemblyDefinition meshed = definition;
+    for (auto& part : meshed.parts) {
+        if (part.simulate)
+            ensurePartMesh(part);
+    }
+    _assembly.build(_system, meshed);
+    _assembly.setDynamicResolution(scenario.settings.dynamicResolution);
     _assembly.place(scenario.initial);
     _assembly.bindLoads(scenario.loads);
 
@@ -80,18 +87,70 @@ void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scen
 }
 
 bool Simulator::step(double dt, double time, const Environment& environment,
-                     const std::vector<ImpactLoad>& loads)
+                     const std::vector<ImpactLoad>& loads,
+                     const std::vector<HeatSource>& heat)
 {
-    _assembly.applyLoads(environment, loads, time, dt);
+    _assembly.advanceHeat(dt, time, environment, heat);
+    const bool volume = _assembly.maintainVolume(dt);
+    const bool impact = _assembly.prepareBrittleImpact(environment, dt);
+    const bool joints = _assembly.updateJoints(dt);
+    if (volume || impact || joints) {
+        if (volume || impact)
+            _system.Setup();
+        refreshLinearSolver();
+    }
+    if (_assembly.applyLoads(environment, loads, time, dt)) {
+        // Contact elements carry a Jacobian, so adding one changes the matrix.
+        _system.Setup();
+        refreshLinearSolver();
+    }
     try {
-        _system.DoStepDynamics(dt);
-    } catch (const std::exception&) {
-        // HHT throws when it has already cut the step to the minimum and the
-        // Newton solve still will not converge. That is a diverged run.
-        return false;
+        if (_assembly.hasFreeSolve()) {
+            const int subs = _assembly.compliantImpactSubsteps(environment, dt);
+            const double h = dt / static_cast<double>(subs);
+            for (int i = 0; i < subs; ++i)
+                _system.DoStepDynamics(h);
+        }
+    } catch (const std::exception& error) {
+        if (std::getenv("RCS_TRACE"))
+            std::printf("  [step threw at t=%.4f: %s]\n", time, error.what());
+        const bool again = _assembly.maintainVolume(dt) || _assembly.updateJoints(dt);
+        auto retryWithoutDebris = [&]() {
+            if (!_assembly.discardAwakeShards())
+                return false;
+            _assembly.applyLoads(environment, loads, time, dt);
+            _system.Setup();
+            refreshLinearSolver();
+            try {
+                _system.DoStepDynamics(dt);
+            } catch (const std::exception&) {
+                return false;
+            }
+            return true;
+        };
+        if (again) {
+            _system.Setup();
+            refreshLinearSolver();
+            try {
+                _system.DoStepDynamics(dt);
+            } catch (const std::exception&) {
+                if (retryWithoutDebris())
+                    return _assembly.finite();
+                bool anyLive = false;
+                for (const auto& part : _assembly.parts())
+                    anyLive = anyLive || part.liveTetCount() > 0 || !part.quads().empty();
+                return !anyLive && _assembly.finite();
+            }
+        } else if (retryWithoutDebris()) {
+            return _assembly.finite();
+        } else {
+            bool anyLive = false;
+            for (const auto& part : _assembly.parts())
+                anyLive = anyLive || part.liveTetCount() > 0 || !part.quads().empty();
+            return !anyLive && _assembly.finite();
+        }
     }
     _assembly.integrateShards(dt, environment);
-    const bool joints = _assembly.updateJoints(dt);
     const bool torn = _assembly.tearOverstretched();
     const bool spanned = (joints || torn) && _assembly.respan();
     if (joints || torn || spanned) {
@@ -161,7 +220,7 @@ Recording Simulator::run(const AssemblyDefinition& definition,
             break;
         }
 
-        if (!step(dt, time, scenario.environment, scenario.loads)) {
+        if (!step(dt, time, scenario.environment, scenario.loads, scenario.heatSources)) {
             recording.diverged = true;
             recording.message = "Solver diverged at t = " + std::to_string(time) + " s";
             break;

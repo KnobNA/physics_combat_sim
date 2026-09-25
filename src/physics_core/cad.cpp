@@ -1,4 +1,5 @@
 #include "physics_core/cad.hpp"
+#include "physics_core/mesh_split.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -294,6 +295,7 @@ AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
 
     AssemblyDefinition assembly;
     assembly.name = "Welded test box";
+    assembly.groups.push_back(GroupDefinition{"Shell cube", -1});
 
     // Axes are ordered so that u x v points out of the box.
     assembly.parts.push_back(panel("Bottom", options.material, t, n, {-h, -h, -h}, x, z, size));
@@ -302,6 +304,8 @@ AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
     assembly.parts.push_back(panel("Back", options.material, t, n, {-h, -h, -h}, y, x, size));
     assembly.parts.push_back(panel("Right", options.material, t, n, {h, -h, -h}, y, z, size));
     assembly.parts.push_back(panel("Left", options.material, t, n, {-h, -h, -h}, z, y, size));
+    for (auto& part : assembly.parts)
+        part.group = 0;
 
     enum { kBottom = 0, kTop, kFront, kBack, kRight, kLeft };
     const std::pair<int, int> seams[12] = {
@@ -350,24 +354,18 @@ bool importAssembly(const std::string& path, AssemblyDefinition& out, std::strin
     for (std::size_t i = 0; i < meshes.size(); ++i) {
         if (meshes[i].triangles.empty())
             continue;
-        if (isChunkySolid(meshes[i])) {
-            if (!skipped.empty())
-                skipped += ", ";
-            skipped += names[i];
-            continue;
-        }
         PartDefinition part;
         part.name = names[i].empty() ? ("Part " + std::to_string(assembly.parts.size() + 1)) : names[i];
         part.material = aluminum6061();
         part.thickness = 0.008;
-        part.surface = std::move(meshes[i]);
+        part.source = std::move(meshes[i]);
         keptIndex.push_back(assembly.parts.size());
-        kept.push_back(part.surface);
+        kept.push_back(part.source);
         assembly.parts.push_back(std::move(part));
     }
     if (assembly.parts.empty()) {
-        error = skipped.empty() ? "The file had no shell surfaces."
-                                : "Skipped solid bodies (export them as surfaces): " + skipped;
+        error = skipped.empty() ? "The file had no surfaces."
+                                : "Could not mesh: " + skipped;
         return false;
     }
 
@@ -392,7 +390,7 @@ bool importAssembly(const std::string& path, AssemblyDefinition& out, std::strin
     }
 
     if (!skipped.empty())
-        error = "Imported shells. Skipped solid bodies (they need a volume mesh): " + skipped;
+        error = "Imported what could be meshed. Failed: " + skipped;
     out = std::move(assembly);
     return true;
 }

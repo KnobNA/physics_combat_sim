@@ -28,17 +28,29 @@ struct EditorState {
 
     ShadeMode shade = ShadeMode::Stress;
     bool autoStressScale = true;
+    bool showAir = false;
+    /// Hover readout for the temperature or stress view. `probeValue` is
+    /// kelvin or pascals, matching the active shade mode.
+    bool probeVisible = false;
+    float probeValue = 0.0f;
     float stressScale = 2.76e8f;  ///< Pa mapped to the top of the colour ramp
 
     std::optional<std::size_t> selectedPart;
+    /// Empty folder selection. Mutually exclusive with `selectedPart`.
+    std::optional<std::size_t> selectedGroup;
+    bool addGroupRequested = false;
     int selectedLoad = -1;
+    int selectedHeat = -1;
 
     bool simulateRequested = false;
     bool cancelRequested = false;
     bool rebuildRequested = false;
     bool addLoadRequested = false;
     int removeLoadIndex = -1;
+    bool addHeatRequested = false;
+    int removeHeatIndex = -1;
     bool importRequested = false;
+    bool addSolidCubeRequested = false;
     std::string importPath;
 
     std::string status;
@@ -59,5 +71,10 @@ struct UiContext {
 };
 
 void drawEditorUi(EditorState& state, const UiContext& context);
+
+/// Metre ticks on the floor grid, and the length of the three axis edges.
+void drawArenaOverlay(const Environment& environment,
+                      const Magnum::Matrix4& view,
+                      const Magnum::Matrix4& projection);
 
 }  // namespace rcs

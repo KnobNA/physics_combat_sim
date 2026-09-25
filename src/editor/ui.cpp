@@ -75,6 +75,32 @@ void drawStressLegend(float scale) {
     ImGui::TextDisabled("%s", formatStress(scale).c_str());
 }
 
+void drawTemperatureLegend() {
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 origin = ImGui::GetCursorScreenPos();
+    const float width = 16.0f;
+    const float height = 120.0f;
+    constexpr int kSegments = 32;
+    for (int i = 0; i < kSegments; ++i) {
+        const float t0 = float(i) / kSegments;
+        const float t1 = float(i + 1) / kSegments;
+        const Magnum::Color3 c = SceneRenderer::temperatureColor(2000.0f * (1.0f - t0));
+        const ImVec4 rgba{c.r(), c.g(), c.b(), 1.0f};
+        draw->AddRectFilled({origin.x, origin.y + height * t0},
+                            {origin.x + width, origin.y + height * t1},
+                            ImGui::GetColorU32(rgba));
+    }
+    ImGui::Dummy({width, height});
+    ImGui::SameLine();
+    ImGui::BeginGroup();
+    ImGui::TextDisabled("2000 K");
+    ImGui::Dummy({1.0f, height * 0.72f});
+    ImGui::TextDisabled("293 K");
+    ImGui::Dummy({1.0f, height * 0.08f});
+    ImGui::TextDisabled("0 K");
+    ImGui::EndGroup();
+}
+
 void drawAssemblyPanel(EditorState& state, const UiContext& context) {
     if (!ImGui::CollapsingHeader("Assembly", ImGuiTreeNodeFlags_DefaultOpen))
         return;
@@ -86,22 +112,138 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
                         context.layout->parts.size(), context.layout->joints.size(),
                         context.assemblyMass);
 
-    if (ImGui::BeginListBox("##parts", {-1.0f, 110.0f})) {
-        for (std::size_t i = 0; i < context.layout->parts.size(); ++i) {
-            const PartLayout& part = context.layout->parts[i];
-            const bool selected = state.selectedPart && *state.selectedPart == i;
-            char label[128];
-            std::snprintf(label, sizeof(label), "%s  (%s, %.1f mm)", part.name.c_str(),
-                          part.materialName.c_str(), part.thickness * 1000.0f);
-            if (ImGui::Selectable(label, selected))
-                state.selectedPart = i;
+    const std::size_t partCount = std::min(context.definition->parts.size(), context.layout->parts.size());
+    auto setPartBranch = [&](std::size_t index, bool on, auto& self) -> void {
+        if (index >= context.definition->parts.size())
+            return;
+        context.definition->parts[index].simulate = on;
+        for (std::size_t i = 0; i < context.definition->parts.size(); ++i)
+            if (context.definition->parts[i].parentPart == static_cast<int>(index))
+                self(i, on, self);
+    };
+    auto setFolder = [&](int groupIndex, bool on, auto& self) -> void {
+        if (groupIndex < 0 || static_cast<std::size_t>(groupIndex) >= context.definition->groups.size())
+            return;
+        context.definition->groups[static_cast<std::size_t>(groupIndex)].simulate = on;
+        for (int child = 0; child < static_cast<int>(context.definition->groups.size()); ++child)
+            if (context.definition->groups[static_cast<std::size_t>(child)].parent == groupIndex)
+                self(child, on, self);
+        for (std::size_t i = 0; i < context.definition->parts.size(); ++i)
+            if (context.definition->parts[i].group == groupIndex && context.definition->parts[i].parentPart < 0)
+                setPartBranch(i, on, setPartBranch);
+        state.rebuildRequested = true;
+    };
+    auto showPart = [&](std::size_t i, auto& drawChildren) -> void {
+        const PartDefinition& defined = context.definition->parts[i];
+        const PartLayout& layout = context.layout->parts[i];
+        char label[160];
+        if (defined.simulate && layout.volume)
+            std::snprintf(label, sizeof(label), "%s  (%s, solid, %d tets)", defined.name.c_str(),
+                          defined.material.name.c_str(), layout.tetCount);
+        else if (defined.simulate)
+            std::snprintf(label, sizeof(label), "%s  (%s, %.1f mm)", defined.name.c_str(),
+                          defined.material.name.c_str(), defined.thickness * 1000.0);
+        else
+            std::snprintf(label, sizeof(label), "%s  (off)", defined.name.c_str());
+        const bool partSelected = state.selectedPart && *state.selectedPart == i;
+        ImGui::PushID(static_cast<int>(i) + 1000);
+        ImGui::BeginDisabled(context.simulating);
+        bool on = context.definition->parts[i].simulate;
+        if (ImGui::Checkbox("##sim", &on)) {
+            setPartBranch(i, on, setPartBranch);
+            state.rebuildRequested = true;
         }
-        ImGui::EndListBox();
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Include this part in the view and the simulation");
+        ImGui::SameLine();
+        if (ImGui::Selectable(label, partSelected)) {
+            state.selectedPart = i;
+            state.selectedGroup.reset();
+        }
+        drawChildren(i);
+        ImGui::PopID();
+    };
+    auto drawChildren = [&](std::size_t parent, auto& self) -> void {
+        for (std::size_t i = 0; i < partCount; ++i) {
+            if (context.definition->parts[i].parentPart != static_cast<int>(parent))
+                continue;
+            ImGui::Indent();
+            showPart(i, [&](std::size_t child) { self(child, self); });
+            ImGui::Unindent();
+        }
+    };
+    auto drawGroup = [&](int groupIndex, auto& self) -> void {
+        const GroupDefinition& group = context.definition->groups[static_cast<std::size_t>(groupIndex)];
+        const bool selected = state.selectedGroup && *state.selectedGroup == static_cast<std::size_t>(groupIndex);
+        ImGui::PushID(groupIndex);
+        ImGui::BeginDisabled(context.simulating);
+        bool on = group.simulate;
+        if (ImGui::Checkbox("##sim", &on))
+            setFolder(groupIndex, on, setFolder);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Turn every child of this folder on or off");
+        ImGui::SameLine();
+        const ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_DefaultOpen | ImGuiTreeNodeFlags_OpenOnArrow |
+                                         (selected ? ImGuiTreeNodeFlags_Selected : 0);
+        const bool open = ImGui::TreeNodeEx(group.name.c_str(), flags);
+        if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
+            state.selectedGroup = static_cast<std::size_t>(groupIndex);
+            state.selectedPart.reset();
+        }
+        if (open) {
+            for (int child = 0; child < static_cast<int>(context.definition->groups.size()); ++child) {
+                if (context.definition->groups[static_cast<std::size_t>(child)].parent == groupIndex)
+                    self(child, self);
+            }
+            for (std::size_t i = 0; i < partCount; ++i) {
+                const PartDefinition& part = context.definition->parts[i];
+                if (part.group != groupIndex || part.parentPart >= 0)
+                    continue;
+                showPart(i, [&](std::size_t child) { drawChildren(child, drawChildren); });
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    };
+    for (int g = 0; g < static_cast<int>(context.definition->groups.size()); ++g) {
+        if (context.definition->groups[static_cast<std::size_t>(g)].parent < 0)
+            drawGroup(g, drawGroup);
     }
+    for (std::size_t i = 0; i < partCount; ++i) {
+        const PartDefinition& part = context.definition->parts[i];
+        if (part.group >= 0 || part.parentPart >= 0)
+            continue;
+        showPart(i, [&](std::size_t child) { drawChildren(child, drawChildren); });
+    }
+    ImGui::BeginDisabled(context.simulating);
+    if (ImGui::Button("New folder", {-1.0f, 0.0f}))
+        state.addGroupRequested = true;
+    ImGui::EndDisabled();
 
     if (state.selectedPart && context.definition &&
         *state.selectedPart < context.definition->parts.size()) {
         PartDefinition& part = context.definition->parts[*state.selectedPart];
+        const char* folderLabel = "(none)";
+        if (part.group >= 0 && static_cast<std::size_t>(part.group) < context.definition->groups.size())
+            folderLabel = context.definition->groups[static_cast<std::size_t>(part.group)].name.c_str();
+        if (ImGui::BeginCombo("Folder", folderLabel)) {
+            if (ImGui::Selectable("(none)", part.group < 0)) {
+                part.group = -1;
+                state.rebuildRequested = true;
+            }
+            for (int g = 0; g < static_cast<int>(context.definition->groups.size()); ++g) {
+                const bool chosen = part.group == g;
+                if (ImGui::Selectable(context.definition->groups[static_cast<std::size_t>(g)].name.c_str(), chosen)) {
+                    part.group = g;
+                    part.parentPart = -1;
+                    state.rebuildRequested = true;
+                }
+            }
+            ImGui::EndCombo();
+        }
+        ImGui::TextDisabled("Moving a folder moves its children and leaves everything else where it is.");
         const auto presets = materialPresets();
         int preset = presetIndex(part.material);
         if (ImGui::Combo("Material##preset", &preset, presetName,
@@ -143,7 +285,10 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
             edited |= scalarControl("Expansion (1/K)", material.thermalExpansion, 1.0e-7f, 0.0f, 5.0e-4f, "%.3g");
             edited |= scalarControl("Specific heat", material.specificHeat, 5.0f, 0.0f, 5000.0f, "%.0f");
             edited |= scalarControl("Conductivity", material.conductivity, 0.5f, 0.0f, 500.0f, "%.2f");
-            ImGui::TextDisabled("Temperature stays at the reference until heat is simulated.");
+            edited |= scalarControl("Emissivity", material.emissivity, 0.01f, 0.0f, 1.0f, "%.2f");
+            ImGui::TextDisabled("Stiffness and yield follow the handbook curve and keep falling past the solidus.");
+            edited |= scalarControl("Initial temperature (K)", part.initialTemperature, 1.0f, 0.0f, 4000.0f, "%.2f");
+            ImGui::TextDisabled("The mesh is unstressed at this temperature. Room is 293.15 K.");
             ImGui::TreePop();
         }
         if (edited) {
@@ -190,7 +335,44 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
     if (ImGui::Button("Import surface", {-1.0f, 0.0f}))
         state.importRequested = true;
     ImGui::EndDisabled();
-    ImGui::TextDisabled("One part per object. Welds stay manual. Solids are skipped.");
+    ImGui::BeginDisabled(context.simulating);
+    if (ImGui::Button("Add solid aluminum cube", {-1.0f, 0.0f}))
+        state.addSolidCubeRequested = true;
+    ImGui::EndDisabled();
+    ImGui::TextDisabled("Thin walls stay shells. Thick regions are tetrahedra. Welds stay manual.");
+
+    if (state.selectedPart && context.definition &&
+        *state.selectedPart < context.definition->parts.size()) {
+        PartDefinition& sized = context.definition->parts[*state.selectedPart];
+        if (!sized.source.empty() || !sized.volume.empty()) {
+            if (ImGui::TreeNode("Mesh size")) {
+                bool edited = false;
+                edited |= ImGui::InputDouble("Shell cutoff (m)", &sized.sizing.shellCutoff, 0.0, 0.0, "%.4f");
+                edited |= ImGui::InputDouble("Min element (m)", &sized.sizing.minElement, 0.0, 0.0, "%.4f");
+                edited |= ImGui::InputDouble("Max element (m)", &sized.sizing.maxElement, 0.0, 0.0, "%.4f");
+                int through = sized.sizing.throughThickness;
+                if (ImGui::InputInt("Elements through thickness", &through)) {
+                    sized.sizing.throughThickness = std::clamp(through, 1, 8);
+                    edited = true;
+                }
+                if (!sized.volume.empty())
+                    ImGui::TextDisabled("%zu tets, element %.1f mm", sized.volume.tets.size(),
+                                        sized.volume.elementSize * 1000.0);
+                if (!sized.surface.empty())
+                    ImGui::TextDisabled("%zu shell triangles", sized.surface.triangles.size());
+                if (edited) {
+                    sized.sizing.shellCutoff = std::clamp(sized.sizing.shellCutoff, 0.0005, 0.05);
+                    sized.sizing.minElement = std::clamp(sized.sizing.minElement, 0.0005, sized.sizing.maxElement);
+                    sized.sizing.maxElement = std::clamp(sized.sizing.maxElement, sized.sizing.minElement, 0.1);
+                    sized.sizing.cached = false;
+                    sized.volume = {};
+                    sized.surface = {};
+                    state.rebuildRequested = true;
+                }
+                ImGui::TreePop();
+            }
+        }
+    }
 }
 
 void drawScenarioPanel(EditorState& state) {
@@ -226,6 +408,13 @@ void drawScenarioPanel(EditorState& state) {
     dirty |= ImGui::Checkbox("Floor", &environment.floorEnabled);
     if (environment.floorEnabled)
         dirty |= scalarControl("Floor height (m)", environment.floorHeight, 0.01f, -10.0f, 10.0f, "%.3f");
+    scalarControl("Arena width (m)", environment.boundsSize.x(), 0.1f, 1.0f, 200.0f, "%.2f");
+    scalarControl("Arena height (m)", environment.boundsSize.y(), 0.1f, 1.0f, 200.0f, "%.2f");
+    scalarControl("Arena depth (m)", environment.boundsSize.z(), 0.1f, 1.0f, 200.0f, "%.2f");
+    scalarControl("Ambient (K)", environment.ambientTemperature, 0.5f, 0.0f, 4000.0f, "%.2f");
+    ImGui::TextDisabled("White edges mark the arena. Grid lines are %g m. Parts stay inside.",
+                        Environment::gridStep(std::max(environment.boundsSize.x(),
+                                                       environment.boundsSize.z())));
 
     if (ImGui::TreeNode("Contact")) {
         scalarControl("Stiffness (N/m)", environment.contactStiffness, 1.0e4f, 1.0e3f, 1.0e9f, "%.3g");
@@ -257,9 +446,15 @@ void drawLoadsPanel(EditorState& state, const UiContext& context) {
     if (ImGui::BeginListBox("##loads", {-1.0f, 80.0f})) {
         for (int i = 0; i < int(loads.size()); ++i) {
             char label[160];
-            std::snprintf(label, sizeof(label), "%s  %.0f N @ %.3f s%s", loads[i].name.c_str(),
-                          loads[i].force, loads[i].startTime,
-                          loads[i].enabled ? "" : "  (off)");
+            if (loads[i].rampTime > 1.0e-9) {
+                std::snprintf(label, sizeof(label), "%s  %.0f to %.0f N @ %.3f s%s", loads[i].name.c_str(),
+                              loads[i].initialForce, loads[i].finalForce, loads[i].startTime,
+                              loads[i].enabled ? "" : "  (off)");
+            } else {
+                std::snprintf(label, sizeof(label), "%s  %.0f N @ %.3f s%s", loads[i].name.c_str(),
+                              loads[i].finalForce, loads[i].startTime,
+                              loads[i].enabled ? "" : "  (off)");
+            }
             if (ImGui::Selectable(label, state.selectedLoad == i))
                 state.selectedLoad = i;
         }
@@ -294,11 +489,36 @@ void drawLoadsPanel(EditorState& state, const UiContext& context) {
 
     vectorControl("Hit point (m)", load.point, 0.005f);
     vectorControl("Direction", load.direction, 0.01f, "%.2f");
-    scalarControl("Force (N)", load.force, 50.0f, 0.0f, 1.0e7f, "%.0f");
+    scalarControl("Initial force (N)", load.initialForce, 50.0f, -1.0e7f, 1.0e7f, "%.0f");
+    scalarControl("Final force (N)", load.finalForce, 50.0f, -1.0e7f, 1.0e7f, "%.0f");
+    scalarControl("Ramp time (s)", load.rampTime, 0.005f, 0.0f, 30.0f, "%.3f");
+    const char* rampNames[] = {"Linear", "Logarithmic", "Exponential", "Polynomial"};
+    int ramp = static_cast<int>(load.ramp);
+    if (ImGui::Combo("Ramp", &ramp, rampNames, 4))
+        load.ramp = static_cast<LoadRamp>(ramp);
+    if (load.ramp == LoadRamp::Polynomial)
+        ImGui::DragInt("Degree", &load.polynomialDegree, 0.1f, 1, 8);
     scalarControl("Patch radius (m)", load.radius, 0.002f, 0.001f, 1.0f, "%.3f");
     scalarControl("Start (s)", load.startTime, 0.005f, 0.0f, 60.0f, "%.3f");
-    scalarControl("Duration (s)##load", load.duration, 0.001f, 0.0001f, 10.0f, "%.4f");
-    ImGui::TextDisabled("Impulse %.1f N*s", load.force * load.duration);
+    scalarControl("Duration (s)##load", load.duration, 0.001f, 0.0001f, 30.0f, "%.4f");
+    double impulse = 0.0;
+    const int samples = 48;
+    for (int i = 0; i < samples; ++i) {
+        const double t = load.startTime + (static_cast<double>(i) + 0.5) / samples * load.duration;
+        impulse += loadMagnitude(load, t);
+    }
+    impulse *= load.duration / samples;
+    ImGui::TextDisabled("Impulse %.1f N*s", impulse);
+    ImGui::TextDisabled(
+        "Force moves from initial to final over the ramp, then holds until the duration ends. A ramp time of zero applies the final force immediately.");
+    if (load.rampTime > load.duration + 1.0e-6) {
+        const double reached =
+            loadMagnitude(load, load.startTime + std::max(0.0, load.duration - 1.0e-6));
+        ImGui::TextColored({0.95f, 0.6f, 0.25f, 1.0f},
+                           "Duration is shorter than the ramp, so this hit only reaches %.0f N "
+                           "(impulse %.1f N*s), not the final force.",
+                           reached, impulse);
+    }
 
     if (std::size_t(state.selectedLoad) < context.loadAdvice.size()) {
         const auto& advice = context.loadAdvice[std::size_t(state.selectedLoad)];
@@ -316,6 +536,49 @@ void drawLoadsPanel(EditorState& state, const UiContext& context) {
     }
 }
 
+void drawHeatPanel(EditorState& state) {
+    if (!ImGui::CollapsingHeader("Heat sources"))
+        return;
+
+    auto& sources = state.scenario.heatSources;
+    if (ImGui::Button("Add heat"))
+        state.addHeatRequested = true;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(state.selectedHeat < 0);
+    if (ImGui::Button("Remove##heat"))
+        state.removeHeatIndex = state.selectedHeat;
+    ImGui::EndDisabled();
+
+    if (ImGui::BeginListBox("##heat", {-1.0f, 72.0f})) {
+        for (int i = 0; i < int(sources.size()); ++i) {
+            char label[160];
+            std::snprintf(label, sizeof(label), "%s  %.0f K @ %.2f s%s", sources[i].name.c_str(),
+                          sources[i].temperature, sources[i].startTime,
+                          sources[i].enabled ? "" : "  (off)");
+            if (ImGui::Selectable(label, state.selectedHeat == i))
+                state.selectedHeat = i;
+        }
+        ImGui::EndListBox();
+    }
+
+    if (state.selectedHeat < 0 || state.selectedHeat >= int(sources.size())) {
+        ImGui::TextDisabled("A sphere. No collision. Hotter than the air adds energy.");
+        return;
+    }
+
+    HeatSource& source = sources[std::size_t(state.selectedHeat)];
+    char nameBuffer[64];
+    std::snprintf(nameBuffer, sizeof(nameBuffer), "%s", source.name.c_str());
+    if (ImGui::InputText("Name##heat", nameBuffer, sizeof(nameBuffer)))
+        source.name = nameBuffer;
+    ImGui::Checkbox("Enabled##heat", &source.enabled);
+    vectorControl("Centre (m)", source.point, 0.01f);
+    scalarControl("Radius (m)##heat", source.radius, 0.005f, 0.01f, 5.0f, "%.3f");
+    scalarControl("Temperature (K)", source.temperature, 5.0f, 0.0f, 4000.0f, "%.1f");
+    scalarControl("Start (s)##heat", source.startTime, 0.01f, 0.0f, 60.0f, "%.3f");
+    scalarControl("Duration (s)##heat", source.duration, 0.01f, 0.0f, 60.0f, "%.3f");
+}
+
 void drawRunPanel(EditorState& state, const UiContext& context) {
     ImGui::SeparatorText("Run");
 
@@ -326,6 +589,10 @@ void drawRunPanel(EditorState& state, const UiContext& context) {
     } else {
         if (ImGui::Button("Simulate", {-1.0f, 32.0f}))
             state.simulateRequested = true;
+        scalarControl("Resolution", state.scenario.settings.meshResolution, 0.05f, 0.25f, 8.0f, "%.2f");
+        ImGui::TextDisabled("1 is the part's own element size. Higher adds tetrahedra everywhere.");
+        ImGui::Checkbox("Dynamic Resolution", &state.scenario.settings.dynamicResolution);
+        ImGui::TextDisabled("When on, a hot or loaded spot is split finer than this mesh.");
     }
 
     if (!state.status.empty())
@@ -392,15 +659,20 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
     drawAssemblyPanel(state, context);
     drawScenarioPanel(state);
     drawLoadsPanel(state, context);
+    drawHeatPanel(state);
     drawRunPanel(state, context);
 
     ImGui::SeparatorText("View");
-    int shade = state.shade == ShadeMode::Stress ? 1 : 0;
+    int shade = state.shade == ShadeMode::Temperature ? 2 : state.shade == ShadeMode::Stress ? 1 : 0;
     if (ImGui::RadioButton("Material##shade", shade == 0))
         state.shade = ShadeMode::Material;
     ImGui::SameLine();
     if (ImGui::RadioButton("Stress", shade == 1))
         state.shade = ShadeMode::Stress;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Temperature", shade == 2))
+        state.shade = ShadeMode::Temperature;
+    ImGui::Checkbox("Show air temperature", &state.showAir);
 
     if (state.shade == ShadeMode::Stress) {
         ImGui::Checkbox("Auto scale", &state.autoStressScale);
@@ -413,6 +685,8 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
         if (context.recording)
             ImGui::TextDisabled("Run peak: %s", formatStress(context.recording->maxStress).c_str());
     }
+    if (state.shade == ShadeMode::Temperature)
+        drawTemperatureLegend();
 
     ImGui::SeparatorText("Tools");
     ImGui::BeginDisabled(context.simulating);
@@ -430,7 +704,109 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
 
     ImGui::End();
 
+    if (state.probeVisible &&
+        (state.shade == ShadeMode::Temperature || state.shade == ShadeMode::Stress)) {
+        const ImVec2 mouse = ImGui::GetMousePos();
+        ImGui::SetNextWindowPos({mouse.x + 16.0f, mouse.y + 16.0f}, ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.92f);
+        ImGui::Begin("##probe", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                         ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
+        if (state.shade == ShadeMode::Temperature)
+            ImGui::Text("%.1f K", state.probeValue);
+        else
+            ImGui::Text("%s", formatStress(state.probeValue).c_str());
+        ImGui::End();
+    }
+
     drawPlaybackWindow(state, context);
+}
+
+void drawArenaOverlay(const Environment& environment,
+                      const Magnum::Matrix4& view,
+                      const Magnum::Matrix4& projection)
+{
+    if (!environment.floorEnabled)
+        return;
+
+    const Magnum::Matrix4 clipFromWorld = projection * view;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    auto project = [&](const Magnum::Vector3& world, ImVec2& screen) {
+        const Magnum::Vector4 clip = clipFromWorld * Magnum::Vector4{world, 1.0f};
+        if (clip.w() <= 0.05f)
+            return false;
+        const float x = clip.x() / clip.w();
+        const float y = clip.y() / clip.w();
+        if (x < -1.05f || x > 1.05f || y < -1.05f || y > 1.05f)
+            return false;
+        screen.x = (x * 0.5f + 0.5f) * display.x;
+        screen.y = (1.0f - (y * 0.5f + 0.5f)) * display.y;
+        return true;
+    };
+    auto label = [](ImDrawList* draw, const ImVec2& at, const char* text, bool strong) {
+        const ImU32 fill = strong ? IM_COL32(255, 255, 255, 255) : IM_COL32(220, 224, 230, 230);
+        const ImVec2 size = ImGui::CalcTextSize(text);
+        const ImVec2 pos{at.x - size.x * 0.5f, at.y - size.y * 0.5f};
+        draw->AddText({pos.x + 1.0f, pos.y + 1.0f}, IM_COL32(0, 0, 0, 200), text);
+        draw->AddText(pos, fill, text);
+    };
+    auto formatLength = [](double metres, char* buffer, std::size_t count) {
+        if (std::abs(metres - std::round(metres)) < 0.05)
+            std::snprintf(buffer, count, "%.0f m", metres);
+        else
+            std::snprintf(buffer, count, "%.2f m", metres);
+    };
+
+    const double hx = std::max(0.5, environment.boundsSize.x() * 0.5);
+    const double hz = std::max(0.5, environment.boundsSize.z() * 0.5);
+    const double height = std::max(1.0, environment.boundsSize.y());
+    const float y0 = float(environment.floorHeight);
+    ImDrawList* draw = ImGui::GetBackgroundDrawList();
+
+    const auto ticks = [&](double limit, double step, auto place, auto textFor) {
+        const double start = std::ceil((-limit) / step - 1.0e-4) * step;
+        for (double t = start; t <= limit + 1.0e-3; t += step) {
+            ImVec2 screen;
+            if (!project(place(float(t)), screen))
+                continue;
+            char buffer[32];
+            textFor(t, buffer, sizeof(buffer));
+            label(draw, screen, buffer, false);
+        }
+    };
+    const double stepX = Environment::gridStep(environment.boundsSize.x());
+    const double stepZ = Environment::gridStep(environment.boundsSize.z());
+    ticks(hx, stepX,
+          [&](float x) { return Magnum::Vector3{x, y0, float(-hz) - 0.08f}; },
+          [](double t, char* buffer, std::size_t count) {
+              if (std::abs(t) < 1.0e-3)
+                  std::snprintf(buffer, count, "0 m");
+              else
+                  std::snprintf(buffer, count, "%.0f", t);
+          });
+    ticks(hz, stepZ,
+          [&](float z) { return Magnum::Vector3{float(-hx) - 0.08f, y0, z}; },
+          [](double t, char* buffer, std::size_t count) {
+              if (std::abs(t) < 1.0e-3)
+                  std::snprintf(buffer, count, "0 m");
+              else
+                  std::snprintf(buffer, count, "%.0f", t);
+          });
+
+    char length[32];
+    const Magnum::Vector3 axisEdge[3] = {
+        {0.0f, y0 + 0.35f, float(-hz) - 0.45f},
+        {float(-hx) - 0.45f, y0 + float(height) * 0.5f, float(-hz) - 0.25f},
+        {float(-hx) - 0.45f, y0 + 0.35f, 0.0f}
+    };
+    const double axisLength[3] = {environment.boundsSize.x(), height, environment.boundsSize.z()};
+    for (int i = 0; i < 3; ++i) {
+        ImVec2 screen;
+        if (!project(axisEdge[i], screen))
+            continue;
+        formatLength(axisLength[i], length, sizeof(length));
+        label(draw, {screen.x, screen.y - 14.0f}, length, true);
+    }
 }
 
 }  // namespace rcs
