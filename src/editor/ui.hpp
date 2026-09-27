@@ -1,14 +1,17 @@
 #pragma once
 
+#include "editor/faces.hpp"
 #include "editor/tools.hpp"
 #include "physics_core/assembly.hpp"
 #include "physics_core/recording.hpp"
 #include "physics_core/scenario.hpp"
 #include "render_core/renderer.hpp"
 
+#include <algorithm>
 #include <cstddef>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace rcs {
 
@@ -35,10 +38,17 @@ struct EditorState {
     float probeValue = 0.0f;
     float stressScale = 2.76e8f;  ///< Pa mapped to the top of the colour ramp
 
-    std::optional<std::size_t> selectedPart;
-    /// Empty folder selection. Mutually exclusive with `selectedPart`.
+    std::vector<std::size_t> selectedParts;
+    /// Empty folder selection. Mutually exclusive with a part selection.
     std::optional<std::size_t> selectedGroup;
+    bool selectFaces = false;
+    std::vector<FaceId> selectedFaces;
+    double spliceAngle = 0.0;
+    SplicePreview splicePreview;
+    std::vector<std::vector<chrono::ChVector3d>> faceOutlines;
+
     bool addGroupRequested = false;
+    bool deleteSelectionRequested = false;
     int selectedLoad = -1;
     int selectedHeat = -1;
 
@@ -56,6 +66,15 @@ struct EditorState {
     std::string status;
 };
 
+inline bool partIsSelected(const EditorState& state, std::size_t index) {
+    return std::find(state.selectedParts.begin(), state.selectedParts.end(), index) !=
+           state.selectedParts.end();
+}
+
+inline bool faceIsSelected(const EditorState& state, FaceId id) {
+    return std::find(state.selectedFaces.begin(), state.selectedFaces.end(), id) != state.selectedFaces.end();
+}
+
 /// View of everything the panels display. The assembly definition is mutable
 /// so a selected part's material can be edited in place.
 struct UiContext {
@@ -65,6 +84,10 @@ struct UiContext {
     const Frame* frame = nullptr;
     bool simulating = false;
     float progress = 0.0f;
+    double simulatedTime = 0.0;
+    double runDuration = 0.0;
+    long long simStep = 0;
+    long long simStepCount = 0;
     double assemblyMass = 0.0;
     /// One entry per scenario load, in the same order.
     std::vector<Assembly::LoadAdvisory> loadAdvice;
@@ -74,6 +97,10 @@ void drawEditorUi(EditorState& state, const UiContext& context);
 
 /// Metre ticks on the floor grid, and the length of the three axis edges.
 void drawArenaOverlay(const Environment& environment,
+                      const Magnum::Matrix4& view,
+                      const Magnum::Matrix4& projection);
+
+void drawFaceOverlays(const EditorState& state,
                       const Magnum::Matrix4& view,
                       const Magnum::Matrix4& projection);
 

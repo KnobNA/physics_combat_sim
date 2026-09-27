@@ -8,16 +8,16 @@
 namespace rcs {
 
 /// Parameters for the stand-in assembly used until real CAD import lands:
-/// six finite-thickness panels welded along the twelve shared edges.
+/// six solid panels welded along the twelve shared edges.
 struct TestCubeOptions {
     double outerSize = 0.40;   ///< m, outside dimension of the box
     double thickness = 0.008;  ///< m, panel thickness
-    int divisions = 4;         ///< shell elements per panel edge
+    int divisions = 4;         ///< unused; panels are tetrahedral solids
     Material material = aluminum6061();
 };
 
-/// Build the six-panel welded test box. Every panel is an independent part and
-/// every edge is an explicit manual weld, exactly as a CAD import would produce.
+/// Build the six-panel welded test box. Every panel is an independent solid
+/// and every edge is an explicit manual weld, exactly as a CAD import would produce.
 AssemblyDefinition makeTestCube(const TestCubeOptions& options = {});
 
 /// Load an OBJ or STL surface. One part per object. Coincident circular holes

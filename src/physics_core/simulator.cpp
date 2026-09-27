@@ -6,6 +6,7 @@
 #include "chrono/timestepper/ChTimestepperHHT.h"
 
 #include <exception>
+#include <stdexcept>
 #include "chrono_pardisomkl/ChSolverPardisoMKL.h"
 
 #ifndef CHRONO_PARDISO_MKL
@@ -22,6 +23,20 @@ namespace {
 int solverThreadCount() {
     const int hardware = static_cast<int>(std::thread::hardware_concurrency());
     return std::clamp(hardware, 1, 8);
+}
+
+void configureHht(chrono::ChTimestepperHHT& hht) {
+    hht.SetAlpha(-0.05);
+    hht.SetMaxIters(30);
+    hht.SetRelTolerance(1e-4);
+    hht.SetAbsTolerances(1e-6, 1e-4);
+    hht.SetStepControl(true);
+    hht.SetMinStepSize(1e-6);
+    hht.SetRequiredSuccessfulSteps(5);
+    hht.SetStepIncreaseFactor(2.0);
+    hht.AcceptTerminatedStep(false);
+    hht.SetJacobianUpdateMethod(
+        chrono::ChTimestepperImplicit::JacobianUpdate::EVERY_STEP);
 }
 
 }  // namespace
@@ -44,15 +59,8 @@ Simulator::Simulator() {
     // correction out, and if a step still will not converge it cuts the step
     // instead of keeping the bad one.
     _system.SetTimestepperType(ChTimestepper::Type::HHT);
-    if (auto hht = std::dynamic_pointer_cast<ChTimestepperHHT>(_system.GetTimestepper())) {
-        hht->SetAlpha(-0.05);
-        hht->SetMaxIters(30);
-        hht->SetRelTolerance(1e-4);
-        hht->SetAbsTolerances(1e-6, 1e-4);
-        hht->SetStepControl(true);
-        hht->SetMinStepSize(1e-6);
-        hht->AcceptTerminatedStep(false);
-    }
+    if (auto hht = std::dynamic_pointer_cast<ChTimestepperHHT>(_system.GetTimestepper()))
+        configureHht(*hht);
 
     // Every external force (gravity, drag, contact, user loads) is assembled
     // per node in Assembly::applyLoads, so Chrono must not add its own.
@@ -60,13 +68,15 @@ Simulator::Simulator() {
     _system.SetCollisionSystemType(ChCollisionSystem::Type::BULLET);
 }
 
-void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scenario) {
+void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scenario, bool mesh) {
     _system.Clear();
     _assembly = Assembly{};
     AssemblyDefinition meshed = definition;
-    for (auto& part : meshed.parts) {
-        if (part.simulate)
-            ensurePartMesh(part);
+    if (mesh) {
+        for (auto& part : meshed.parts) {
+            if (part.simulate)
+                ensurePartMesh(part);
+        }
     }
     _assembly.build(_system, meshed);
     _assembly.setDynamicResolution(scenario.settings.dynamicResolution);
@@ -84,6 +94,7 @@ void Simulator::reset(const AssemblyDefinition& definition, const Scenario& scen
     _system.Setup();
     _system.Update(chrono::UpdateFlags::UPDATE_ALL);
     refreshLinearSolver();
+    _contactStepFailed = false;
 }
 
 bool Simulator::step(double dt, double time, const Environment& environment,
@@ -91,11 +102,15 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                      const std::vector<HeatSource>& heat)
 {
     _assembly.advanceHeat(dt, time, environment, heat);
-    const bool volume = _assembly.maintainVolume(dt);
-    const bool impact = _assembly.prepareBrittleImpact(environment, dt);
+    const int impact = _assembly.impactSubsteps(environment, dt);
+    bool alreadyTorn = false;
+    for (const auto& part : _assembly.parts())
+        alreadyTorn = alreadyTorn || part.torn();
+    const bool allowRefine = impact < 8 && !alreadyTorn;
+    const bool volume = _assembly.maintainVolume(dt, allowRefine);
     const bool joints = _assembly.updateJoints(dt);
-    if (volume || impact || joints) {
-        if (volume || impact)
+    if (volume || joints) {
+        if (volume)
             _system.Setup();
         refreshLinearSolver();
     }
@@ -104,54 +119,94 @@ bool Simulator::step(double dt, double time, const Environment& environment,
         _system.Setup();
         refreshLinearSolver();
     }
+    bool rejected = false;
     try {
         if (_assembly.hasFreeSolve()) {
-            const int subs = _assembly.compliantImpactSubsteps(environment, dt);
-            const double h = dt / static_cast<double>(subs);
-            for (int i = 0; i < subs; ++i)
-                _system.DoStepDynamics(h);
-        }
-    } catch (const std::exception& error) {
-        if (std::getenv("RCS_TRACE"))
-            std::printf("  [step threw at t=%.4f: %s]\n", time, error.what());
-        const bool again = _assembly.maintainVolume(dt) || _assembly.updateJoints(dt);
-        auto retryWithoutDebris = [&]() {
-            if (!_assembly.discardAwakeShards())
-                return false;
-            _assembly.applyLoads(environment, loads, time, dt);
-            _system.Setup();
-            refreshLinearSolver();
-            try {
-                _system.DoStepDynamics(dt);
-            } catch (const std::exception&) {
-                return false;
+            const int subs = std::max(1, _assembly.impactSubsteps(environment, dt));
+            auto hht = std::dynamic_pointer_cast<chrono::ChTimestepperHHT>(_system.GetTimestepper());
+            auto restoreHht = [&]() {
+                if (hht)
+                    configureHht(*hht);
+            };
+            // High-speed floor hits are already split to ~2 mm. Cutting
+            // further on thousands of tets is the glass-test stall only when
+            // the Advance dt is still 0.5 ms. Inside a 2 mm substep, a cut
+            // to 1e-5 is a handful of Newton loops and is how J2/Rankine
+            // actually get to commit. A miss keeps Chrono's last accepted
+            // state; rewinding retries the same hit forever.
+            const bool bulkyContact = environment.floorEnabled && subs >= 8;
+            if (hht && environment.floorEnabled) {
+                hht->SetJacobianUpdateMethod(
+                    chrono::ChTimestepperImplicit::JacobianUpdate::EVERY_ITERATION);
+                if (bulkyContact)
+                    hht->SetMinStepSize(1.0e-5);
             }
-            return true;
-        };
-        if (again) {
-            _system.Setup();
-            refreshLinearSolver();
-            try {
-                _system.DoStepDynamics(dt);
-            } catch (const std::exception&) {
-                if (retryWithoutDebris())
-                    return _assembly.finite();
-                bool anyLive = false;
-                for (const auto& part : _assembly.parts())
-                    anyLive = anyLive || part.liveTetCount() > 0 || !part.quads().empty();
-                return !anyLive && _assembly.finite();
+            if (hht && _contactStepFailed) {
+                // After a min-stepsize throw Chrono leaves h below h_min.
+                // One Advance with StepControl off sets h to this
+                // substep so the next cut starts from the user dt, not 1e-5.
+                hht->SetStepControl(false);
             }
-        } else if (retryWithoutDebris()) {
-            return _assembly.finite();
-        } else {
-            bool anyLive = false;
-            for (const auto& part : _assembly.parts())
-                anyLive = anyLive || part.liveTetCount() > 0 || !part.quads().empty();
-            return !anyLive && _assembly.finite();
+            auto runSubs = [&](int n) {
+                const double sub = dt / static_cast<double>(n);
+                _assembly.setContactStep(sub);
+                for (int i = 0; i < n; ++i)
+                    _system.DoStepDynamics(sub);
+            };
+            _assembly.captureKinematics();
+            try {
+                runSubs(subs);
+                _contactStepFailed = false;
+            } catch (...) {
+                _contactStepFailed = true;
+                restoreHht();
+                _assembly.discardTrial();
+                rejected = true;
+                // A coupon Newton miss at the user dt must not spin at
+                // h_min (tempered/rubber hang). Crawl a few fixed slices
+                // with cutting off so the outer clock can unload.
+                if (hht && !environment.floorEnabled) {
+                    hht->SetStepControl(false);
+                    const int slices = 8;
+                    const double crawl = dt / static_cast<double>(slices);
+                    _assembly.setContactStep(crawl);
+                    int got = 0;
+                    for (int i = 0; i < slices; ++i) {
+                        try {
+                            _system.DoStepDynamics(crawl);
+                            ++got;
+                        } catch (...) {
+                            break;
+                        }
+                    }
+                    if (got > 0)
+                        rejected = false;
+                }
+            }
+            if (!_assembly.finite()) {
+                _assembly.restoreKinematics();
+                _assembly.discardTrial();
+                _assembly.discardAwakeShards();
+                rejected = true;
+            }
+            restoreHht();
         }
+    } catch (const std::exception&) {
+        // A rejected HHT step keeps the last accepted positions. Discard the
+        // tet trial state so a failed 50 m/s hit cannot store a 1e8 plastic
+        // strain and then explode the mesh. Do not peel or tear from that
+        // iterate; the next user step tries again on the intact core.
+        _assembly.restoreKinematics();
+        _assembly.discardTrial();
+        _assembly.discardAwakeShards();
+        rejected = true;
+        if (!_assembly.finite())
+            return false;
     }
     _assembly.integrateShards(dt, environment);
-    const bool torn = _assembly.tearOverstretched();
+    bool torn = false;
+    if (!rejected)
+        torn = _assembly.tearOverstretched();
     const bool spanned = (joints || torn) && _assembly.respan();
     if (joints || torn || spanned) {
         // New nodes change the coordinate count. Constraint-only edits (a weld
@@ -199,6 +254,12 @@ Recording Simulator::run(const AssemblyDefinition& definition,
     const double captureInterval =
         1.0 / std::max(1.0, scenario.settings.captureRate);
     const auto totalSteps = static_cast<long long>(std::ceil(duration / dt));
+    if (control) {
+        control->duration.store(duration);
+        control->stepCount.store(totalSteps);
+        control->simulatedTime.store(0.0);
+        control->step.store(0);
+    }
 
     auto captureFrame = [&](double time) {
         Frame frame;
@@ -231,8 +292,11 @@ Recording Simulator::run(const AssemblyDefinition& definition,
             captureFrame(time);
             nextCapture += captureInterval;
         }
-        if (control)
+        if (control) {
+            control->simulatedTime.store(time);
+            control->step.store(i + 1);
             control->progress.store(static_cast<float>(time / duration));
+        }
     }
 
     if (recording.frames.empty() || recording.frames.back().time < time)
@@ -265,6 +329,10 @@ void SimulationJob::start(const AssemblyDefinition& definition, const Scenario& 
 
     _control.cancel.store(false);
     _control.progress.store(0.0f);
+    _control.simulatedTime.store(0.0);
+    _control.duration.store(std::max(scenario.settings.timestep, scenario.settings.duration));
+    _control.step.store(0);
+    _control.stepCount.store(0);
     _done.store(false);
     _hasResult = false;
     _running = true;

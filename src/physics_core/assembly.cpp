@@ -195,7 +195,10 @@ void Assembly::build(chrono::ChSystem& system, const AssemblyDefinition& definit
     for (const auto& screw : definition.screws)
         buildScrew(system, screw, translationSet, rotationSet);
 
-    _authoredCenter = center();
+    // Editor transforms are authored in world metres. A live COM pivot would
+    // slide every other part whenever one cube moves, so the drop pose is an
+    // offset of the origin, not of the current centre of mass.
+    _authoredCenter = ChVector3d(0, 0, 0);
     _placementRotation = chrono::QUNIT;
     _placementPosition = _authoredCenter;
     refreshAdjacency();
@@ -480,30 +483,44 @@ void Assembly::bindLoads(const std::vector<ImpactLoad>& loads) {
             continue;
         const Part& part = _parts[load.partIndex];
 
+        auto nodeFixed = [&](std::size_t n) {
+            if (n < part.xyzNodes().size() && part.xyzNodes()[n])
+                return part.xyzNodes()[n]->IsFixed();
+            if (n < part.nodes().size() && part.nodes()[n])
+                return part.nodes()[n]->IsFixed();
+            return true;
+        };
+
         double totalMass = 0.0;
         std::vector<LoadTarget> targets;
         for (std::size_t n = 0; n < part.nodeCount(); ++n) {
+            if (nodeFixed(n))
+                continue;
             if ((part.nodePosition(n) - load.point).Length() > load.radius)
                 continue;
             targets.push_back({load.partIndex, n, part.nodeMass()[n]});
             totalMass += part.nodeMass()[n];
         }
 
-        // Nothing inside the patch: fall back to the single closest node so a
-        // mis-placed load still does something visible.
+        // Nothing inside the patch: fall back to the single closest free node
+        // so a mis-placed load still does something visible. A fixed node
+        // would swallow the force without stressing the mesh.
         if (targets.empty()) {
-            std::size_t best = 0;
+            std::size_t best = part.nodeCount();
             double bestDistance = std::numeric_limits<double>::max();
             for (std::size_t n = 0; n < part.nodeCount(); ++n) {
+                if (nodeFixed(n))
+                    continue;
                 const double distance = (part.nodePosition(n) - load.point).Length();
                 if (distance < bestDistance) {
                     bestDistance = distance;
                     best = n;
                 }
             }
-            if (part.nodeCount() > 0)
+            if (best < part.nodeCount()) {
                 targets.push_back({load.partIndex, best, 1.0});
-            totalMass = 1.0;
+                totalMass = 1.0;
+            }
         }
 
         if (totalMass <= 0.0)
@@ -815,8 +832,13 @@ bool Assembly::syncContacts(const Environment& environment) {
         // A fixed node has no solver variables, so a load may not reference
         // it: its Jacobian block would point at a disabled column.
         auto eligible = [&](std::size_t i) {
-            return i < area.size() && area[i] > 0.0 && i < part.xyzNodes().size() && part.xyzNodes()[i] &&
-                   !part.xyzNodes()[i]->IsFixed();
+            if (i >= area.size() || area[i] <= 0.0)
+                return false;
+            if (i < part.xyzNodes().size() && part.xyzNodes()[i] && !part.xyzNodes()[i]->IsFixed())
+                return part.nodeOnLiveTet(i);
+            if (i < part.nodes().size() && part.nodes()[i] && !part.nodes()[i]->IsFixed())
+                return true;
+            return false;
         };
         // A digest of which nodes are eligible, not how many. Counting them is
         // not enough: one node freezing in the same step that another thaws
@@ -848,7 +870,12 @@ bool Assembly::syncContacts(const Environment& environment) {
             for (std::size_t i = 0; i < part.nodeCount(); ++i) {
                 if (!eligible(i))
                     continue;
-                _contacts[p][i] = chrono_types::make_shared<NodeContact>(part.xyzNodes()[i], _contactWorld);
+                if (i < part.xyzNodes().size() && part.xyzNodes()[i])
+                    _contacts[p][i] = chrono_types::make_shared<NodeContact>(part.xyzNodes()[i], _contactWorld);
+                else if (i < part.nodes().size() && part.nodes()[i])
+                    _contacts[p][i] = chrono_types::make_shared<NodeContact>(part.nodes()[i], _contactWorld);
+                else
+                    continue;
                 _contactContainer->Add(_contacts[p][i]);
             }
             structureChanged = true;
@@ -874,7 +901,7 @@ bool Assembly::syncContacts(const Environment& environment) {
             // harder for a load carried by a handful of nodes. Scaling it back
             // leaves the penetration far below any modelled feature and keeps
             // the step convergent. This is the usual penalty-scale factor.
-            constexpr double kPenaltyScale = 0.02;
+            constexpr double kPenaltyScale = 1.0;
             const double stiffness = kPenaltyScale * modulus * std::sqrt(patch);
             // Hunt-Crossley dissipation, in s/m, saturating inside the contact
             // element. Metal arriving on concrete at a metre a second comes
@@ -887,6 +914,7 @@ bool Assembly::syncContacts(const Environment& environment) {
                 return override ? std::atof(override) : 0.5;
             }();
             _contacts[p][i]->configure(offset, stiffness, kDissipation);
+            _contacts[p][i]->setSoftenFast(part.material().fracture == FractureMode::Brittle);
         }
     }
     return structureChanged;
@@ -1288,7 +1316,22 @@ bool Assembly::discardAwakeShards() {
     return any;
 }
 
-bool Assembly::maintainVolume(double dt) {
+void Assembly::discardTrial() {
+    for (auto& part : _parts)
+        part.discardTrial();
+}
+
+void Assembly::captureKinematics() {
+    for (auto& part : _parts)
+        part.captureKinematics();
+}
+
+void Assembly::restoreKinematics() {
+    for (auto& part : _parts)
+        part.restoreKinematics();
+}
+
+bool Assembly::maintainVolume(double dt, bool allowRefine) {
     for (auto& part : _parts)
         part.clearLinkedNodes();
     for (const auto& joint : _joints) {
@@ -1302,7 +1345,7 @@ bool Assembly::maintainVolume(double dt) {
         }
     }
     _volumeWait += dt;
-    const bool refine = _dynamicResolution && _volumeWait >= 0.02;
+    const bool refine = allowRefine && _dynamicResolution && _volumeWait >= 0.02;
     if (refine)
         _volumeWait = 0.0;
     bool changed = false;
@@ -1313,39 +1356,41 @@ bool Assembly::maintainVolume(double dt) {
     return changed;
 }
 
-bool Assembly::prepareBrittleImpact(const Environment& environment, double dt) {
-    if (!environment.floorEnabled)
-        return false;
-    bool changed = false;
-    for (auto& part : _parts)
-        changed = part.prepareBrittleImpact(environment.floorHeight, dt) || changed;
-    if (changed)
-        inheritWeldNodes();
-    return changed;
-}
-
-int Assembly::compliantImpactSubsteps(const Environment& environment, double dt) const {
+int Assembly::impactSubsteps(const Environment& environment, double dt) const {
     if (!environment.floorEnabled)
         return 1;
     int steps = 1;
     for (const auto& part : _parts) {
-        if (part.material().fracture != FractureMode::Compliant)
-            continue;
         const double offset = part.contactOffset();
         const double reach = std::max(dt, 1.0e-4);
         for (int index : part.boundaryNodes()) {
             if (index < 0 || static_cast<std::size_t>(index) >= part.nodeCount())
                 continue;
+            if (static_cast<std::size_t>(index) < part.xyzNodes().size() && part.xyzNodes()[static_cast<std::size_t>(index)] &&
+                part.xyzNodes()[static_cast<std::size_t>(index)]->IsFixed())
+                continue;
             const double gap = part.nodePosition(static_cast<std::size_t>(index)).y() -
                                (environment.floorHeight + offset);
             const double closing = -part.nodeVelocity(static_cast<std::size_t>(index)).y();
-            if (closing <= 8.0 || gap > closing * reach + 5.0e-3)
+            if (gap > 2.0e-3 && (closing <= 1.0 || gap > closing * reach + 0.02))
                 continue;
-            const int need = static_cast<int>(std::ceil(closing * dt / 4.0e-3));
-            steps = std::max(steps, std::clamp(need, 1, 8));
+            // Deep overlap with almost no remaining closing speed still needs
+            // contact substeps. A single 0.5 ms user step is what walks HHT
+            // to 1 µs. A resting sag of tens of microns stays one step.
+            if (gap < -5.0e-4)
+                steps = std::max(steps, 4);
+            if (closing > 1.0) {
+                const int need = static_cast<int>(std::ceil(closing * dt / 0.002));
+                steps = std::max(steps, std::clamp(need, 1, 16));
+            }
         }
     }
     return steps;
+}
+
+void Assembly::setContactStep(double h) {
+    if (_contactWorld)
+        _contactWorld->stepSize = std::max(h, 1.0e-6);
 }
 
 void Assembly::inheritWeldNodes() {

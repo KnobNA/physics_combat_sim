@@ -155,6 +155,29 @@ void ThermalTet4::setRankine(double tensionLimit, double compressionLimit) {
     _rankineCompression = std::max(0.0, compressionLimit);
 }
 
+void ThermalTet4::setFailureStrain(double strain) {
+    _failPlastic = std::max(0.0, strain);
+}
+
+double ThermalTet4::tangentScale() const {
+    double scale = 1.0;
+    if (_failPlastic > 0.0 && _plastic > 0.5 * _failPlastic) {
+        const double span = std::max(0.5 * _failPlastic, 1.0e-12);
+        const double u = std::clamp((_plastic - 0.5 * _failPlastic) / span, 0.0, 1.0);
+        scale *= 1.0 - 0.95 * u;
+    }
+    // On the yield surface the elastic slope over-corrects a fast impact.
+    // About 0.35 of the elastic matrix stays positive-definite; near the
+    // solidus keep the full tangent so a molten yield surface does not go
+    // singular. Rankine glass sheds with the same idea at half slope.
+    if (_strength > 0.05 && _yield > 0.0 &&
+        (_plastic > 1.0e-6 || _vonMises >= 0.99 * _yield * _strength))
+        scale *= 0.35;
+    if (_overstrength && _rankineTension > 0.0)
+        scale *= 0.5;
+    return scale;
+}
+
 void ThermalTet4::rebuildReference() {
     if (!_nodes[0])
         return;
@@ -315,6 +338,11 @@ void ThermalTet4::trialStress(ChVectorDynamic<>& stress, ChVectorDynamic<>& stra
             _overstrength = true;
         }
     }
+    if (_failPlastic > 0.0 && _plastic > 0.5 * _failPlastic) {
+        const double span = std::max(0.5 * _failPlastic, 1.0e-12);
+        const double u = std::clamp((_plastic - 0.5 * _failPlastic) / span, 0.0, 1.0);
+        stress *= 1.0 - 0.95 * u;
+    }
     noteTension(stress);
 }
 
@@ -343,6 +371,13 @@ void ThermalTet4::commitPlastic() {
     _plastic = equivalentPlastic(_plasticStrain);
 }
 
+void ThermalTet4::discardTrial() {
+    for (int i = 0; i < 6; ++i)
+        _plasticPending[i] = _plasticStrain[i];
+    _plastic = equivalentPlastic(_plasticStrain);
+    _overstrength = false;
+}
+
 void ThermalTet4::copyPlasticFrom(const ThermalTet4& other) {
     for (int i = 0; i < 6; ++i) {
         _plasticStrain[i] = other._plasticStrain[i];
@@ -357,6 +392,7 @@ void ThermalTet4::ComputeKRMmatricesGlobal(chrono::ChMatrixRef H, double Kfactor
     refreshRotation();
     ChMatrixDynamic<> C;
     elasticLaw(C);
+    C *= tangentScale();
     _K = _volume * (_B.transpose() * C * _B);
     for (int row = 0; row < 12; ++row)
         for (int col = row + 1; col < 12; ++col)
@@ -383,6 +419,7 @@ void ThermalTet4::ComputeInternalForces(ChVectorDynamic<>& Fi) {
     trialStress(stress, strain);
     ChMatrixDynamic<> C;
     elasticLaw(C);
+    C *= tangentScale();
     _K = _volume * (_B.transpose() * C * _B);
 
     ChVectorDynamic<> localForce = _B.transpose() * stress * _volume;

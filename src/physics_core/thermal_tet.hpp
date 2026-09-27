@@ -26,6 +26,10 @@ public:
     /// this the way J2 uses yield: the tangent stays elastic, the force cannot
     /// exceed the material strength.
     void setRankine(double tensionLimit, double compressionLimit);
+    /// Equivalent plastic strain at which the tet tears. Zero disables the
+    /// damage ramp. Past half of this the stress and tangent fade toward a
+    /// small residual so the element sheds load before it is removed.
+    void setFailureStrain(double strain);
 
     double vonMises() const { return _vonMises; }
     double plasticStrain() const { return _plastic; }
@@ -49,6 +53,9 @@ public:
     /// Keep the plastic strain from the last converged step. Called once after
     /// the implicit solve, so Newton iterations do not ratchet it.
     void commitPlastic();
+    /// Throw away a rejected Newton iterate so a failed impact cannot store
+    /// a 1e8 plastic strain or a Rankine flag that the positions do not have.
+    void discardTrial();
     void copyPlasticFrom(const ThermalTet4& other);
 
 private:
@@ -57,6 +64,10 @@ private:
     void rebuildReference();
     void elasticLaw(chrono::ChMatrixDynamic<>& C) const;
     void trialStress(chrono::ChVectorDynamic<>& stress, chrono::ChVectorDynamic<>& strain);
+    /// Fraction of the elastic law still carried. Damage fades it near tear.
+    /// The yield return caps the force; the tangent stays elastic so a soft
+    /// punch can still converge. Fast impacts use contact substeps instead.
+    double tangentScale() const;
 
     std::shared_ptr<chrono::fea::ChNodeFEAxyz> _nodes[4];
     chrono::ChMatrix33<> _rotation;
@@ -67,6 +78,7 @@ private:
     double _youngs = 1.0;
     double _nu = 0.33;
     double _yield = 0.0;
+    double _failPlastic = 0.0;
     double _rankineTension = 0.0;
     double _rankineCompression = 0.0;
     double _density = 1.0;

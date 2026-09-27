@@ -5,7 +5,8 @@ namespace rcs {
 enum class Tool {
     Select,
     Move,
-    Rotate
+    Rotate,
+    Splice
 };
 
 }  // namespace rcs

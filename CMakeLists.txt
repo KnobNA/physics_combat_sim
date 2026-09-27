@@ -305,6 +305,7 @@ add_executable(combat_sim
     src/render_core/renderer.cpp
     src/render_core/gizmos.cpp
     src/editor/ui.cpp
+    src/editor/faces.cpp
 )
 
 target_include_directories(combat_sim PRIVATE src)

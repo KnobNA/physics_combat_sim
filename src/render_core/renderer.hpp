@@ -26,6 +26,11 @@ enum class ShadeMode {
     Temperature   ///< absolute kelvin ramp, 0 K is always dark blue
 };
 
+struct FaceHighlight {
+    std::size_t part = 0;
+    std::vector<Magnum::Vector3> loop;
+};
+
 class SceneRenderer {
 public:
     SceneRenderer();
@@ -40,6 +45,7 @@ public:
                 ShadeMode mode,
                 float stressScale,
                 const std::vector<std::size_t>& highlighted,
+                const std::vector<FaceHighlight>& faces,
                 bool showAir);
 
     void draw(const Magnum::Matrix4& view,

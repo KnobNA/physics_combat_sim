@@ -77,6 +77,7 @@ void Part::build(const PartDefinition& definition) {
     _temperature = _initialTemperature;
     _fixed = definition.fixed;
     _torn = false;
+    _peakFractureTension = 0.0;
     _shattering = false;
     _elasticity.reset();
     _plasticity.reset();
@@ -85,6 +86,7 @@ void Part::build(const PartDefinition& definition) {
     _nodeTemperature.clear();
     _strainTemperature.clear();
     _heatActive.clear();
+    _prescribedThermalKur = 0.0;
     _tearTwins.clear();
     _xyzNodes.clear();
     _trianglesElements.clear();
@@ -203,8 +205,56 @@ void Part::build(const PartDefinition& definition) {
     }
 
     if (definition.clampBoundary) {
+        double minX = 1.0e9, maxX = -1.0e9;
+        double minY = 1.0e9, maxY = -1.0e9;
+        double minZ = 1.0e9, maxZ = -1.0e9;
+        for (const auto& node : _nodes) {
+            const ChVector3d p = node->GetPos();
+            minX = std::min(minX, p.x());
+            maxX = std::max(maxX, p.x());
+            minY = std::min(minY, p.y());
+            maxY = std::max(maxY, p.y());
+            minZ = std::min(minZ, p.z());
+            maxZ = std::max(maxZ, p.z());
+        }
+        const double extX = maxX - minX;
+        const double extY = maxY - minY;
+        const double extZ = maxZ - minZ;
+        int thick = 0;
+        double thickLen = extX;
+        if (extY < thickLen) {
+            thick = 1;
+            thickLen = extY;
+        }
+        if (extZ < thickLen)
+            thick = 2;
+        const int axisA = (thick + 1) % 3;
+        const int axisB = (thick + 2) % 3;
+        const double inA = axisA == 0 ? extX : (axisA == 1 ? extY : extZ);
+        const double inB = axisB == 0 ? extX : (axisB == 1 ? extY : extZ);
+        const double aspect = std::max(inA, inB) / std::max(std::min(inA, inB), 1.0e-9);
+        // Same rule as the tet clamp: a square face is a plate (all four
+        // silhouette edges), a long bar is a cantilever (min-X root).
+        const bool plate = aspect < 2.0;
+        auto coord = [](const ChVector3d& p, int axis) {
+            return axis == 0 ? p.x() : (axis == 1 ? p.y() : p.z());
+        };
+        auto lo = [&](int axis) { return axis == 0 ? minX : (axis == 1 ? minY : minZ); };
+        auto hi = [&](int axis) { return axis == 0 ? maxX : (axis == 1 ? maxY : maxZ); };
         for (int index : _boundaryNodes) {
-            if (index >= 0 && static_cast<std::size_t>(index) < _nodes.size())
+            if (index < 0 || static_cast<std::size_t>(index) >= _nodes.size())
+                continue;
+            const ChVector3d p = _nodes[static_cast<std::size_t>(index)]->GetPos();
+            bool clamp = false;
+            if (plate) {
+                if (coord(p, axisA) <= lo(axisA) + 1.0e-4 || coord(p, axisA) >= hi(axisA) - 1.0e-4)
+                    clamp = true;
+                if (coord(p, axisB) <= lo(axisB) + 1.0e-4 || coord(p, axisB) >= hi(axisB) - 1.0e-4)
+                    clamp = true;
+            } else if (p.x() <= minX + 1.0e-4) {
+                clamp = true;
+            }
+            if (clamp)
                 _nodes[static_cast<std::size_t>(index)]->SetFixed(true);
         }
     }
@@ -435,6 +485,16 @@ void Part::setHeatActive(std::size_t index, bool active) {
     _heatActive[index] = active ? 1 : 0;
 }
 
+void Part::setThermalCurvature(double kappa) {
+    _prescribedThermalKur = kappa;
+    if (_elasticity)
+        _elasticity->SetThermalCurvature(kappa);
+    for (QuadThermal& slot : _quadThermal) {
+        if (slot.elasticity)
+            slot.elasticity->SetThermalCurvature(kappa);
+    }
+}
+
 void Part::setTemperature(double kelvin) {
     _temperature = kelvin;
     for (double& value : _nodeTemperature)
@@ -508,17 +568,55 @@ void Part::syncThermalMechanics() {
         storedStrength = strength;
     };
 
+    double thermalKur = 0.0;
+    if (_elasticity && !_nodes.empty() && _thickness > 1.0e-9) {
+        ChVector3d nDir(0.0, 1.0, 0.0);
+        if (!_quads.empty() && _quads[0][0] >= 0 && _quads[0][1] >= 0 && _quads[0][3] >= 0) {
+            const ChVector3d p0 = restPosition(static_cast<std::size_t>(_quads[0][0]));
+            const ChVector3d p1 = restPosition(static_cast<std::size_t>(_quads[0][1]));
+            const ChVector3d p3 = restPosition(static_cast<std::size_t>(_quads[0][3]));
+            nDir = (p1 - p0).Cross(p3 - p0);
+            if (nDir.Length() > 1.0e-12)
+                nDir.Normalize();
+            else
+                nDir = {0.0, 1.0, 0.0};
+        }
+        double sumS = 0.0, sumT = 0.0, sumSS = 0.0, sumST = 0.0;
+        double sMin = 1.0e30, sMax = -1.0e30;
+        int samples = 0;
+        for (std::size_t i = 0; i < _nodes.size(); ++i) {
+            const double s = restPosition(i).Dot(nDir);
+            const double kelvin = strainTemperature(i);
+            sMin = std::min(sMin, s);
+            sMax = std::max(sMax, s);
+            sumS += s;
+            sumT += kelvin;
+            sumSS += s * s;
+            sumST += s * kelvin;
+            ++samples;
+        }
+        const double span = sMax - sMin;
+        const double denom = static_cast<double>(samples) * sumSS - sumS * sumS;
+        if (samples >= 3 && span > 0.2 * _thickness && std::abs(denom) > 1.0e-18)
+            thermalKur = alpha * (static_cast<double>(samples) * sumST - sumS * sumT) / denom;
+        else
+            thermalKur = _prescribedThermalKur;
+    }
+
     if (uniform && _elasticity) {
         _elasticity->SetThermalStrain(alpha * (firstStrain - t0));
+        _elasticity->SetThermalCurvature(thermalKur);
         applyScale(*_elasticity, _plasticity.get(), _sharedStiffness, _sharedStrength, firstNode);
         for (QuadThermal& slot : _quadThermal) {
             if (!slot.elasticity)
                 continue;
             slot.elasticity->SetThermalStrain(alpha * (firstStrain - t0));
+            slot.elasticity->SetThermalCurvature(thermalKur);
             applyScale(*slot.elasticity, slot.plasticity.get(), slot.stiffness, slot.strength, firstNode);
         }
     } else if (_elasticity) {
         _elasticity->SetThermalStrain(0.0);
+        _elasticity->SetThermalCurvature(thermalKur);
         for (std::size_t q = 0; q < _quads.size() && q < _elements.size(); ++q) {
             if (!_elements[q])
                 continue;
@@ -540,6 +638,7 @@ void Part::syncThermalMechanics() {
             if (q >= _quadThermal.size() || !_quadThermal[q].elasticity)
                 continue;
             _quadThermal[q].elasticity->SetThermalStrain(alpha * (strainKelvin - t0));
+            _quadThermal[q].elasticity->SetThermalCurvature(thermalKur);
             applyScale(*_quadThermal[q].elasticity, _quadThermal[q].plasticity.get(), _quadThermal[q].stiffness,
                        _quadThermal[q].strength, nodeKelvin);
         }
@@ -897,6 +996,68 @@ double Part::peakTension() const {
     return peak;
 }
 
+void Part::discardTrial() {
+    for (const auto& tet : _tetElements)
+        if (tet)
+            tet->discardTrial();
+}
+
+void Part::captureKinematics() {
+    _savedPos.clear();
+    _savedVel.clear();
+    _savedRot.clear();
+    _savedRotDt.clear();
+    if (!_xyzNodes.empty()) {
+        _savedPos.reserve(_xyzNodes.size());
+        _savedVel.reserve(_xyzNodes.size());
+        for (const auto& node : _xyzNodes) {
+            if (!node)
+                continue;
+            _savedPos.push_back(node->GetPos());
+            _savedVel.push_back(node->GetPosDt());
+        }
+        return;
+    }
+    _savedPos.reserve(_nodes.size());
+    _savedVel.reserve(_nodes.size());
+    _savedRot.reserve(_nodes.size());
+    _savedRotDt.reserve(_nodes.size());
+    for (const auto& node : _nodes) {
+        if (!node)
+            continue;
+        _savedPos.push_back(node->GetPos());
+        _savedVel.push_back(node->GetPosDt());
+        _savedRot.push_back(node->GetRot());
+        _savedRotDt.push_back(node->GetRotDt());
+    }
+}
+
+void Part::restoreKinematics() {
+    if (!_xyzNodes.empty()) {
+        std::size_t i = 0;
+        for (auto& node : _xyzNodes) {
+            if (!node || i >= _savedPos.size())
+                continue;
+            node->SetPos(_savedPos[i]);
+            node->SetPosDt(_savedVel[i]);
+            ++i;
+        }
+        return;
+    }
+    std::size_t i = 0;
+    for (auto& node : _nodes) {
+        if (!node || i >= _savedPos.size())
+            continue;
+        node->SetPos(_savedPos[i]);
+        node->SetPosDt(_savedVel[i]);
+        if (i < _savedRot.size())
+            node->SetRot(_savedRot[i]);
+        if (i < _savedRotDt.size())
+            node->SetRotDt(_savedRotDt[i]);
+        ++i;
+    }
+}
+
 chrono::ChVector3d Part::center() const {
     chrono::ChVector3d sum{0, 0, 0};
     const std::size_t count = nodeCount();
@@ -934,6 +1095,13 @@ bool Part::finite() const {
         if (!std::isfinite(p.x()) || !std::isfinite(p.y()) || !std::isfinite(p.z()))
             return false;
         if (p.Length() > 1.0e3)
+            return false;
+        const auto v = nodeVelocity(i);
+        if (!std::isfinite(v.x()) || !std::isfinite(v.y()) || !std::isfinite(v.z()))
+            return false;
+        // A kilometre a second is past any combat impact this engine models.
+        // Positions-only let Rankine shatter keep a 1e6 m/s trial velocity.
+        if (v.Length() > 1.0e3)
             return false;
     }
     return true;
@@ -983,6 +1151,21 @@ double Part::maxEdgeStretch(const int* index, int count) const {
 
 bool Part::nodeRigid(std::size_t index) const {
     return index < _rigidNode.size() && _rigidNode[index] != 0;
+}
+
+bool Part::nodeOnLiveTet(std::size_t index) const {
+    if (_tetElements.empty())
+        return true;
+    const int node = static_cast<int>(index);
+    for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
+        if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+            continue;
+        for (int corner : _tets[t]) {
+            if (corner == node)
+                return true;
+        }
+    }
+    return false;
 }
 
 void Part::clearLinkedNodes() {
@@ -1048,6 +1231,17 @@ void Part::evaluatePlasticStrain(std::vector<float>& out) const {
             if (hits == 3)
                 out[t] = static_cast<float>(_tetElements[tet]->plasticStrain());
         }
+    }
+    float tetPeak = 0.0f;
+    for (const auto& tet : _tetElements) {
+        if (tet)
+            tetPeak = std::max(tetPeak, static_cast<float>(tet->plasticStrain()));
+    }
+    if (tetPeak > 0.0f) {
+        if (out.empty())
+            out.push_back(tetPeak);
+        else
+            out[0] = std::max(out[0], tetPeak);
     }
     for (std::size_t s = 0; s < _triangleThermal.size(); ++s) {
         const std::size_t tri = static_cast<std::size_t>(_skinTriangles) + s;
@@ -1515,6 +1709,8 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
             const ChVector3d arm = shard.rotation.Rotate(shard.local[static_cast<std::size_t>(k)]);
             const ChVector3d pos = shard.com + arm;
             const ChVector3d vel = shard.velocity + shard.angularVelocity.Cross(arm);
+            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()))
+                continue;
             if (index < _xyzNodes.size() && _xyzNodes[index]) {
                 _xyzNodes[index]->SetPos(pos);
                 _xyzNodes[index]->SetPosDt(vel);
@@ -1849,6 +2045,8 @@ bool Part::shatterQuads() {
         const bool dust = _material.shatterToDust && _shattering && longest > minEdge;
         if (!over && !dust)
             continue;
+        if (over)
+            _peakFractureTension = std::max(_peakFractureTension, fiber.tension);
         candidates.push_back({q, fiber.tension, fiber.theta, fiber.edgeU, fiber.edgeV, over});
     }
     std::sort(candidates.begin(), candidates.end(),
@@ -1870,8 +2068,8 @@ bool Part::shatterQuads() {
         const double longest = std::max(candidate.edgeU, candidate.edgeV);
         const double shortest = std::min(candidate.edgeU, candidate.edgeV);
         const double aspect = shortest > 1.0e-9 ? longest / shortest : 1.0;
-        if (longest < minEdge) {
-            if (!candidate.over)
+        if (longest < minEdge || aspect > 8.0) {
+            if (!candidate.over && longest < minEdge)
                 continue;
             detachQuad(candidate.quad);
         } else if (live >= 48) {
@@ -1880,10 +2078,9 @@ bool Part::shatterQuads() {
         } else {
             // A needle is cut across its long side. Rankine still chooses
             // the direction while the quad is roughly square.
-            const bool crossCut = aspect > 2.0 && (_shattering || candidate.over);
-            const bool alongU = (crossCut || (!candidate.over && _material.shatterToDust))
-                                    ? candidate.edgeV >= candidate.edgeU
-                                    : std::abs(std::cos(candidate.theta)) >= std::abs(std::sin(candidate.theta));
+            // Always bisect the long edge. Rankine still picks which quads
+            // fail; cutting the short edge is what made 35:1 needles.
+            const bool alongU = candidate.edgeV >= candidate.edgeU;
             if (!splitQuad(candidate.quad, alongU))
                 continue;
             ++live;
@@ -1904,9 +2101,15 @@ bool Part::tearFailed() {
         if (tet)
             tet->commitPlastic();
     bool changed = false;
+    if (!_tetElements.empty())
+        changed = releaseMoltenTets() || changed;
     if (!_elements.empty()) {
-        if (_material.fracture == FractureMode::Brittle)
-            return shatterQuads() ? (_torn = true) : false;
+        if (_material.fracture == FractureMode::Brittle) {
+            const bool shattered = shatterQuads();
+            if (shattered || changed)
+                _torn = true;
+            return shattered || changed;
+        }
 
         std::vector<std::size_t> failed;
         for (std::size_t q = 0; q < _quads.size() && q < _elements.size(); ++q) {
@@ -2038,9 +2241,18 @@ void Part::buildVolume(const PartDefinition& definition) {
     }
 
     double minX = 1.0e30;
-    if (definition.clampBoundary) {
-        for (const ChVector3d& vertex : volume.vertices)
-            minX = std::min(minX, vertex.x());
+    double minY = 1.0e30;
+    double minZ = 1.0e30;
+    double maxX = -1.0e30;
+    double maxY = -1.0e30;
+    double maxZ = -1.0e30;
+    for (const ChVector3d& vertex : volume.vertices) {
+        minX = std::min(minX, vertex.x());
+        minY = std::min(minY, vertex.y());
+        minZ = std::min(minZ, vertex.z());
+        maxX = std::max(maxX, vertex.x());
+        maxY = std::max(maxY, vertex.y());
+        maxZ = std::max(maxZ, vertex.z());
     }
 
     for (std::size_t t = 0; t < _tets.size(); ++t) {
@@ -2056,6 +2268,8 @@ void Part::buildVolume(const PartDefinition& definition) {
                            _material.density, _material.dampingBeta);
         if (_material.fracture == FractureMode::Brittle)
             element->setRankine(rankineTensionLimit(_material), rankineCompressionLimit(_material));
+        if (_material.fracture == FractureMode::Ductile)
+            element->setFailureStrain(_material.failPlasticStrain);
         element->SetNodes(_xyzNodes[tet[0]], _xyzNodes[tet[1]], _xyzNodes[tet[2]], _xyzNodes[tet[3]]);
         _mesh->AddElement(element);
         _tetElements.push_back(element);
@@ -2087,9 +2301,45 @@ void Part::buildVolume(const PartDefinition& definition) {
             _boundaryNodes.push_back(static_cast<int>(i));
     }
     if (definition.clampBoundary) {
-        for (std::size_t i = 0; i < _xyzNodes.size(); ++i) {
-            if (_xyzNodes[i]->GetPos().x() <= minX + 1.0e-4)
-                _xyzNodes[i]->SetFixed(true);
+        const double extX = maxX - minX;
+        const double extY = maxY - minY;
+        const double extZ = maxZ - minZ;
+        int thick = 0;
+        double thickLen = extX;
+        if (extY < thickLen) {
+            thick = 1;
+            thickLen = extY;
+        }
+        if (extZ < thickLen)
+            thick = 2;
+        const int axisA = (thick + 1) % 3;
+        const int axisB = (thick + 2) % 3;
+        const double inA = axisA == 0 ? extX : (axisA == 1 ? extY : extZ);
+        const double inB = axisB == 0 ? extX : (axisB == 1 ? extY : extZ);
+        const double aspect = std::max(inA, inB) / std::max(std::min(inA, inB), 1.0e-9);
+        // Square plates clamp every in-plane silhouette node, matching the
+        // Reissner outline. Long bars keep the min-X cantilever convention.
+        const bool plate = aspect < 2.0;
+        auto coord = [](const ChVector3d& p, int axis) {
+            return axis == 0 ? p.x() : (axis == 1 ? p.y() : p.z());
+        };
+        auto lo = [&](int axis) { return axis == 0 ? minX : (axis == 1 ? minY : minZ); };
+        auto hi = [&](int axis) { return axis == 0 ? maxX : (axis == 1 ? maxY : maxZ); };
+        for (int index : _boundaryNodes) {
+            if (index < 0 || static_cast<std::size_t>(index) >= _xyzNodes.size())
+                continue;
+            const ChVector3d p = _xyzNodes[static_cast<std::size_t>(index)]->GetPos();
+            bool clamp = false;
+            if (plate) {
+                if (coord(p, axisA) <= lo(axisA) + 1.0e-4 || coord(p, axisA) >= hi(axisA) - 1.0e-4)
+                    clamp = true;
+                if (coord(p, axisB) <= lo(axisB) + 1.0e-4 || coord(p, axisB) >= hi(axisB) - 1.0e-4)
+                    clamp = true;
+            } else if (p.x() <= minX + 1.0e-4) {
+                clamp = true;
+            }
+            if (clamp)
+                _xyzNodes[static_cast<std::size_t>(index)]->SetFixed(true);
         }
     }
 }
@@ -2100,61 +2350,6 @@ bool Part::maintainVolume(bool refine) {
     const bool released = releaseMoltenTets();
     const bool refined = refine && refineActiveTets();
     return refined || released;
-}
-
-bool Part::prepareBrittleImpact(double floorHeight, double dt) {
-    _tetImpactFail.assign(_tets.size(), 0);
-    if (_fixed || _tetElements.empty())
-        return false;
-    double tensionLimit = 0.0;
-    double compressionLimit = 0.0;
-    if (_material.fracture == FractureMode::Brittle) {
-        tensionLimit = rankineTensionLimit(_material);
-        compressionLimit = rankineCompressionLimit(_material);
-    } else if (_material.fracture == FractureMode::Ductile) {
-        compressionLimit = _material.ultimateStress > 0.0 ? _material.ultimateStress
-                                                          : _material.yieldStress;
-        tensionLimit = compressionLimit;
-    } else {
-        compressionLimit = _material.ultimateStress;
-        tensionLimit = compressionLimit;
-    }
-    if (tensionLimit <= 0.0 && compressionLimit <= 0.0)
-        return false;
-    const double waveSpeed = std::sqrt(_material.youngsModulus / std::max(_material.density, 1.0));
-    const double impedance = _material.density * waveSpeed;
-    const double nu = std::clamp(_material.poissonRatio, 0.0, 0.49);
-    const double offset = contactOffset();
-    const double reach = std::max(dt, 1.0e-4);
-    bool overload = false;
-    for (int index : _boundaryNodes) {
-        if (index < 0 || static_cast<std::size_t>(index) >= _xyzNodes.size() || !_xyzNodes[index])
-            continue;
-        const chrono::ChVector3d p = nodePosition(static_cast<std::size_t>(index));
-        const chrono::ChVector3d v = nodeVelocity(static_cast<std::size_t>(index));
-        const double gap = p.y() - (floorHeight + offset);
-        const double closing = -v.y();
-        if (closing <= 1.0e-3)
-            continue;
-        if (gap > closing * reach + 5.0e-3)
-            continue;
-        const double wave = impedance * closing;
-        const double lateral = nu / std::max(1.0 - nu, 1.0e-3) * wave;
-        if ((compressionLimit > 0.0 && wave >= compressionLimit) ||
-            (tensionLimit > 0.0 && (lateral >= tensionLimit || wave >= 8.0 * tensionLimit))) {
-            overload = true;
-            break;
-        }
-    }
-    if (!overload)
-        return false;
-    // One timestep at metal or glass wave speed crosses the part. The solid
-    // is already over its strength, so it leaves as chips instead of asking
-    // HHT to converge a GPa residual.
-    std::fill(_tetImpactFail.begin(), _tetImpactFail.end(), 1);
-    const bool changed = releaseMoltenTets();
-    _tetImpactFail.clear();
-    return changed;
 }
 
 int Part::xyzMidpoint(int a, int b) {
@@ -2215,6 +2410,8 @@ void Part::bisectTet(std::size_t index, int a, int b, int mid) {
                            _material.dampingBeta);
         if (_material.fracture == FractureMode::Brittle)
             element->setRankine(rankineTensionLimit(_material), rankineCompressionLimit(_material));
+        if (_material.fracture == FractureMode::Ductile)
+            element->setFailureStrain(_material.failPlasticStrain);
         element->SetNodes(_xyzNodes[static_cast<std::size_t>(n0)], _xyzNodes[static_cast<std::size_t>(n1)],
                           _xyzNodes[static_cast<std::size_t>(n2)], _xyzNodes[static_cast<std::size_t>(n3)]);
         element->copyPlasticFrom(*parentElement);
@@ -2404,8 +2601,77 @@ bool Part::refineActiveTets() {
 bool Part::releaseMoltenTets() {
     if (_tetElements.empty())
         return false;
+
+    // At most a contact layer per call. The highest tension or plastic strain
+    // goes first, so an impact cannot turn the whole solid into chips at once.
+    std::vector<char> chosen(_tets.size(), 0);
+    {
+        struct Candidate {
+            std::size_t index = 0;
+            double score = 0.0;
+        };
+        std::vector<Candidate> candidates;
+        for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
+            if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+                continue;
+            const auto& tet = _tets[t];
+            int corners = 0;
+            bool molten = true;
+            double kelvin = 0.0;
+            for (int index : tet) {
+                if (index < 0) {
+                    molten = false;
+                    continue;
+                }
+                ++corners;
+                kelvin += nodeTemperature(static_cast<std::size_t>(index));
+                if (nodeTemperature(static_cast<std::size_t>(index)) < _material.meltTemperature)
+                    molten = false;
+            }
+            if (corners != 4)
+                continue;
+            kelvin /= 4.0;
+            const double retention = thermalStrengthRetention(_material, kelvin);
+            const double ductility = thermalDuctilityRetention(_material, kelvin);
+            const double plasticLimit = _material.failPlasticStrain * ductility;
+            const double stretchLimit = 1.0 + std::max(0.0, _material.tearStretch - 1.0) * ductility;
+            const double plastic = _tetElements[t]->plasticStrain();
+            const double stretch = maxEdgeStretch(tet.data(), 4);
+            const double tension = _tetElements[t]->tension();
+            double softest = 1.0;
+            for (int index : tet) {
+                if (index < 0)
+                    continue;
+                softest = std::min(softest, thermalStiffnessRetention(_material, nodeTemperature(static_cast<std::size_t>(index))));
+            }
+            double score = 0.0;
+            if (molten || softest <= kThermalFloor * 2.0)
+                score = 1.0e6 + tension;
+            else if (_material.fracture == FractureMode::Brittle && _material.fractureStrength > 0.0) {
+                const double limit = _material.fractureStrength * std::max(retention, 1.0e-4);
+                if (_tetElements[t]->overstrength() || tension >= limit)
+                    score = std::max(tension, limit);
+            } else if (_material.fracture == FractureMode::Ductile) {
+                if ((plasticLimit > 0.0 && plastic >= plasticLimit) || stretch >= stretchLimit)
+                    score = plastic * 1.0e9 + tension;
+            } else if (stretch >= stretchLimit) {
+                score = stretch;
+            }
+            if (score > 0.0)
+                candidates.push_back({t, score});
+        }
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+        if (candidates.size() > 48)
+            candidates.resize(48);
+        for (const auto& candidate : candidates)
+            chosen[candidate.index] = 1;
+    }
+
     bool changed = false;
     for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
+        if (t >= chosen.size() || !chosen[t])
+            continue;
         if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
             continue;
         const auto& tet = _tets[t];
@@ -2444,13 +2710,13 @@ bool Part::releaseMoltenTets() {
         // step if the tet stayed in. Contained metal above that still sags.
         if (softest <= kThermalFloor * 2.0)
             failed = true;
-        if (!failed && t < _tetImpactFail.size() && _tetImpactFail[t])
-            failed = true;
         if (!failed && _material.fracture == FractureMode::Brittle && _material.fractureStrength > 0.0)
             failed = _tetElements[t]->overstrength() ||
-                     tension >= _material.fractureStrength * std::max(retention, 1.0e-4) * 0.98;
-        if (!failed && _material.fracture != FractureMode::Brittle)
+                     tension >= _material.fractureStrength * std::max(retention, 1.0e-4);
+        if (!failed && _material.fracture == FractureMode::Ductile)
             failed = (plasticLimit > 0.0 && plastic >= plasticLimit) || stretch >= stretchLimit;
+        if (!failed && _material.fracture == FractureMode::Compliant)
+            failed = stretch >= stretchLimit;
         if (!failed)
             continue;
 
@@ -2526,9 +2792,11 @@ bool Part::releaseMoltenTets() {
         _shards.push_back(shard);
         changed = true;
     }
-    _tetImpactFail.clear();
     if (changed) {
         _torn = true;
+        _contactArea.clear();
+        _contactAreaNodes = 0;
+        _contactAreaFaces = 0;
         std::vector<char> used(_xyzNodes.size(), 0);
         for (std::size_t i = 0; i < _tets.size() && i < _tetElements.size(); ++i) {
             if (!_tetElements[i] || (i < _tetLive.size() && !_tetLive[i]))

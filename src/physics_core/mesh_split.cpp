@@ -132,8 +132,38 @@ bool fillSolid(const SurfaceMesh& skin, const std::vector<double>& sizeAtVertex,
     if (skin.triangles.size() < 4 || skin.vertices.size() < 4)
         return false;
 
-    const bool flip = meshVolume(skin) < 0.0;
-    double requested = budgetEdge(std::abs(meshVolume(skin)), sizing);
+    SurfaceMesh plc;
+    std::vector<double> size;
+    plc.vertices.reserve(skin.vertices.size());
+    size.reserve(skin.vertices.size());
+    plc.triangles.reserve(skin.triangles.size());
+    std::vector<int> remap(skin.vertices.size(), -1);
+    auto take = [&](int index) {
+        if (index < 0 || static_cast<std::size_t>(index) >= remap.size())
+            return -1;
+        if (remap[static_cast<std::size_t>(index)] < 0) {
+            remap[static_cast<std::size_t>(index)] = static_cast<int>(plc.vertices.size());
+            plc.vertices.push_back(skin.vertices[static_cast<std::size_t>(index)]);
+            const double local = static_cast<std::size_t>(index) < sizeAtVertex.size()
+                                     ? sizeAtVertex[static_cast<std::size_t>(index)]
+                                     : 0.0;
+            size.push_back(local);
+        }
+        return remap[static_cast<std::size_t>(index)];
+    };
+    for (const auto& tri : skin.triangles) {
+        const int a = take(tri[0]);
+        const int b = take(tri[1]);
+        const int c = take(tri[2]);
+        if (a < 0 || b < 0 || c < 0 || a == b || b == c || c == a)
+            continue;
+        plc.triangles.push_back({a, b, c});
+    }
+    if (plc.triangles.size() < 4 || plc.vertices.size() < 4)
+        return false;
+
+    const bool flip = meshVolume(plc) < 0.0;
+    double requested = budgetEdge(std::abs(meshVolume(plc)), sizing);
     // The caller's sizing field is a request, not a floor. Raising only the
     // ceiling cannot bring a mesh back under budget when the field itself is
     // what is refining it, which is the case for anything with a thin wall:
@@ -143,24 +173,28 @@ bool fillSolid(const SurfaceMesh& skin, const std::vector<double>& sizeAtVertex,
     for (int attempt = 0; attempt < 4; ++attempt) {
         tetgenio in;
         tetgenio out;
-        const int n = static_cast<int>(skin.vertices.size());
+        const int n = static_cast<int>(plc.vertices.size());
         in.firstnumber = 0;
         in.numberofpoints = n;
         in.pointlist = new REAL[static_cast<std::size_t>(n) * 3];
         in.numberofpointmtrs = 1;
         in.pointmtrlist = new REAL[static_cast<std::size_t>(n)];
         for (int i = 0; i < n; ++i) {
-            const ChVector3d& p = skin.vertices[static_cast<std::size_t>(i)];
+            const ChVector3d& p = plc.vertices[static_cast<std::size_t>(i)];
             in.pointlist[3 * i] = p.x();
             in.pointlist[3 * i + 1] = p.y();
             in.pointlist[3 * i + 2] = p.z();
-            const double local = i < static_cast<int>(sizeAtVertex.size())
-                                     ? sizeAtVertex[static_cast<std::size_t>(i)]
+            const double local = i < static_cast<int>(size.size()) && size[static_cast<std::size_t>(i)] > 1.0e-12
+                                     ? size[static_cast<std::size_t>(i)]
                                      : requested;
-            const double h = std::clamp(std::min(local * relax, requested), sizing.minElement, requested);
+            // maxElement is the finest the initial mesh may use. Without this
+            // floor a thin wall's thickness/N field (a few millimetres) wins
+            // over the budget and tetgen emits tens of thousands of tets.
+            const double minH = std::min(requested, std::max(sizing.minElement, sizing.maxElement));
+            const double h = std::clamp(std::min(local * relax, requested), minH, requested);
             in.pointmtrlist[i] = h;
         }
-        const int faceCount = static_cast<int>(skin.triangles.size());
+        const int faceCount = static_cast<int>(plc.triangles.size());
         in.numberoffacets = faceCount;
         in.facetlist = new tetgenio::facet[static_cast<std::size_t>(faceCount)];
         in.facetmarkerlist = new int[static_cast<std::size_t>(faceCount)];
@@ -172,7 +206,7 @@ bool fillSolid(const SurfaceMesh& skin, const std::vector<double>& sizeAtVertex,
             facet.holelist = nullptr;
             facet.polygonlist[0].numberofvertices = 3;
             facet.polygonlist[0].vertexlist = new int[3];
-            const auto& tri = skin.triangles[static_cast<std::size_t>(f)];
+            const auto& tri = plc.triangles[static_cast<std::size_t>(f)];
             facet.polygonlist[0].vertexlist[0] = tri[0];
             facet.polygonlist[0].vertexlist[1] = tri[flip ? 2 : 1];
             facet.polygonlist[0].vertexlist[2] = tri[flip ? 1 : 2];
@@ -204,7 +238,7 @@ bool fillSolid(const SurfaceMesh& skin, const std::vector<double>& sizeAtVertex,
             requested *= 1.6;
             continue;
         }
-        constexpr int kBudget = 40000;
+        const int kBudget = std::max(4000, sizing.tetBudget * 4);
         if (out.numberoftetrahedra > kBudget && attempt + 1 < 4) {
             // Element count goes as the cube of the size, so scale by the
             // cube root of the overshoot and land near the budget in one go
@@ -436,11 +470,13 @@ void addOrientedTet(VolumeMesh& volume, int a, int b, int c, int d) {
     volume.tets.push_back({a, b, c, d});
 }
 
-/// One layer of tetrahedra through `thickness`. The base triangles stay put so
-/// a welded seam that already coincides keeps its nodes.
-bool extrudeSheet(const SurfaceMesh& mid, double thickness, VolumeMesh& volume) {
+/// Tetrahedra through `thickness`. The base triangles stay put so a welded
+/// seam that already coincides keeps its nodes. `layers` is the number of
+/// hex-equivalent slices (each becomes 3 tets per triangle).
+bool extrudeSheet(const SurfaceMesh& mid, double thickness, VolumeMesh& volume, int layers) {
     if (mid.triangles.empty() || thickness <= 1.0e-6)
         return false;
+    layers = std::clamp(layers, 2, 16);
     volume = {};
     std::unordered_map<Key, int, KeyHash> weld;
     std::vector<ChVector3d> normals(mid.vertices.size(), ChVector3d(0, 0, 0));
@@ -450,7 +486,6 @@ bool extrudeSheet(const SurfaceMesh& mid, double thickness, VolumeMesh& volume) 
             if (index >= 0)
                 normals[static_cast<std::size_t>(index)] += n;
     }
-    const int layers = 2;
     std::vector<std::vector<int>> sheet(static_cast<std::size_t>(layers + 1), std::vector<int>(mid.vertices.size(), -1));
     for (std::size_t i = 0; i < mid.vertices.size(); ++i) {
         ChVector3d n = normals[i];
@@ -550,17 +585,17 @@ bool ensurePartMesh(PartDefinition& part) {
     if (part.sizing.cached)
         return true;
     if (part.source.empty()) {
-        if (part.patch.uSize > 1.0e-6 && part.patch.vSize > 1.0e-6) {
+        if (part.patch.uSize > 1.0e-6 && part.patch.vSize > 1.0e-6 &&
+            part.sizing.throughThickness >= 2) {
             const double thickness = std::max(part.thickness, part.sizing.minElement);
-            if (!extrudeSheet(sheetFromPatch(part.patch), thickness, part.volume))
+            const int layers = std::clamp(part.sizing.throughThickness, 2, 16);
+            if (!extrudeSheet(sheetFromPatch(part.patch), thickness, part.volume, layers))
                 return false;
             part.surface = {};
             part.thickness = thickness;
-            part.sizing.cached = true;
-            ++part.sizing.generation;
-            return true;
         }
         part.sizing.cached = true;
+        ++part.sizing.generation;
         return true;
     }
 
@@ -677,10 +712,13 @@ bool ensurePartMesh(PartDefinition& part) {
                     incident = incident || index == static_cast<int>(v);
                 if (!incident)
                     continue;
+                const double finest = std::max(part.sizing.minElement, part.sizing.maxElement);
                 const double local = thickness[i] < 1.0e20
                                          ? thickness[i] / std::max(1, part.sizing.throughThickness)
                                          : coarse;
-                h = std::min(h, std::clamp(local, part.sizing.minElement, coarse));
+                const double lo = std::min(finest, coarse);
+                const double hi = std::max(finest, coarse);
+                h = std::min(h, std::clamp(local, lo, hi));
                 for (std::size_t j = i + 1; j < source.triangles.size(); ++j) {
                     if (!sharesVertex(source.triangles[i], source.triangles[j]))
                         continue;
@@ -729,7 +767,7 @@ bool ensurePartMesh(PartDefinition& part) {
             thick = sum / static_cast<double>(shells.thickness.size());
         }
         thick = std::max(thick, part.sizing.minElement);
-        if (!extrudeSheet(shells, thick, part.volume))
+        if (!extrudeSheet(shells, thick, part.volume, std::max(2, part.sizing.throughThickness)))
             return false;
         part.thickness = thick;
     } else {
@@ -819,7 +857,8 @@ bool ensurePartMesh(PartDefinition& part) {
                 thick = sum / static_cast<double>(shells.thickness.size());
             }
             VolumeMesh fin;
-            if (extrudeSheet(shells, std::max(thick, part.sizing.minElement), fin))
+            if (extrudeSheet(shells, std::max(thick, part.sizing.minElement), fin,
+                             std::max(2, part.sizing.throughThickness)))
                 appendVolume(part.volume, fin);
         }
     }
@@ -841,11 +880,13 @@ PartDefinition makeSolidCube(double outerSize, const ChVector3d& center) {
         center + ChVector3d{-h, -h, h},  center + ChVector3d{h, -h, h},
         center + ChVector3d{h, h, h},    center + ChVector3d{-h, h, h}};
     part.source.vertices.assign(corner, corner + 8);
-    const int faces[12][3] = {
-        {0, 3, 2}, {0, 2, 1}, {4, 5, 6}, {4, 6, 7}, {0, 1, 5}, {0, 5, 4},
-        {3, 7, 6}, {3, 6, 2}, {0, 4, 7}, {0, 7, 3}, {1, 2, 6}, {1, 6, 5}};
-    for (const auto& face : faces)
+    const int quads[6][4] = {
+        {0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {3, 7, 6, 2}, {0, 4, 7, 3}, {1, 2, 6, 5}};
+    for (const auto& face : quads) {
+        part.source.faces.push_back(AuthoredFace{{face[0], face[1], face[2], face[3]}});
         part.source.triangles.push_back({face[0], face[1], face[2]});
+        part.source.triangles.push_back({face[0], face[2], face[3]});
+    }
     part.sizing.shellCutoff = 0.008;
     part.sizing.minElement = 0.002;
     part.sizing.maxElement = 0.025;

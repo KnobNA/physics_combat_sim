@@ -23,6 +23,8 @@
 #include <optional>
 #include <vector>
 
+#include <imgui.h>
+
 namespace rcs {
 
 using namespace Magnum;
@@ -183,13 +185,21 @@ private:
 
     Vector2 framebufferPosition(const Vector2& windowPosition) const;
     void rayAt(const Vector2& windowPosition, Vector3& origin, Vector3& direction) const;
-    void selectAt(const Vector2& windowPosition);
+    void selectAt(const Vector2& windowPosition, bool additive);
     void applyTranslation(const Vector3& delta);
     void applyRotation(const Vector3& axis, Rad angle);
     float gizmoScale() const;
     std::vector<std::size_t> selectionGroup() const;
     Vector3 selectionCenter() const;
     bool editingAllowed() const;
+    void pruneEditorSelection();
+    void seedSelectedPartFaces();
+    void refreshFaceVisuals();
+    void updateSplicePreview(const Vector3& origin, const Vector3& dir);
+    bool commitSplice();
+    std::vector<FaceHighlight> gpuFaceHighlights() const;
+    chrono::ChQuaterniond worldRotation() const;
+    chrono::ChVector3d worldOrigin() const;
 
     ImGuiIntegration::Context _imgui{NoCreate};
     Timeline _timeline;
@@ -213,6 +223,10 @@ private:
     float _dragGrabU = 0.0f;
     bool _orbiting = false;
     bool _panning = false;
+    Vector2 _lastPointer{};
+    bool _havePointer = false;
+    bool _spliceHovering = false;
+    SplicePreview _authoredSplice;
 };
 
 CombatApp::CombatApp(const Arguments& arguments):
@@ -243,16 +257,13 @@ CombatApp::CombatApp(const Arguments& arguments):
 }
 
 void CombatApp::rebuildPreview() {
-    _preview.reset(_definition, _editor.scenario);
+    _preview.reset(_definition, _editor.scenario, false);
     _pose = _preview.capture();
     // The old run no longer describes this assembly or this starting state.
     _run = Recording{};
     _editor.playback.time = 0.0;
     _editor.playback.playing = false;
-    if (_editor.selectedPart && *_editor.selectedPart >= _pose.layout.parts.size())
-        _editor.selectedPart.reset();
-    if (_editor.selectedGroup && *_editor.selectedGroup >= _definition.groups.size())
-        _editor.selectedGroup.reset();
+    pruneEditorSelection();
     _renderer.setLayout(_pose.layout);
 }
 
@@ -277,7 +288,8 @@ void CombatApp::startSimulation() {
             continue;
         if (part.source.empty() && (part.patch.uSize <= 1.0e-6 || part.patch.vSize <= 1.0e-6))
             continue;
-        part.sizing.tetBudget = std::clamp(static_cast<int>(2500.0 * resolution), 400, 8000);
+        const int base = std::max(200, part.sizing.tetBudget);
+        part.sizing.tetBudget = std::clamp(static_cast<int>(base * resolution), 400, 8000);
         part.sizing.refineLimit = part.sizing.minElement;
         part.sizing.cached = false;
         part.volume = {};
@@ -296,7 +308,7 @@ void CombatApp::handleEditorRequests() {
         _editor.addLoadRequested = false;
         ImpactLoad load;
         load.name = "Load " + std::to_string(_editor.scenario.loads.size() + 1);
-        load.partIndex = _editor.selectedPart.value_or(0);
+        load.partIndex = _editor.selectedParts.empty() ? 0 : _editor.selectedParts.front();
         load.initialForce = 0.0;
         load.finalForce = 1000.0;
         load.rampTime = 0.1;
@@ -361,7 +373,9 @@ void CombatApp::handleEditorRequests() {
                 folder.parent = static_cast<int>(*_editor.selectedGroup);
             _definition.groups.push_back(folder);
             _editor.selectedGroup = _definition.groups.size() - 1;
-            _editor.selectedPart.reset();
+            _editor.selectedParts.clear();
+            _editor.selectedFaces.clear();
+            _editor.selectFaces = false;
             _editor.status = "Added " + folder.name + ".";
         }
     }
@@ -370,7 +384,9 @@ void CombatApp::handleEditorRequests() {
         _editor.addSolidCubeRequested = false;
         if (editingAllowed()) {
             _definition.parts.push_back(makeSolidCube(0.40, {0.50, 0.0, 0.0}));
-            _editor.selectedPart = _definition.parts.size() - 1;
+            _editor.selectedParts = {_definition.parts.size() - 1};
+            _editor.selectedGroup.reset();
+            _editor.selectedFaces.clear();
             rebuildPreview();
             _editor.status = "Added a 400 mm solid aluminum cube.";
         }
@@ -383,8 +399,10 @@ void CombatApp::handleEditorRequests() {
             std::string error;
             if (importAssembly(_editor.importPath, loaded, error)) {
                 _definition = std::move(loaded);
-                _editor.selectedPart.reset();
+                _editor.selectedParts.clear();
                 _editor.selectedGroup.reset();
+                _editor.selectedFaces.clear();
+                _editor.selectFaces = false;
                 rebuildPreview();
                 _editor.status = error.empty() ? "Imported " + _definition.name : error;
             } else {
@@ -397,6 +415,22 @@ void CombatApp::handleEditorRequests() {
         _editor.simulateRequested = false;
         if (editingAllowed())
             startSimulation();
+    }
+
+    if (_editor.deleteSelectionRequested) {
+        _editor.deleteSelectionRequested = false;
+        if (editingAllowed() && _run.frames.empty()) {
+            if (_editor.selectedGroup && *_editor.selectedGroup < _definition.groups.size()) {
+                deleteSelectedGroup(_definition, *_editor.selectedGroup, _editor.selectedParts);
+                _editor.selectedGroup.reset();
+            } else {
+                deleteSelectedParts(_definition, _editor.selectedParts, _editor.scenario.loads);
+            }
+            _editor.selectedFaces.clear();
+            _editor.selectFaces = false;
+            _editor.splicePreview = {};
+            rebuildPreview();
+        }
     }
 
     Recording finished;
@@ -435,47 +469,185 @@ float CombatApp::gizmoScale() const {
     return std::max(0.12f, _camera.distance() * 0.12f);
 }
 
+void CombatApp::pruneEditorSelection() {
+    _editor.selectedParts.erase(
+        std::remove_if(_editor.selectedParts.begin(), _editor.selectedParts.end(),
+                       [&](std::size_t i) { return i >= _definition.parts.size(); }),
+        _editor.selectedParts.end());
+    if (_editor.selectedGroup && *_editor.selectedGroup >= _definition.groups.size())
+        _editor.selectedGroup.reset();
+    _editor.selectedFaces.erase(
+        std::remove_if(_editor.selectedFaces.begin(), _editor.selectedFaces.end(),
+                       [&](const FaceId& id) {
+                           if (id.part >= _definition.parts.size() || !partIsSelected(_editor, id.part))
+                               return true;
+                           return id.face >= _definition.parts[id.part].source.faces.size();
+                       }),
+        _editor.selectedFaces.end());
+    if (_editor.selectedParts.empty())
+        _editor.selectFaces = false;
+    if (_editor.selectedFaces.empty() && _editor.tool == Tool::Splice)
+        _editor.tool = Tool::Select;
+}
+
+void CombatApp::seedSelectedPartFaces() {
+    for (std::size_t index : _editor.selectedParts) {
+        if (index < _definition.parts.size())
+            ensureAuthoredFaces(_definition.parts[index]);
+    }
+}
+
+chrono::ChQuaterniond CombatApp::worldRotation() const {
+    return _preview.assembly().placementRotation();
+}
+
+chrono::ChVector3d CombatApp::worldOrigin() const {
+    return _preview.assembly().placementPosition();
+}
+
 std::vector<std::size_t> CombatApp::selectionGroup() const {
-    std::vector<std::size_t> group;
-    const auto& parts = _definition.parts;
-    const auto& folders = _definition.groups;
-    std::vector<char> folder(_definition.groups.size(), 0);
-    if (_editor.selectedGroup && *_editor.selectedGroup < folders.size()) {
-        std::vector<int> stack{static_cast<int>(*_editor.selectedGroup)};
-        while (!stack.empty()) {
-            const int current = stack.back();
-            stack.pop_back();
-            if (current < 0 || static_cast<std::size_t>(current) >= folder.size() || folder[static_cast<std::size_t>(current)])
-                continue;
-            folder[static_cast<std::size_t>(current)] = 1;
-            for (int child = 0; child < static_cast<int>(folders.size()); ++child)
-                if (folders[static_cast<std::size_t>(child)].parent == current)
-                    stack.push_back(child);
-        }
-        for (std::size_t i = 0; i < parts.size(); ++i)
-            if (parts[i].group >= 0 && static_cast<std::size_t>(parts[i].group) < folder.size() &&
-                folder[static_cast<std::size_t>(parts[i].group)] && parts[i].parentPart < 0)
-                group.push_back(i);
-    } else if (_editor.selectedPart && *_editor.selectedPart < parts.size()) {
-        group.push_back(*_editor.selectedPart);
-    }
-    for (std::size_t n = 0; n < group.size(); ++n) {
-        for (std::size_t i = 0; i < parts.size(); ++i) {
-            if (parts[i].parentPart == static_cast<int>(group[n]) &&
-                std::find(group.begin(), group.end(), i) == group.end())
-                group.push_back(i);
-        }
-    }
-    return group;
+    return collectTransformTargets(_definition, _editor.selectedParts, _editor.selectedGroup);
 }
 
 Vector3 CombatApp::selectionCenter() const {
-    return toMagnum(_preview.assembly().centerOf(selectionGroup()));
+    const auto group = selectionGroup();
+    if (group.empty())
+        return {};
+    chrono::ChVector3d sum{0, 0, 0};
+    std::size_t count = 0;
+    for (std::size_t index : group) {
+        if (index >= _definition.parts.size())
+            continue;
+        sum += partCentroid(_definition.parts[index]);
+        ++count;
+    }
+    if (!count)
+        return {};
+    return toMagnum(toWorld(sum / double(count), worldRotation(), worldOrigin()));
 }
 
-void CombatApp::selectAt(const Vector2& windowPosition) {
+void CombatApp::refreshFaceVisuals() {
+    _editor.faceOutlines.clear();
+    const chrono::ChQuaterniond rotation = worldRotation();
+    const chrono::ChVector3d origin = worldOrigin();
+    for (const FaceId& id : _editor.selectedFaces) {
+        if (id.part >= _definition.parts.size())
+            continue;
+        std::vector<chrono::ChVector3d> loop;
+        faceLoopWorld(_definition.parts[id.part], id.face, rotation, origin, loop);
+        if (!loop.empty())
+            _editor.faceOutlines.push_back(std::move(loop));
+    }
+}
+
+std::vector<FaceHighlight> CombatApp::gpuFaceHighlights() const {
+    std::vector<FaceHighlight> faces;
+    const chrono::ChQuaterniond rotation = worldRotation();
+    const chrono::ChVector3d origin = worldOrigin();
+    for (const FaceId& id : _editor.selectedFaces) {
+        if (id.part >= _definition.parts.size())
+            continue;
+        std::vector<chrono::ChVector3d> loop;
+        faceLoopWorld(_definition.parts[id.part], id.face, rotation, origin, loop);
+        FaceHighlight highlight;
+        highlight.part = id.part;
+        highlight.loop.reserve(loop.size());
+        for (const auto& point : loop)
+            highlight.loop.push_back(toMagnum(point));
+        faces.push_back(std::move(highlight));
+    }
+    return faces;
+}
+
+void CombatApp::updateSplicePreview(const Vector3& origin, const Vector3& dir) {
+    _editor.splicePreview = {};
+    _authoredSplice = {};
+    _spliceHovering = false;
+    if (_editor.tool != Tool::Splice || _editor.selectedFaces.empty())
+        return;
+    seedSelectedPartFaces();
+    std::vector<std::size_t> parts;
+    for (const FaceId& id : _editor.selectedFaces) {
+        if (std::find(parts.begin(), parts.end(), id.part) == parts.end())
+            parts.push_back(id.part);
+    }
+    chrono::ChVector3d worldHit{0, 0, 0};
+    const auto hit = pickAuthoredFace(_definition, parts, toChrono(origin), toChrono(dir),
+                                      worldRotation(), worldOrigin(), &worldHit);
+    FaceId target;
+    std::optional<chrono::ChVector3d> through;
+    if (hit && faceIsSelected(_editor, *hit)) {
+        target = *hit;
+        _spliceHovering = true;
+        through = worldRotation().RotateBack(worldHit - worldOrigin());
+    } else if (_editor.selectedFaces.size() == 1) {
+        target = _editor.selectedFaces.front();
+    } else {
+        return;
+    }
+    if (target.part >= _definition.parts.size())
+        return;
+    SplicePreview preview =
+        makeSplicePreview(_definition.parts[target.part], target.face, _editor.spliceAngle, through);
+    if (!preview.valid && through)
+        preview = makeSplicePreview(_definition.parts[target.part], target.face, _editor.spliceAngle, {});
+    preview.face = target;
+    _authoredSplice = preview;
+    auto toPlaced = [&](chrono::ChVector3d point) {
+        return toWorld(point, worldRotation(), worldOrigin());
+    };
+    preview.chordA = toPlaced(preview.chordA);
+    preview.chordB = toPlaced(preview.chordB);
+    for (auto& point : preview.loop)
+        point = toPlaced(point);
+    preview.hits[0].point = toPlaced(preview.hits[0].point);
+    preview.hits[1].point = toPlaced(preview.hits[1].point);
+    _editor.splicePreview = std::move(preview);
+}
+
+bool CombatApp::commitSplice() {
+    if (!_spliceHovering || !_authoredSplice.valid ||
+        _authoredSplice.face.part >= _definition.parts.size())
+        return false;
+    PartDefinition& part = _definition.parts[_authoredSplice.face.part];
+    std::size_t faceA = 0;
+    std::size_t faceB = 0;
+    if (!spliceFace(part, _authoredSplice, faceA, faceB))
+        return false;
+    const FaceId old = _authoredSplice.face;
+    _editor.selectedFaces.erase(
+        std::remove(_editor.selectedFaces.begin(), _editor.selectedFaces.end(), old),
+        _editor.selectedFaces.end());
+    _editor.selectedFaces.push_back(FaceId{old.part, faceA});
+    _editor.selectedFaces.push_back(FaceId{old.part, faceB});
+    _editor.splicePreview = {};
+    _authoredSplice = {};
+    _spliceHovering = false;
+    rebuildPreview();
+    return true;
+}
+
+void CombatApp::selectAt(const Vector2& windowPosition, bool additive) {
     Vector3 origin, dir;
     rayAt(windowPosition, origin, dir);
+
+    if (_editor.selectFaces && !_editor.selectedParts.empty()) {
+        seedSelectedPartFaces();
+        const auto face = pickAuthoredFace(_definition, _editor.selectedParts, toChrono(origin),
+                                           toChrono(dir), worldRotation(), worldOrigin());
+        if (face) {
+            if (additive) {
+                auto found = std::find(_editor.selectedFaces.begin(), _editor.selectedFaces.end(), *face);
+                if (found == _editor.selectedFaces.end())
+                    _editor.selectedFaces.push_back(*face);
+                else
+                    _editor.selectedFaces.erase(found);
+            } else {
+                _editor.selectedFaces = {*face};
+            }
+            return;
+        }
+    }
 
     std::optional<std::size_t> hit;
     float bestT = 1.0e8f;
@@ -489,60 +661,53 @@ void CombatApp::selectAt(const Vector2& windowPosition) {
             hit = i;
         }
     }
-    _editor.selectedPart = hit;
-    if (hit)
-        _editor.selectedGroup.reset();
+    if (!hit) {
+        if (!additive) {
+            _editor.selectedParts.clear();
+            _editor.selectedGroup.reset();
+            _editor.selectedFaces.clear();
+            _editor.selectFaces = false;
+        }
+        return;
+    }
+    _editor.selectedGroup.reset();
+    if (additive) {
+        auto found = std::find(_editor.selectedParts.begin(), _editor.selectedParts.end(), *hit);
+        if (found == _editor.selectedParts.end())
+            _editor.selectedParts.push_back(*hit);
+        else {
+            _editor.selectedParts.erase(found);
+            _editor.selectedFaces.erase(
+                std::remove_if(_editor.selectedFaces.begin(), _editor.selectedFaces.end(),
+                               [&](const FaceId& id) { return id.part == *hit; }),
+                _editor.selectedFaces.end());
+        }
+    } else {
+        _editor.selectedParts = {*hit};
+        _editor.selectedFaces.clear();
+    }
+    if (_editor.selectedParts.empty())
+        _editor.selectFaces = false;
 }
 
 void CombatApp::applyTranslation(const Vector3& delta) {
+    if (!_editor.selectedFaces.empty())
+        return;
     const auto group = selectionGroup();
     if (group.empty() || delta.length() < 1.0e-8f)
         return;
 
     const chrono::ChVector3d world = toChrono(delta);
-
-    // place() drops the mean of the authored nodes onto InitialState::position.
-    // Shifting every patch by the same vector moves that mean by the same
-    // vector, and the drop cancels it, so dragging the whole welded assembly
-    // has to edit the drop position itself.
-    if (group.size() == _definition.parts.size()) {
-        _editor.scenario.initial.position += world;
-        rebuildPreview();
-        return;
-    }
-
-    const Assembly& assembly = _preview.assembly();
-    const chrono::ChVector3d local = assembly.placementRotation().RotateBack(world);
+    const chrono::ChVector3d local = worldRotation().RotateBack(world);
 
     std::vector<char> inGroup(_definition.parts.size(), 0);
-    std::size_t movedNodes = 0;
-    std::size_t totalNodes = 0;
-    for (const auto& part : assembly.parts())
-        totalNodes += part.nodeCount();
-
-    auto shiftMesh = [&](SurfaceMesh& mesh) {
-        for (auto& vertex : mesh.vertices)
-            vertex += local;
-    };
-    auto shiftVolume = [&](VolumeMesh& mesh) {
-        for (auto& vertex : mesh.vertices)
-            vertex += local;
-    };
     for (std::size_t index : group) {
         if (index >= _definition.parts.size())
             continue;
         inGroup[index] = 1;
-        PartDefinition& part = _definition.parts[index];
-        part.patch.origin += local;
-        shiftMesh(part.source);
-        shiftMesh(part.surface);
-        shiftVolume(part.volume);
-        if (index < assembly.parts().size())
-            movedNodes += assembly.parts()[index].nodeCount();
+        applyPartTranslation(_definition.parts[index], local);
     }
 
-    // Screws and optional weld regions live in authoring space. A joint only
-    // ties parts in the same connected group, so both ends move together.
     for (auto& screw : _definition.screws) {
         if (screw.partA < inGroup.size() && screw.partB < inGroup.size() &&
             inGroup[screw.partA] && inGroup[screw.partB])
@@ -557,48 +722,28 @@ void CombatApp::applyTranslation(const Vector3& delta) {
             weld.regionMax += local;
         }
     }
-
-    // Recentring onto the old drop position would slide the parts that were
-    // not dragged the other way. Shift the drop by the fraction the mean moved.
-    if (totalNodes > 0) {
-        const double fraction = double(movedNodes) / double(totalNodes);
-        _editor.scenario.initial.position += world * fraction;
-    }
     rebuildPreview();
 }
 
 void CombatApp::applyRotation(const Vector3& axis, Rad angle) {
+    if (!_editor.selectedFaces.empty())
+        return;
     if (axis.length() < 1.0e-6f)
         return;
     const auto group = selectionGroup();
     if (group.empty())
         return;
 
-    const Assembly& assembly = _preview.assembly();
-    const chrono::ChVector3d localAxis =
-        assembly.placementRotation().RotateBack(toChrono(axis.normalized()));
-    const chrono::ChQuaterniond rotation =
-        chrono::QuatFromAngleAxis(double(float(angle)), localAxis);
+    const chrono::ChVector3d localAxis = worldRotation().RotateBack(toChrono(axis.normalized()));
+    const chrono::ChQuaterniond rotation = chrono::QuatFromAngleAxis(double(float(angle)), localAxis);
     const chrono::ChVector3d worldPivot = toChrono(selectionCenter());
-    const chrono::ChVector3d pivot =
-        assembly.placementRotation().RotateBack(worldPivot - assembly.placementPosition()) +
-        assembly.authoredCenter();
+    const chrono::ChVector3d pivot = worldRotation().RotateBack(worldPivot - worldOrigin()) +
+                                     _preview.assembly().authoredCenter();
 
     for (std::size_t index : group) {
         if (index >= _definition.parts.size())
             continue;
-        PartDefinition& part = _definition.parts[index];
-        auto spin = [&](chrono::ChVector3d& point) {
-            point = pivot + rotation.Rotate(point - pivot);
-        };
-        spin(part.patch.origin);
-        part.patch.uAxis = rotation.Rotate(part.patch.uAxis);
-        part.patch.vAxis = rotation.Rotate(part.patch.vAxis);
-        for (auto* mesh : {&part.source, &part.surface})
-            for (auto& vertex : mesh->vertices)
-                spin(vertex);
-        for (auto& vertex : part.volume.vertices)
-            spin(vertex);
+        applyPartRotation(_definition.parts[index], rotation, pivot);
     }
     rebuildPreview();
 }
@@ -615,9 +760,17 @@ void CombatApp::drawEvent() {
     if (_editor.autoStressScale)
         _editor.stressScale = std::max(recording.maxStress, 1.0e6f);
 
+    pruneEditorSelection();
+    if (_editor.tool == Tool::Splice && editingAllowed() && _run.frames.empty()) {
+        Vector3 origin, dir;
+        rayAt(_havePointer ? _lastPointer : Vector2{windowSize()} * 0.5f, origin, dir);
+        updateSplicePreview(origin, dir);
+    }
+    refreshFaceVisuals();
+
     if (frame) {
         _renderer.update(recording.layout, *frame, _editor.shade, _editor.stressScale,
-                         selectionGroup(), _editor.showAir);
+                         selectionGroup(), gpuFaceHighlights(), _editor.showAir);
     }
 
     GL::Renderer::setClearColor(0x1b1e23_rgbf);
@@ -629,7 +782,9 @@ void CombatApp::drawEvent() {
                    _editor.playback.time);
 
     const bool showGizmo = editingAllowed() && _run.frames.empty() &&
-                           !selectionGroup().empty() && _editor.tool != Tool::Select;
+                           _editor.selectedFaces.empty() &&
+                           (_editor.tool == Tool::Move || _editor.tool == Tool::Rotate) &&
+                           !selectionGroup().empty();
     if (showGizmo) {
         _gizmos.draw(view, projection, selectionCenter(), gizmoScale(),
                      _editor.tool, _activeHandle != GizmoHandle::None ? _activeHandle : _hoverHandle);
@@ -648,6 +803,10 @@ void CombatApp::drawEvent() {
     context.frame = frame;
     context.simulating = _job.running();
     context.progress = _job.progress();
+    context.simulatedTime = _job.simulatedTime();
+    context.runDuration = _job.runDuration();
+    context.simStep = _job.stepIndex();
+    context.simStepCount = _job.stepCount();
     context.assemblyMass = _preview.assembly().mass();
     context.loadAdvice.reserve(_editor.scenario.loads.size());
     for (std::size_t i = 0; i < _editor.scenario.loads.size(); ++i) {
@@ -656,6 +815,7 @@ void CombatApp::drawEvent() {
     }
     drawEditorUi(_editor, context);
     drawArenaOverlay(_editor.scenario.environment, view, projection);
+    drawFaceOverlays(_editor, view, projection);
     _imgui.updateApplicationCursor(*this);
 
     GL::Renderer::enable(GL::Renderer::Feature::Blending);
@@ -704,8 +864,13 @@ void CombatApp::pointerPressEvent(PointerEvent& event) {
     if (event.pointer() != Pointer::MouseLeft)
         return;
 
+    _lastPointer = event.position();
+    _havePointer = true;
+
     const bool canEdit = editingAllowed() && _run.frames.empty();
-    if (canEdit && !selectionGroup().empty() && _editor.tool != Tool::Select) {
+    const bool gizmoTool = _editor.selectedFaces.empty() &&
+                           (_editor.tool == Tool::Move || _editor.tool == Tool::Rotate);
+    if (canEdit && !selectionGroup().empty() && gizmoTool) {
         Vector3 origin, dir;
         rayAt(event.position(), origin, dir);
         const Vector3 center = selectionCenter();
@@ -730,7 +895,18 @@ void CombatApp::pointerPressEvent(PointerEvent& event) {
         }
     }
 
-    selectAt(event.position());
+    if (canEdit && _editor.tool == Tool::Splice) {
+        Vector3 origin, dir;
+        rayAt(event.position(), origin, dir);
+        updateSplicePreview(origin, dir);
+        if (commitSplice()) {
+            event.setAccepted();
+            return;
+        }
+    }
+
+    const bool additive = bool(event.modifiers() & Modifier::Ctrl);
+    selectAt(event.position(), additive);
     event.setAccepted();
 }
 
@@ -757,6 +933,8 @@ void CombatApp::pointerMoveEvent(PointerMoveEvent& event) {
 
     Vector3 origin, dir;
     rayAt(event.position(), origin, dir);
+    _lastPointer = event.position();
+    _havePointer = true;
     _editor.probeVisible = false;
     if (_editor.shade == ShadeMode::Temperature || _editor.shade == ShadeMode::Stress) {
         if (const Frame* frame = activeFrame()) {
@@ -777,13 +955,20 @@ void CombatApp::pointerMoveEvent(PointerMoveEvent& event) {
     }
 
     const bool canEdit = editingAllowed() && _run.frames.empty();
-    if (canEdit && !selectionGroup().empty() && _editor.tool != Tool::Select &&
+    const bool gizmoTool = _editor.selectedFaces.empty() &&
+                           (_editor.tool == Tool::Move || _editor.tool == Tool::Rotate);
+    if (canEdit && !selectionGroup().empty() && gizmoTool &&
         _activeHandle == GizmoHandle::None) {
         const Vector3 center = selectionCenter();
         _hoverHandle = (_editor.tool == Tool::Move)
             ? _gizmos.pickMove(origin, dir, center, gizmoScale())
             : _gizmos.pickRotate(origin, dir, center, gizmoScale());
+    } else if (!gizmoTool) {
+        _hoverHandle = GizmoHandle::None;
     }
+
+    if (canEdit && _editor.tool == Tool::Splice)
+        updateSplicePreview(origin, dir);
 
     if (canEdit && _activeHandle != GizmoHandle::None && (event.pointers() & Pointer::MouseLeft)) {
         if (_editor.tool == Tool::Move) {
@@ -822,11 +1007,31 @@ void CombatApp::scrollEvent(ScrollEvent& event) {
         event.setAccepted();
         return;
     }
+    if (editingAllowed() && _run.frames.empty() && _editor.tool == Tool::Splice &&
+        !_editor.selectedFaces.empty()) {
+        Vector3 origin, dir;
+        rayAt(event.position(), origin, dir);
+        updateSplicePreview(origin, dir);
+        if (_editor.splicePreview.valid) {
+            _editor.spliceAngle += double(event.offset().y()) * (5.0 * 3.14159265358979323846 / 180.0);
+            updateSplicePreview(origin, dir);
+            event.setAccepted();
+            return;
+        }
+    }
     _camera.zoom(event.offset().y());
     event.setAccepted();
 }
 
 void CombatApp::keyPressEvent(KeyEvent& event) {
+    const bool typing = ImGui::GetIO().WantTextInput;
+    if (!typing && event.key() == Key::Delete && editingAllowed() && _run.frames.empty()) {
+        if (!_editor.selectedParts.empty() || _editor.selectedGroup) {
+            _editor.deleteSelectionRequested = true;
+            event.setAccepted();
+            return;
+        }
+    }
     if (_imgui.handleKeyPressEvent(event)) {
         event.setAccepted();
         return;

@@ -75,9 +75,13 @@ void ThermalReissnerElasticity::ComputeStress(chrono::ChVector3d& nU,
 {
     chrono::ChVector3d eu = epsU;
     chrono::ChVector3d ev = epsV;
+    chrono::ChVector3d ku = kurU;
+    chrono::ChVector3d kv = kurV;
     eu.x() -= _thermal;
     ev.y() -= _thermal;
-    chrono::fea::ChElasticityReissnerIsothropic::ComputeStress(nU, nV, mU, mV, eu, ev, kurU, kurV, zInf,
+    ku.y() -= _thermalKur;
+    kv.x() -= _thermalKur;
+    chrono::fea::ChElasticityReissnerIsothropic::ComputeStress(nU, nV, mU, mV, eu, ev, ku, kv, zInf,
                                                                zSup, angle);
     if (_stiffness != 1.0) {
         nU *= _stiffness;

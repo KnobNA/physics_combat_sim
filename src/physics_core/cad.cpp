@@ -33,8 +33,39 @@ PartDefinition panel(const std::string& name,
     part.patch.vAxis = vAxis;
     part.patch.uSize = size;
     part.patch.vSize = size;
-    part.patch.divU = divisions;
-    part.patch.divV = divisions;
+    part.patch.divU = std::max(1, divisions);
+    part.patch.divV = std::max(1, divisions);
+
+    ChVector3d u = uAxis;
+    ChVector3d v = vAxis;
+    if (u.Length() > 1.0e-12)
+        u.Normalize();
+    if (v.Length() > 1.0e-12)
+        v.Normalize();
+    ChVector3d n = u.Cross(v);
+    if (n.Length() < 1.0e-12)
+        n = {0, 1, 0};
+    else
+        n.Normalize();
+    const double h = 0.5 * std::max(thickness, 1.0e-6);
+    auto corner = [&](double su, double sv, double side) {
+        return origin + u * (su * size) + v * (sv * size) + n * (side * h);
+    };
+    part.source.vertices = {corner(0.0, 0.0, -1.0), corner(1.0, 0.0, -1.0), corner(1.0, 1.0, -1.0),
+                            corner(0.0, 1.0, -1.0), corner(0.0, 0.0, 1.0),  corner(1.0, 0.0, 1.0),
+                            corner(1.0, 1.0, 1.0),  corner(0.0, 1.0, 1.0)};
+    const int quads[6][4] = {
+        {0, 3, 2, 1}, {4, 5, 6, 7}, {0, 1, 5, 4}, {1, 2, 6, 5}, {2, 3, 7, 6}, {3, 0, 4, 7}};
+    for (const auto& face : quads) {
+        part.source.faces.push_back(AuthoredFace{{face[0], face[1], face[2], face[3]}});
+        part.source.triangles.push_back({face[0], face[1], face[2]});
+        part.source.triangles.push_back({face[0], face[2], face[3]});
+    }
+    part.sizing.shellCutoff = 0.008;
+    part.sizing.minElement = 0.008;
+    part.sizing.maxElement = 0.025;
+    part.sizing.throughThickness = 2;
+    part.sizing.tetBudget = 800;
     return part;
 }
 
@@ -70,6 +101,7 @@ int parseIndex(const std::string& token, int count) {
 void addFace(SurfaceMesh& mesh, const std::vector<int>& corners) {
     if (corners.size() < 3)
         return;
+    mesh.faces.push_back(AuthoredFace{corners});
     for (std::size_t i = 1; i + 1 < corners.size(); ++i)
         mesh.triangles.push_back({corners[0], corners[i], corners[i + 1]});
 }
@@ -282,10 +314,8 @@ bool isChunkySolid(const SurfaceMesh& mesh) {
 AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
     const double t = options.thickness;
     const int n = std::max(1, options.divisions);
-    // Shell elements live on the panel mid-surface, so the six mid-surfaces
-    // form a cube one thickness smaller than the outside dimension. Laying
-    // them out this way makes the twelve seams geometrically coincident, which
-    // is what the weld node-pairing looks for.
+    // Each wall is a solid slab whose mid-surface matches the old shell
+    // layout, so the twelve welds still pair along coincident seams.
     const double size = options.outerSize - t;
     const double h = 0.5 * size;
 
@@ -295,7 +325,7 @@ AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
 
     AssemblyDefinition assembly;
     assembly.name = "Welded test box";
-    assembly.groups.push_back(GroupDefinition{"Shell cube", -1});
+    assembly.groups.push_back(GroupDefinition{"Hollow cube", -1});
 
     // Axes are ordered so that u x v points out of the box.
     assembly.parts.push_back(panel("Bottom", options.material, t, n, {-h, -h, -h}, x, z, size));

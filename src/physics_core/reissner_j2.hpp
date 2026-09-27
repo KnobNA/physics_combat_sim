@@ -30,6 +30,10 @@ public:
 
     void SetThermalStrain(double strain) { _thermal = strain; }
     double thermalStrain() const { return _thermal; }
+    /// Uniform thermal curvature κ_T ≈ α (T_top − T_bot) / h. Subtracted from
+    /// the bending strains so a through-thickness gradient curls the midplane.
+    void SetThermalCurvature(double kappa) { _thermalKur = kappa; }
+    double thermalCurvature() const { return _thermalKur; }
     /// Scales the tangent and the stress. The floor keeps the shell invertible
     /// once the handbook curve has fallen past the solidus.
     void SetStiffnessScale(double scale) { _stiffness = std::clamp(scale, kThermalFloor, 1.0); }
@@ -58,6 +62,7 @@ public:
 
 private:
     double _thermal = 0.0;
+    double _thermalKur = 0.0;
     double _stiffness = 1.0;
 };
 

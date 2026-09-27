@@ -1,12 +1,21 @@
 #include "editor/ui.hpp"
+#include "editor/faces.hpp"
 #include "physics_core/material.hpp"
 
+#include "chrono/core/ChQuaternion.h"
+#include "chrono/core/ChRotation.h"
+
 #include <Magnum/Math/Color.h>
+#include <Magnum/Math/Matrix4.h>
+#include <Magnum/Math/Vector2.h>
+#include <Magnum/Math/Vector3.h>
+#include <Magnum/Math/Vector4.h>
 #include <imgui.h>
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace rcs {
 namespace {
@@ -49,6 +58,116 @@ std::string formatStress(float pascals) {
     else
         std::snprintf(buffer, sizeof(buffer), "%.0f Pa", pascals);
     return buffer;
+}
+
+struct HierDrag {
+    int kind = 0;  // 0 part, 1 group
+    int index = 0;
+};
+
+void selectClickedPart(EditorState& state, std::size_t index) {
+    state.selectedGroup.reset();
+    if (ImGui::GetIO().KeyCtrl) {
+        auto found = std::find(state.selectedParts.begin(), state.selectedParts.end(), index);
+        if (found == state.selectedParts.end())
+            state.selectedParts.push_back(index);
+        else
+            state.selectedParts.erase(found);
+    } else {
+        state.selectedParts = {index};
+        state.selectedFaces.clear();
+    }
+    if (state.selectedParts.empty())
+        state.selectFaces = false;
+    state.selectedFaces.erase(
+        std::remove_if(state.selectedFaces.begin(), state.selectedFaces.end(),
+                       [&](const FaceId& id) { return !partIsSelected(state, id.part); }),
+        state.selectedFaces.end());
+}
+
+void requestDeletePart(EditorState& state, std::size_t index) {
+    if (!partIsSelected(state, index)) {
+        state.selectedParts = {index};
+        state.selectedGroup.reset();
+        state.selectedFaces.clear();
+    }
+    state.deleteSelectionRequested = true;
+}
+
+void applyHierDrop(AssemblyDefinition& definition, const HierDrag& src, int targetKind, int targetIndex,
+                   bool insertBefore, bool edge) {
+    if (src.kind == 0) {
+        if (src.index < 0 || static_cast<std::size_t>(src.index) >= definition.parts.size())
+            return;
+        PartDefinition& part = definition.parts[static_cast<std::size_t>(src.index)];
+        if (targetKind == 0) {
+            if (targetIndex < 0 || static_cast<std::size_t>(targetIndex) >= definition.parts.size())
+                return;
+            if (src.index == targetIndex)
+                return;
+            if (partIsDescendant(definition, static_cast<std::size_t>(targetIndex),
+                                 static_cast<std::size_t>(src.index)))
+                return;
+            const PartDefinition& target = definition.parts[static_cast<std::size_t>(targetIndex)];
+            const bool siblings = part.parentPart == target.parentPart && part.group == target.group;
+            if (siblings && edge) {
+                part.order = target.order + (insertBefore ? -1 : 1);
+            } else {
+                part.parentPart = targetIndex;
+                part.group = target.group;
+                part.order = 1000;
+            }
+        } else if (targetKind == 1) {
+            if (targetIndex < 0 || static_cast<std::size_t>(targetIndex) >= definition.groups.size())
+                return;
+            part.parentPart = -1;
+            part.group = targetIndex;
+            part.order = 1000;
+        } else {
+            part.parentPart = -1;
+            part.group = -1;
+            part.order = 1000;
+        }
+    } else {
+        if (src.index < 0 || static_cast<std::size_t>(src.index) >= definition.groups.size())
+            return;
+        GroupDefinition& group = definition.groups[static_cast<std::size_t>(src.index)];
+        if (targetKind == 1) {
+            if (src.index == targetIndex)
+                return;
+            if (groupIsDescendant(definition, targetIndex, src.index))
+                return;
+            const bool siblings =
+                group.parent == definition.groups[static_cast<std::size_t>(targetIndex)].parent;
+            if (siblings && edge) {
+                group.order = definition.groups[static_cast<std::size_t>(targetIndex)].order +
+                              (insertBefore ? -1 : 1);
+            } else {
+                group.parent = targetIndex;
+                group.order = 1000;
+            }
+        } else if (targetKind == 2) {
+            group.parent = -1;
+            group.order = 1000;
+        }
+    }
+    renormalizeSiblingOrder(definition);
+}
+
+bool acceptHierDrop(AssemblyDefinition& definition, int targetKind, int targetIndex) {
+    if (!ImGui::BeginDragDropTarget())
+        return false;
+    const ImGuiPayload* payload = ImGui::AcceptDragDropPayload("RCS_HIER");
+    if (!payload) {
+        ImGui::EndDragDropTarget();
+        return false;
+    }
+    HierDrag src = *static_cast<const HierDrag*>(payload->Data);
+    const float span = std::max(1.0f, ImGui::GetItemRectMax().y - ImGui::GetItemRectMin().y);
+    const float t = (ImGui::GetMousePos().y - ImGui::GetItemRectMin().y) / span;
+    applyHierDrop(definition, src, targetKind, targetIndex, t < 0.5f, t < 0.25f || t > 0.75f);
+    ImGui::EndDragDropTarget();
+    return true;
 }
 
 void drawStressLegend(float scale) {
@@ -133,9 +252,38 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
                 setPartBranch(i, on, setPartBranch);
         state.rebuildRequested = true;
     };
+    auto sortedKids = [&](int parent, int group) {
+        std::vector<std::size_t> kids;
+        for (std::size_t i = 0; i < partCount; ++i) {
+            const auto& p = context.definition->parts[i];
+            if (p.parentPart == parent && p.group == group)
+                kids.push_back(i);
+        }
+        std::sort(kids.begin(), kids.end(), [&](std::size_t a, std::size_t b) {
+            if (context.definition->parts[a].order != context.definition->parts[b].order)
+                return context.definition->parts[a].order < context.definition->parts[b].order;
+            return a < b;
+        });
+        return kids;
+    };
+    auto sortedGroups = [&](int parent) {
+        std::vector<int> kids;
+        for (int g = 0; g < static_cast<int>(context.definition->groups.size()); ++g)
+            if (context.definition->groups[static_cast<std::size_t>(g)].parent == parent)
+                kids.push_back(g);
+        std::sort(kids.begin(), kids.end(), [&](int a, int b) {
+            if (context.definition->groups[static_cast<std::size_t>(a)].order !=
+                context.definition->groups[static_cast<std::size_t>(b)].order)
+                return context.definition->groups[static_cast<std::size_t>(a)].order <
+                       context.definition->groups[static_cast<std::size_t>(b)].order;
+            return a < b;
+        });
+        return kids;
+    };
     auto showPart = [&](std::size_t i, auto& drawChildren) -> void {
         const PartDefinition& defined = context.definition->parts[i];
-        const PartLayout& layout = context.layout->parts[i];
+        const PartLayout& layout = i < context.layout->parts.size() ? context.layout->parts[i]
+                                                                    : PartLayout{};
         char label[160];
         if (defined.simulate && layout.volume)
             std::snprintf(label, sizeof(label), "%s  (%s, solid, %d tets)", defined.name.c_str(),
@@ -145,7 +293,6 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
                           defined.material.name.c_str(), defined.thickness * 1000.0);
         else
             std::snprintf(label, sizeof(label), "%s  (off)", defined.name.c_str());
-        const bool partSelected = state.selectedPart && *state.selectedPart == i;
         ImGui::PushID(static_cast<int>(i) + 1000);
         ImGui::BeginDisabled(context.simulating);
         bool on = context.definition->parts[i].simulate;
@@ -157,17 +304,27 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("Include this part in the view and the simulation");
         ImGui::SameLine();
-        if (ImGui::Selectable(label, partSelected)) {
-            state.selectedPart = i;
-            state.selectedGroup.reset();
+        if (ImGui::Selectable(label, partIsSelected(state, i)))
+            selectClickedPart(state, i);
+        if (!context.simulating && ImGui::BeginDragDropSource()) {
+            HierDrag drag{0, static_cast<int>(i)};
+            ImGui::SetDragDropPayload("RCS_HIER", &drag, sizeof(drag));
+            ImGui::TextUnformatted(defined.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (!context.simulating && acceptHierDrop(*context.definition, 0, static_cast<int>(i)))
+            state.rebuildRequested = true;
+        if (ImGui::BeginPopupContextItem("part_menu")) {
+            if (ImGui::MenuItem("Delete"))
+                requestDeletePart(state, i);
+            ImGui::EndPopup();
         }
         drawChildren(i);
         ImGui::PopID();
     };
     auto drawChildren = [&](std::size_t parent, auto& self) -> void {
-        for (std::size_t i = 0; i < partCount; ++i) {
-            if (context.definition->parts[i].parentPart != static_cast<int>(parent))
-                continue;
+        const int group = context.definition->parts[parent].group;
+        for (std::size_t i : sortedKids(static_cast<int>(parent), group)) {
             ImGui::Indent();
             showPart(i, [&](std::size_t child) { self(child, self); });
             ImGui::Unindent();
@@ -190,41 +347,89 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
         const bool open = ImGui::TreeNodeEx(group.name.c_str(), flags);
         if (ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen()) {
             state.selectedGroup = static_cast<std::size_t>(groupIndex);
-            state.selectedPart.reset();
+            state.selectedParts.clear();
+            state.selectedFaces.clear();
+            state.selectFaces = false;
+        }
+        if (!context.simulating && ImGui::BeginDragDropSource()) {
+            HierDrag drag{1, groupIndex};
+            ImGui::SetDragDropPayload("RCS_HIER", &drag, sizeof(drag));
+            ImGui::TextUnformatted(group.name.c_str());
+            ImGui::EndDragDropSource();
+        }
+        if (!context.simulating && acceptHierDrop(*context.definition, 1, groupIndex))
+            state.rebuildRequested = true;
+        if (ImGui::BeginPopupContextItem("group_menu")) {
+            if (ImGui::MenuItem("Delete")) {
+                state.selectedGroup = static_cast<std::size_t>(groupIndex);
+                state.selectedParts.clear();
+                state.deleteSelectionRequested = true;
+            }
+            ImGui::EndPopup();
         }
         if (open) {
-            for (int child = 0; child < static_cast<int>(context.definition->groups.size()); ++child) {
-                if (context.definition->groups[static_cast<std::size_t>(child)].parent == groupIndex)
-                    self(child, self);
-            }
-            for (std::size_t i = 0; i < partCount; ++i) {
-                const PartDefinition& part = context.definition->parts[i];
-                if (part.group != groupIndex || part.parentPart >= 0)
-                    continue;
+            for (int child : sortedGroups(groupIndex))
+                self(child, self);
+            for (std::size_t i : sortedKids(-1, groupIndex))
                 showPart(i, [&](std::size_t child) { drawChildren(child, drawChildren); });
-            }
             ImGui::TreePop();
         }
         ImGui::PopID();
     };
-    for (int g = 0; g < static_cast<int>(context.definition->groups.size()); ++g) {
-        if (context.definition->groups[static_cast<std::size_t>(g)].parent < 0)
-            drawGroup(g, drawGroup);
-    }
-    for (std::size_t i = 0; i < partCount; ++i) {
-        const PartDefinition& part = context.definition->parts[i];
-        if (part.group >= 0 || part.parentPart >= 0)
-            continue;
+    for (int g : sortedGroups(-1))
+        drawGroup(g, drawGroup);
+    for (std::size_t i : sortedKids(-1, -1))
         showPart(i, [&](std::size_t child) { drawChildren(child, drawChildren); });
-    }
+    ImGui::Dummy({ImGui::GetContentRegionAvail().x, 18.0f});
+    if (!context.simulating && acceptHierDrop(*context.definition, 2, -1))
+        state.rebuildRequested = true;
     ImGui::BeginDisabled(context.simulating);
     if (ImGui::Button("New folder", {-1.0f, 0.0f}))
         state.addGroupRequested = true;
     ImGui::EndDisabled();
 
-    if (state.selectedPart && context.definition &&
-        *state.selectedPart < context.definition->parts.size()) {
-        PartDefinition& part = context.definition->parts[*state.selectedPart];
+    const auto targets =
+        collectTransformTargets(*context.definition, state.selectedParts, state.selectedGroup);
+    if (!context.simulating && state.selectedFaces.empty() && !targets.empty()) {
+        chrono::ChVector3d centroid{0, 0, 0};
+        for (std::size_t i : targets)
+            centroid += partCentroid(context.definition->parts[i]);
+        centroid /= double(targets.size());
+        float pos[3] = {float(centroid.x()), float(centroid.y()), float(centroid.z())};
+        if (ImGui::DragFloat3("Position (m)", pos, 0.001f, 0.0f, 0.0f, "%.4f")) {
+            const chrono::ChVector3d delta{pos[0] - centroid.x(), pos[1] - centroid.y(),
+                                           pos[2] - centroid.z()};
+            for (std::size_t i : targets)
+                applyPartTranslation(context.definition->parts[i], delta);
+            state.rebuildRequested = true;
+        }
+        chrono::ChVector3d euler = targets.size() == 1 ? partEuler(context.definition->parts[targets[0]])
+                                                       : chrono::ChVector3d{0, 0, 0};
+        float deg[3] = {float(euler.x() * 180.0 / 3.14159265358979323846),
+                        float(euler.y() * 180.0 / 3.14159265358979323846),
+                        float(euler.z() * 180.0 / 3.14159265358979323846)};
+        if (ImGui::DragFloat3("Rotation (deg)", deg, 0.2f, 0.0f, 0.0f, "%.2f")) {
+            chrono::ChVector3d next{deg[0] * 3.14159265358979323846 / 180.0,
+                                    deg[1] * 3.14159265358979323846 / 180.0,
+                                    deg[2] * 3.14159265358979323846 / 180.0};
+            const chrono::ChQuaterniond qOld =
+                chrono::QuatFromAngleZ(euler.z()) * chrono::QuatFromAngleY(euler.y()) *
+                chrono::QuatFromAngleX(euler.x());
+            const chrono::ChQuaterniond qNew =
+                chrono::QuatFromAngleZ(next.z()) * chrono::QuatFromAngleY(next.y()) *
+                chrono::QuatFromAngleX(next.x());
+            const chrono::ChQuaterniond delta = qNew * qOld.GetConjugate();
+            for (std::size_t i : targets)
+                applyPartRotation(context.definition->parts[i], delta, centroid);
+            state.rebuildRequested = true;
+        }
+        if (targets.size() > 1)
+            ImGui::TextDisabled("Values are the selection centroid. Rotation is about that point.");
+    }
+
+    if (!state.selectedParts.empty() && context.definition &&
+        state.selectedParts.front() < context.definition->parts.size()) {
+        PartDefinition& part = context.definition->parts[state.selectedParts.front()];
         const char* folderLabel = "(none)";
         if (part.group >= 0 && static_cast<std::size_t>(part.group) < context.definition->groups.size())
             folderLabel = context.definition->groups[static_cast<std::size_t>(part.group)].name.c_str();
@@ -297,8 +502,8 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
             state.rebuildRequested = true;
         }
         ImGui::TextDisabled("Contact stiffness and floor restitution are under Scenario.");
-        if (context.frame && *state.selectedPart < context.frame->parts.size()) {
-            const auto& strains = context.frame->parts[*state.selectedPart].plasticStrain;
+        if (context.frame && state.selectedParts.front() < context.frame->parts.size()) {
+            const auto& strains = context.frame->parts[state.selectedParts.front()].plasticStrain;
             float peak = 0.0f;
             for (float value : strains)
                 peak = std::max(peak, value);
@@ -341,9 +546,9 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
     ImGui::EndDisabled();
     ImGui::TextDisabled("Thin walls stay shells. Thick regions are tetrahedra. Welds stay manual.");
 
-    if (state.selectedPart && context.definition &&
-        *state.selectedPart < context.definition->parts.size()) {
-        PartDefinition& sized = context.definition->parts[*state.selectedPart];
+    if (!state.selectedParts.empty() && context.definition &&
+        state.selectedParts.front() < context.definition->parts.size()) {
+        PartDefinition& sized = context.definition->parts[state.selectedParts.front()];
         if (!sized.source.empty() || !sized.volume.empty()) {
             if (ImGui::TreeNode("Mesh size")) {
                 bool edited = false;
@@ -584,6 +789,8 @@ void drawRunPanel(EditorState& state, const UiContext& context) {
 
     if (context.simulating) {
         ImGui::ProgressBar(context.progress, {-1.0f, 0.0f});
+        ImGui::Text("%.2f s / %.2f s    step %lld / %lld", context.simulatedTime, context.runDuration,
+                    context.simStep, context.simStepCount);
         if (ImGui::Button("Cancel", {-1.0f, 32.0f}))
             state.cancelRequested = true;
     } else {
@@ -690,17 +897,39 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
 
     ImGui::SeparatorText("Tools");
     ImGui::BeginDisabled(context.simulating);
-    auto radio = [&](const char* label, Tool tool) {
+    auto radio = [&](const char* label, Tool tool, bool enabled = true) {
+        ImGui::BeginDisabled(!enabled);
         if (ImGui::RadioButton(label, state.tool == tool))
             state.tool = tool;
+        ImGui::EndDisabled();
     };
     radio("Select", Tool::Select);
     ImGui::SameLine();
-    radio("Move", Tool::Move);
+    radio("Move", Tool::Move, state.selectedFaces.empty());
     ImGui::SameLine();
-    radio("Rotate", Tool::Rotate);
+    radio("Rotate", Tool::Rotate, state.selectedFaces.empty());
+    ImGui::SameLine();
+    radio("Splice", Tool::Splice, !state.selectedFaces.empty());
+    if (state.tool == Tool::Select) {
+        ImGui::BeginDisabled(state.selectedParts.empty());
+        ImGui::Checkbox("Select faces", &state.selectFaces);
+        ImGui::EndDisabled();
+        if (state.selectedParts.empty())
+            state.selectFaces = false;
+        if (state.selectFaces && context.definition) {
+            for (std::size_t index : state.selectedParts) {
+                if (index < context.definition->parts.size())
+                    ensureAuthoredFaces(context.definition->parts[index]);
+            }
+        }
+    }
+    if (state.selectedFaces.empty() && state.tool == Tool::Splice)
+        state.tool = Tool::Select;
+    if (!state.selectedFaces.empty() && (state.tool == Tool::Move || state.tool == Tool::Rotate))
+        state.tool = Tool::Select;
     ImGui::EndDisabled();
     ImGui::TextDisabled("Right drag orbits, middle drag pans, wheel zooms.");
+    ImGui::TextDisabled("Ctrl+click adds to the selection. Del deletes.");
 
     ImGui::End();
 
@@ -806,6 +1035,79 @@ void drawArenaOverlay(const Environment& environment,
             continue;
         formatLength(axisLength[i], length, sizeof(length));
         label(draw, {screen.x, screen.y - 14.0f}, length, true);
+    }
+}
+
+void drawFaceOverlays(const EditorState& state,
+                      const Magnum::Matrix4& view,
+                      const Magnum::Matrix4& projection)
+{
+    const Magnum::Matrix4 clipFromWorld = projection * view;
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    auto project = [&](const chrono::ChVector3d& world, ImVec2& screen) {
+        const Magnum::Vector4 clip =
+            clipFromWorld * Magnum::Vector4{float(world.x()), float(world.y()), float(world.z()), 1.0f};
+        if (clip.w() <= 0.05f)
+            return false;
+        const float x = clip.x() / clip.w();
+        const float y = clip.y() / clip.w();
+        if (x < -1.2f || x > 1.2f || y < -1.2f || y > 1.2f)
+            return false;
+        screen.x = (x * 0.5f + 0.5f) * display.x;
+        screen.y = (1.0f - (y * 0.5f + 0.5f)) * display.y;
+        return true;
+    };
+    ImDrawList* draw = ImGui::GetForegroundDrawList();
+    auto text = [&](const ImVec2& at, const char* value) {
+        const ImVec2 size = ImGui::CalcTextSize(value);
+        const ImVec2 pos{at.x - size.x * 0.5f, at.y - size.y * 0.5f};
+        draw->AddText({pos.x + 1.0f, pos.y + 1.0f}, IM_COL32(0, 0, 0, 200), value);
+        draw->AddText(pos, IM_COL32(255, 255, 255, 255), value);
+    };
+    for (const auto& loop : state.faceOutlines) {
+        for (std::size_t i = 0; i < loop.size(); ++i) {
+            ImVec2 a, b;
+            if (!project(loop[i], a) || !project(loop[(i + 1) % loop.size()], b))
+                continue;
+            draw->AddLine(a, b, IM_COL32(255, 210, 80, 255), 2.0f);
+        }
+    }
+    const SplicePreview& preview = state.splicePreview;
+    if (!preview.valid || state.tool != Tool::Splice)
+        return;
+    ImVec2 ca, cb;
+    if (project(preview.chordA, ca) && project(preview.chordB, cb)) {
+        draw->AddLine(ca, cb, IM_COL32(80, 220, 255, 255), 2.0f);
+        ImVec2 mid{(ca.x + cb.x) * 0.5f, (ca.y + cb.y) * 0.5f - 14.0f};
+        text(mid, formatMillimetres(preview.chordLength).c_str());
+    }
+    for (std::size_t i = 0; i < preview.loop.size(); ++i) {
+        const chrono::ChVector3d a = preview.loop[i];
+        const chrono::ChVector3d b = preview.loop[(i + 1) % preview.loop.size()];
+        ImVec2 sa, sb;
+        if (!project(a, sa) || !project(b, sb))
+            continue;
+        if (preview.hits[0].edge == static_cast<int>(i) ||
+            preview.hits[1].edge == static_cast<int>(i)) {
+            const int hit = preview.hits[0].edge == static_cast<int>(i) ? 0 : 1;
+            ImVec2 hp;
+            if (project(preview.hits[hit].point, hp)) {
+                text({(sa.x + hp.x) * 0.5f, (sa.y + hp.y) * 0.5f + 12.0f},
+                     formatMillimetres(preview.edgeSplitA[i]).c_str());
+                text({(hp.x + sb.x) * 0.5f, (hp.y + sb.y) * 0.5f + 12.0f},
+                     formatMillimetres(preview.edgeSplitB[i]).c_str());
+                if (preview.square[hit]) {
+                    draw->AddRect({hp.x - 8.0f, hp.y - 8.0f}, {hp.x + 8.0f, hp.y + 8.0f},
+                                  IM_COL32(80, 220, 255, 255), 0.0f, 0, 2.0f);
+                } else {
+                    draw->AddCircle(hp, 14.0f, IM_COL32(80, 220, 255, 255), 20, 1.5f);
+                }
+                text({hp.x, hp.y - 20.0f}, formatDegrees(preview.interiorDeg[hit]).c_str());
+            }
+        } else {
+            ImVec2 mid{(sa.x + sb.x) * 0.5f, (sa.y + sb.y) * 0.5f - 10.0f};
+            text(mid, formatMillimetres(preview.edgeLength[i]).c_str());
+        }
     }
 }
 

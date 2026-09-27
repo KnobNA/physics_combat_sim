@@ -34,11 +34,18 @@ struct PlatePatch {
     int divV = 4;
 };
 
+/// A planar authored polygon. Triangle fans in `triangles` are derived from
+/// these; the editor picks and splices faces, not tet faces.
+struct AuthoredFace {
+    std::vector<int> loop;
+};
+
 /// A triangulated surface. Non-empty means this part is a triangle shell
 /// (ChElementShellBST) rather than a rectangular Reissner patch.
 struct SurfaceMesh {
     std::vector<chrono::ChVector3d> vertices;
     std::vector<std::array<int, 3>> triangles;
+    std::vector<AuthoredFace> faces;
     /// Per-triangle thickness, metres. Empty means the part thickness.
     std::vector<double> thickness;
 
@@ -96,6 +103,11 @@ struct PartDefinition {
     /// Another part that owns this one. -1 means it is not parented to a part.
     /// A folder and a part parent are not used together; the folder wins.
     int parentPart = -1;
+    /// Sibling rank inside the same parent or folder. Lower draws first.
+    int order = 0;
+    /// Intrinsic XYZ Euler, radians. Solids keep this as their editor frame;
+    /// plates also store orientation in `patch.uAxis` / `patch.vAxis`.
+    chrono::ChVector3d euler{0.0, 0.0, 0.0};
 };
 
 /// Runtime representation: a shell FEA mesh plus the bookkeeping the solver
@@ -130,6 +142,12 @@ public:
     void evaluatePlasticStrain(std::vector<float>& out) const;
     /// Highest outer-fiber tensile principal stress, Pa. Brittle fracture uses this.
     double peakTension() const;
+    /// Throw away tet state from a rejected Newton step.
+    void discardTrial();
+    /// Copy free-node positions and velocities so a rejected HHT step can
+    /// be rolled back if Chrono left a non-finite iterate.
+    void captureKinematics();
+    void restoreKinematics();
 
     /// Detach elements that have stretched, yielded, or cracked past the
     /// material limit. Returns true when the mesh gained nodes.
@@ -137,9 +155,6 @@ public:
     /// On the heat clock: split tetrahedra that are heating, yielding, or
     /// loaded, then let molten ones leave as closed chips.
     bool maintainVolume(bool refine);
-    /// If a floor-closing wave this step would exceed the material strength,
-    /// detach those tetrahedra as chips before the implicit solve sees GPa.
-    bool prepareBrittleImpact(double floorHeight, double dt);
 
     /// Mean node temperature, kelvin. A new part is uniform at its initial
     /// temperature, which is the stress-free temperature of the authored mesh.
@@ -160,6 +175,9 @@ public:
     /// Write thermal strain, and stiffness or yield only when the knockdown
     /// has moved. Also grows rigid chips with alpha * deltaT.
     void syncThermalMechanics();
+    /// Through-thickness thermal curvature for a Reissner midsurface, 1/m.
+    /// Used when the mesh has no nodes through the thickness to fit dT/dn.
+    void setThermalCurvature(double kappa);
     void evaluateTemperature(std::vector<float>& out) const;
 
     std::size_t nodeCount() const;
@@ -194,6 +212,9 @@ public:
     const std::vector<std::array<int, 3>>& triangles() const { return _triangles; }
     const std::vector<std::array<int, 4>>& tets() const { return _tets; }
     bool hasVolume() const { return !_tetElements.empty(); }
+    /// False when every incident tet has left the solve, so floor contact
+    /// must not keep pushing an under-massed orphan.
+    bool nodeOnLiveTet(std::size_t index) const;
     int skinTriangleCount() const { return _skinTriangles; }
     int tetCount() const { return static_cast<int>(_tets.size()); }
     int liveTetCount() const;
@@ -320,6 +341,7 @@ private:
     std::vector<double> _nodeTemperature;
     std::vector<double> _strainTemperature;
     std::vector<char> _heatActive;
+    double _prescribedThermalKur = 0.0;
 
     std::shared_ptr<chrono::fea::ChMesh> _mesh;
     std::vector<std::shared_ptr<chrono::fea::ChNodeFEAxyzrot>> _nodes;
@@ -330,10 +352,10 @@ private:
     std::vector<std::shared_ptr<ThermalTet4>> _tetElements;
     std::vector<std::array<int, 4>> _tets;
     std::vector<char> _tetLive;
-    std::vector<char> _tetImpactFail;
     int _skinTriangles = 0;
     std::vector<TearTwin> _tearTwins;
     bool _torn = false;
+    double _peakFractureTension = 0.0;
     std::vector<double> _nodeMass;
     std::vector<std::array<int, 4>> _quads;
     std::vector<std::array<int, 3>> _triangles;
@@ -343,6 +365,10 @@ private:
     std::vector<char> _rigidQuad;
     std::vector<char> _linked;
     std::vector<RigidShard> _shards;
+    std::vector<chrono::ChVector3d> _savedPos;
+    std::vector<chrono::ChVector3d> _savedVel;
+    std::vector<chrono::ChQuaterniond> _savedRot;
+    std::vector<chrono::ChQuaterniond> _savedRotDt;
 };
 
 }  // namespace rcs

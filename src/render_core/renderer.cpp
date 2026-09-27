@@ -4,6 +4,7 @@
 #include <Magnum/GL/Renderer.h>
 #include <Magnum/Math/Color.h>
 #include <Magnum/Math/Functions.h>
+#include <Magnum/Math/Vector2.h>
 #include <Magnum/MeshTools/Compile.h>
 #include <Magnum/Primitives/Cube.h>
 #include <Magnum/Primitives/UVSphere.h>
@@ -205,12 +206,50 @@ void SceneRenderer::update(const RecordingLayout& layout,
                            ShadeMode mode,
                            float stressScale,
                            const std::vector<std::size_t>& highlighted,
+                           const std::vector<FaceHighlight>& faces,
                            bool showAir)
 {
     if (_parts.size() != layout.parts.size())
         setLayout(layout);
 
     const float scale = stressScale > 1.0f ? stressScale : 1.0f;
+
+    auto pointInLoop = [](const Vector3& p, const std::vector<Vector3>& loop) {
+        if (loop.size() < 3)
+            return false;
+        Vector3 n{0.0f};
+        for (std::size_t i = 1; i + 1 < loop.size(); ++i)
+            n += Math::cross(loop[i] - loop[0], loop[i + 1] - loop[0]);
+        if (n.length() < 1.0e-12f)
+            return false;
+        n = n.normalized();
+        if (std::abs(Math::dot(p - loop[0], n)) > 0.02f)
+            return false;
+        Vector3 e1 = loop[1] - loop[0];
+        e1 -= n * Math::dot(e1, n);
+        if (e1.length() < 1.0e-12f)
+            e1 = Math::cross(n, Vector3{0.0f, 1.0f, 0.0f});
+        if (e1.length() < 1.0e-12f)
+            e1 = Vector3{1.0f, 0.0f, 0.0f};
+        e1 = e1.normalized();
+        const Vector3 e2 = Math::cross(n, e1);
+        auto proj = [&](const Vector3& q) {
+            const Vector3 d = q - loop[0];
+            return Vector2{Math::dot(d, e1), Math::dot(d, e2)};
+        };
+        const Vector2 q = proj(p);
+        int cuts = 0;
+        for (std::size_t i = 0; i < loop.size(); ++i) {
+            const Vector2 a = proj(loop[i]);
+            const Vector2 b = proj(loop[(i + 1) % loop.size()]);
+            if ((a.y() > q.y()) == (b.y() > q.y()))
+                continue;
+            const float t = (q.y() - a.y()) / (b.y() - a.y());
+            if (a.x() + t * (b.x() - a.x()) > q.x())
+                ++cuts;
+        }
+        return (cuts % 2) == 1;
+    };
 
     for (std::size_t i = 0; i < layout.parts.size() && i < frame.parts.size(); ++i) {
         const PartLayout& partLayout = layout.parts[i];
@@ -227,6 +266,17 @@ void SceneRenderer::update(const RecordingLayout& layout,
         const auto& triangles = partFrame.triangles.empty() ? partLayout.triangles : partFrame.triangles;
         const std::size_t nodes = partFrame.nodeCount();
 
+        auto faceSelected = [&](const Vector3& a, const Vector3& b, const Vector3& c) {
+            const Vector3 mid = (a + b + c) / 3.0f;
+            for (const auto& face : faces) {
+                if (face.part != i)
+                    continue;
+                if (pointInLoop(mid, face.loop))
+                    return true;
+            }
+            return false;
+        };
+
         auto drawQuad = [&](int i0, int i1, int i2, int i3, std::size_t colorIndex) {
             if (i0 < 0 || i1 < 0 || i2 < 0 || i3 < 0)
                 return;
@@ -237,15 +287,18 @@ void SceneRenderer::update(const RecordingLayout& layout,
             const Vector3 b = toMagnum(partFrame.position(static_cast<std::size_t>(i1)));
             const Vector3 c = toMagnum(partFrame.position(static_cast<std::size_t>(i2)));
             const Vector3 d = toMagnum(partFrame.position(static_cast<std::size_t>(i3)));
+            const bool faceHit = faceSelected(a, b, c) || (i2 != i3 && faceSelected(a, c, d));
 
             Color3 color = selected ? 0xd4af37_rgbf : 0xb0b7be_rgbf;
+            if (faceHit)
+                color = 0xffe08a_rgbf;
             if (mode == ShadeMode::Temperature && colorIndex < partFrame.temperature.size()) {
                 color = temperatureColor(partFrame.temperature[colorIndex]);
-                if (selected)
+                if (selected || faceHit)
                     color = Math::lerp(color, 0xffffff_rgbf, 0.25f);
             } else if (mode == ShadeMode::Stress && colorIndex < partFrame.stress.size()) {
                 color = stressColor(partFrame.stress[colorIndex] / scale);
-                if (selected)
+                if (selected || faceHit)
                     color = Math::lerp(color, 0xffffff_rgbf, 0.25f);
             } else if (mode == ShadeMode::Stress && colorIndex < partFrame.plasticStrain.size() &&
                        partFrame.plasticStrain[colorIndex] > 0.0f) {

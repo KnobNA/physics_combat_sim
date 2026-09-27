@@ -15,6 +15,10 @@ namespace rcs {
 /// Shared state a running simulation exposes to the UI thread.
 struct RunControl {
     std::atomic<float> progress{0.0f};
+    std::atomic<double> simulatedTime{0.0};
+    std::atomic<double> duration{0.0};
+    std::atomic<long long> step{0};
+    std::atomic<long long> stepCount{0};
     std::atomic<bool> cancel{false};
 };
 
@@ -25,8 +29,10 @@ public:
     Simulator();
 
     /// Tear down and rebuild the system from scratch at the scenario's
-    /// initial state.
-    void reset(const AssemblyDefinition& definition, const Scenario& scenario);
+    /// initial state. `mesh` runs tetgen when a part still needs a volume;
+    /// the editor preview passes false so opening a file does not stall.
+    void reset(const AssemblyDefinition& definition, const Scenario& scenario,
+               bool mesh = true);
 
     /// One integrator step at simulated time `time`. False if the state blew up.
     bool step(double dt, double time, const Environment& environment,
@@ -51,6 +57,7 @@ private:
 
     chrono::ChSystemSMC _system;
     Assembly _assembly;
+    bool _contactStepFailed = false;
 };
 
 /// Runs a scenario on a worker thread so a multi-second batch never stalls
@@ -66,6 +73,10 @@ public:
 
     bool running() const { return _running; }
     float progress() const { return _control.progress.load(); }
+    double simulatedTime() const { return _control.simulatedTime.load(); }
+    double runDuration() const { return _control.duration.load(); }
+    long long stepIndex() const { return _control.step.load(); }
+    long long stepCount() const { return _control.stepCount.load(); }
 
 private:
     void join();

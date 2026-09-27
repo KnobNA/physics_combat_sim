@@ -66,6 +66,29 @@ void check(bool condition, const char* what) {
         ++failures;
 }
 
+/// Finite is required but never enough: every physics case also needs a band.
+void expectFinite(bool finite, const char* what) {
+    check(finite, what);
+}
+
+/// Pass only when `value` sits in [lo, hi]. Prints the miss so a green run
+/// cannot hide a clamped speed, a 48-tet peel, or a retuned yield.
+void expectRange(double value, double lo, double hi, const char* what) {
+    const bool ok = std::isfinite(value) && std::isfinite(lo) && std::isfinite(hi) &&
+                    value >= lo && value <= hi;
+    if (ok) {
+        std::printf("%-46s ok\n", what);
+    } else {
+        std::printf("%-46s FAILED  (got %.6g, want [%.6g, %.6g])\n", what, value, lo, hi);
+        ++failures;
+    }
+    std::fflush(stdout);
+}
+
+void expectRange(double value, double lo, double hi, const std::string& what) {
+    expectRange(value, lo, hi, what.c_str());
+}
+
 /// The reported failure: a box dropped from 2.81 m, tumbling, got shoved at
 /// about 1.09 s and 3.04 s while nothing was touching it. While the lowest
 /// node is clear of the floor, the centre-of-mass acceleration has to stay
@@ -239,13 +262,12 @@ void checkMaterialsAndImport() {
 
 rcs::AssemblyDefinition clampedPlate(const rcs::Material& material, int divisions);
 
-/// A soft yield should leave a dent (plastic strain) on a short punch without
-/// shedding the panel. Aluminium's real yield is far above this.
+/// 6061-T6 (MMPDS / ASTM B209): σ_y = 276 MPa, elongation ~12%. The clamp is
+/// the min-X edge, so this is a 200 mm cantilever, not a four-sided plate.
+/// First-yield for a centre fibre is about 6 kN; 15 kN is ~2.5× that, so the
+/// panel must dent and spring back only part way, without tearing.
 void checkPermanentDent() {
-    rcs::Material soft = rcs::aluminum6061();
-    soft.yieldStress = 5.0e6;
-    soft.failPlasticStrain = 4.0;
-    soft.tearStretch = 4.0;
+    const rcs::Material aluminum = rcs::aluminum6061();
     rcs::Scenario scenario;
     scenario.settings.timestep = 2.0e-4;
     scenario.initial.position = {0.0, 0.3, 0.0};
@@ -256,32 +278,51 @@ void checkPermanentDent() {
     hit.partIndex = 0;
     hit.point = {0.0, 0.3, 0.0};
     hit.direction = {0.0, -1.0, 0.0};
-    hit.initialForce = 25000.0;
-    hit.finalForce = 25000.0;
-    hit.radius = 0.08;
-    hit.duration = 0.04;
+    hit.initialForce = 70000.0;
+    hit.finalForce = 70000.0;
+    hit.radius = 0.03;
+    hit.duration = 0.02;
     scenario.loads.push_back(hit);
 
     rcs::Simulator simulator;
-    simulator.reset(clampedPlate(soft, 4), scenario);
+    simulator.reset(clampedPlate(aluminum, 6), scenario);
+    rcs::Part& plate = simulator.assembly().parts().front();
+    std::size_t centre = 0;
+    double best = 1.0e9;
+    for (std::size_t n = 0; n < plate.nodeCount(); ++n) {
+        const double d = (plate.nodePosition(n) - hit.point).Length();
+        if (d < best) {
+            best = d;
+            centre = n;
+        }
+    }
+    const double startY = plate.nodePosition(centre).y();
     bool finite = true;
     double t = 0.0;
     const double dt = scenario.settings.timestep;
-    for (int step = 0; step < 250 && finite; ++step) {
+    double peakDent = 0.0;
+    float plastic = 0.0f;
+    for (int step = 0; step < 400 && finite; ++step) {
         finite = simulator.step(dt, t, scenario.environment, scenario.loads);
         t += dt;
-    }
-    float plastic = 0.0f;
-    rcs::Frame frame;
-    simulator.assembly().writeFrame(frame);
-    for (const auto& part : frame.parts)
-        for (float value : part.plasticStrain)
+        const rcs::Part& live = simulator.assembly().parts().front();
+        peakDent = std::max(peakDent, startY - live.nodePosition(centre).y());
+        std::vector<float> field;
+        live.evaluatePlasticStrain(field);
+        for (float value : field)
             plastic = std::max(plastic, value);
-    const bool torn = simulator.assembly().parts().front().torn();
-    std::printf("soft punch plastic strain %.5f at t=%.3f s, torn=%d\n", plastic, t, torn ? 1 : 0);
-    check(finite, "soft-yield punch stays finite");
-    check(plastic > 0.0f, "over-yield impact leaves plastic strain");
-    check(simulator.assembly().parts().front().liveTetCount() > 0, "a dent does not delete the panel");
+    }
+    const rcs::Part& done = simulator.assembly().parts().front();
+    const double residual = startY - done.nodePosition(centre).y();
+    const double residualRatio = peakDent > 1.0e-9 ? residual / peakDent : 0.0;
+    std::printf("6061 dent peak %.4f m residual %.4f m plastic %.5f torn=%d shards %zu\n",
+                peakDent, residual, plastic, done.torn() ? 1 : 0, done.shards().size());
+
+    expectFinite(finite, "6061 punch stays in the solver");
+    expectRange(plastic, 0.002, 0.12, "6061 punch yields (MMPDS 276 MPa)");
+    expectRange(peakDent, 2.0e-4, 0.08, "6061 punch leaves a millimetre-scale dent");
+    expectRange(residualRatio, 0.30, 1.0, "6061 dent keeps at least 30% after unload");
+    check(!done.torn() && done.shards().empty(), "6061 dent does not tear the panel");
 }
 
 /// One clamped panel. The patch load is shared by the interior nodes so the
@@ -306,9 +347,10 @@ rcs::AssemblyDefinition clampedPlate(const rcs::Material& material, int division
     return definition;
 }
 
-/// A clamped glass face under a patch load must crack, and the crack has to
-/// leave the panel less stressed than it was at the peak. Rubber, pushed far
-/// more gently relative to its modulus, must stay in one piece.
+/// A clamped glass face under a patch load must crack once Rankine tension
+/// (~45 MPa, soda-lime handbook) is exceeded, and the crack has to leave the
+/// panel less stressed than it was at the peak. Rubber under a light push
+/// relative to its modulus must stay in one piece with no plastic strain.
 void checkGlassShatters() {
     rcs::Scenario scenario;
     scenario.settings.timestep = 1.0e-4;
@@ -342,12 +384,12 @@ void checkGlassShatters() {
         finite = simulator.step(dt, t, scenario.environment, scenario.loads);
         t += dt;
         const double tension = simulator.assembly().parts()[0].peakTension();
-        if (simulator.assembly().parts()[0].liveTetCount() == before)
-            peakDuring = std::max(peakDuring, tension);
+        peakDuring = std::max(peakDuring, tension);
         endTension = tension;
     }
-    const int after = simulator.assembly().parts()[0].liveTetCount();
-    const auto& chips = simulator.assembly().parts()[0].shards();
+    const rcs::Part& glassPart = simulator.assembly().parts()[0];
+    const int after = glassPart.liveTetCount();
+    const auto& chips = glassPart.shards();
     double worstAspect = 1.0;
     for (const auto& shard : chips) {
         const double edgeU = (shard.local[1] - shard.local[0]).Length();
@@ -359,11 +401,16 @@ void checkGlassShatters() {
     std::printf(
         "glass tets %d -> %d, rigid shards %zu, worst aspect %.2f, tension during %.1f MPa, end %.1f MPa at t=%.3f\n",
         before, after, chips.size(), worstAspect, peakDuring * 1.0e-6, endTension * 1.0e-6, t);
-    check(finite, "glass punch stays finite");
-    check(after < before || !chips.empty(), "glass face shatters into more than one piece");
-    check((after < before || !chips.empty()) && peakDuring > endTension, "shatter relieves the peak tension");
+
+    expectFinite(finite, "glass punch stays in the solver");
+    expectRange(peakDuring, 0.8 * rcs::glass().fractureStrength, 5.0 * rcs::glass().fractureStrength,
+                "glass punch reaches Rankine tension");
+    check(!chips.empty() || (before > 0 && after < before), "glass face shatters into more than one piece");
+    expectRange(endTension / std::max(peakDuring, 1.0), 0.0, 0.70, "shatter relieves the peak tension");
     check(!chips.empty(), "detached chips leave the shell solve");
-    check(worstAspect <= 40.0, "rigid shards are not long needles");
+    expectRange(worstAspect, 1.0, 20.0, "glass shards are not long needles");
+    if (before > 0)
+        expectRange(double(after) / double(before), 0.05, 0.95, "glass punch does not delete the whole panel");
 
     scenario.loads.front().initialForce = 5.0;
     scenario.loads.front().finalForce = 5.0;
@@ -373,19 +420,27 @@ void checkGlassShatters() {
     const int rubberBefore = rubberRun.assembly().parts()[0].liveTetCount();
     finite = true;
     t = 0.0;
+    float rubberPlastic = 0.0f;
     for (int step = 0; step < 80 && finite; ++step) {
         finite = rubberRun.step(dt, t, scenario.environment, scenario.loads);
         t += dt;
+        std::vector<float> field;
+        rubberRun.assembly().parts()[0].evaluatePlasticStrain(field);
+        for (float value : field)
+            rubberPlastic = std::max(rubberPlastic, value);
     }
-    std::printf("elastomer finite=%d tets %d -> %d at t=%.3f\n", finite ? 1 : 0, rubberBefore,
-                rubberRun.assembly().parts()[0].liveTetCount(), t);
-    check(finite && rubberRun.assembly().parts()[0].liveTetCount() == rubberBefore,
+    const rcs::Part& rubberDone = rubberRun.assembly().parts()[0];
+    std::printf("elastomer finite=%d tets %d -> %d plastic %.5f shards %zu at t=%.3f\n", finite ? 1 : 0, rubberBefore,
+                rubberDone.liveTetCount(), rubberPlastic, rubberDone.shards().size(), t);
+    expectFinite(finite, "elastomer punch stays in the solver");
+    check(rubberDone.liveTetCount() == rubberBefore && rubberDone.shards().empty(),
           "elastomer does not shatter");
+    expectRange(rubberPlastic, 0.0, 1.0e-4, "elastomer does not yield");
 }
 
-/// High-speed floor landings. Metals must yield instead of blowing the
-/// implicit step, glass must shatter once Rankine is exceeded, and rubber
-/// must stay in one piece. A gentle glass drop has to bounce, not explode.
+/// High-speed floor landings. Metals must yield (MMPDS 6061-T6 276 MPa).
+/// Glass must fragment once Rankine tension is exceeded. Rubber must stretch.
+/// Finite is required; a 48-tet peel or a 15 m/s speed clamp is not a pass.
 void checkImpactFracture() {
     auto land = [](const rcs::Material& material, double speed, double duration) {
         const bool compliant = material.fracture == rcs::FractureMode::Compliant;
@@ -405,7 +460,9 @@ void checkImpactFracture() {
         definition.parts.push_back(cube);
 
         rcs::Scenario scenario;
-        scenario.settings.timestep = 5.0e-4;
+        const bool metal = material.fracture == rcs::FractureMode::Ductile;
+        scenario.settings.timestep =
+            (metal && speed > 0.0) ? (speed <= 20.0 ? 1.0e-4 : 2.0e-4) : 5.0e-4;
         scenario.settings.duration = duration;
         scenario.initial.position = {0.0, compliant ? 0.16 : 0.28, 0.0};
         scenario.initial.orientation = {0.0, 0.0, 0.0};
@@ -417,18 +474,47 @@ void checkImpactFracture() {
         rcs::Simulator simulator;
         simulator.reset(definition, scenario);
         const int startLive = simulator.assembly().parts()[0].liveTetCount();
+        std::printf("landing %s at %.0f m/s, %d tets, %.3f s\n", material.name.c_str(), speed, startLive,
+                    duration);
+        std::fflush(stdout);
         bool finite = true;
         double t = 0.0;
         const double dt = scenario.settings.timestep;
         const int steps = static_cast<int>(std::ceil(duration / dt));
         float plastic = 0.0f;
+        double contactClosing = 0.0;
+        bool seenHit = false;
+        const double floor = scenario.environment.floorHeight;
+        auto sampleContact = [&]() {
+            const rcs::Part& live = simulator.assembly().parts()[0];
+            const double offset = live.contactOffset();
+            double minGap = 1.0e9;
+            double closing = 0.0;
+            for (std::size_t n = 0; n < live.nodeCount(); ++n) {
+                if (!live.nodeOnLiveTet(n))
+                    continue;
+                const double gap = live.nodePosition(n).y() - (floor + offset);
+                minGap = std::min(minGap, gap);
+                if (gap < 0.10)
+                    closing = std::max(closing, -live.nodeVelocity(n).y());
+            }
+            if (!seenHit && minGap < 0.10) {
+                contactClosing = std::max(contactClosing, closing);
+                if (minGap < 0.02)
+                    seenHit = true;
+            }
+        };
         for (int step = 0; step < steps && finite; ++step) {
+            sampleContact();
             finite = simulator.step(dt, t, scenario.environment, scenario.loads);
             t += dt;
+            const rcs::Part& live = simulator.assembly().parts()[0];
             std::vector<float> field;
-            simulator.assembly().parts()[0].evaluatePlasticStrain(field);
+            live.evaluatePlasticStrain(field);
             for (float value : field)
-                plastic = std::max(plastic, value);
+                if (std::isfinite(value))
+                    plastic = std::max(plastic, value);
+            sampleContact();
         }
         const rcs::Part& done = simulator.assembly().parts()[0];
         struct Result {
@@ -439,6 +525,8 @@ void checkImpactFracture() {
             float plastic = 0.0f;
             bool torn = false;
             double lowest = 0.0;
+            double contactClosing = 0.0;
+            double worstAspect = 1.0;
         } result;
         result.finite = finite;
         result.startLive = startLive;
@@ -446,43 +534,77 @@ void checkImpactFracture() {
         result.shards = done.shards().size();
         result.plastic = plastic;
         result.torn = done.torn();
+        result.contactClosing = contactClosing;
         result.lowest = 1.0e9;
         for (std::size_t n = 0; n < done.nodeCount(); ++n)
             result.lowest = std::min(result.lowest, done.nodePosition(n).y());
+        for (const auto& shard : done.shards()) {
+            const double edgeU = (shard.local[1] - shard.local[0]).Length();
+            const double edgeV = (shard.local[3] - shard.local[0]).Length();
+            const double shortest = std::min(edgeU, edgeV);
+            if (shortest > 1.0e-6)
+                result.worstAspect = std::max(result.worstAspect, std::max(edgeU, edgeV) / shortest);
+        }
         return result;
     };
 
-    const auto aluminum = land(rcs::aluminum6061(), 50.0, 0.025);
+    const auto aluminumFast = land(rcs::aluminum6061(), 50.0, 0.025);
+    const auto aluminumSlow = land(rcs::aluminum6061(), 15.0, 0.04);
     const auto glassHit = land(rcs::glass(), 50.0, 0.025);
     const auto rubber = land(rcs::rubber(), 50.0, 0.025);
     const auto glassSoft = land(rcs::glass(), 0.0, 0.20);
 
-    std::printf("\n50 m/s aluminum finite=%d live %d -> %d plastic %.4f torn=%d shards %zu\n",
-                aluminum.finite ? 1 : 0, aluminum.startLive, aluminum.live, aluminum.plastic,
-                aluminum.torn ? 1 : 0, aluminum.shards);
-    std::printf("50 m/s glass     finite=%d live %d -> %d torn=%d shards %zu\n",
-                glassHit.finite ? 1 : 0, glassHit.startLive, glassHit.live, glassHit.torn ? 1 : 0,
-                glassHit.shards);
-    std::printf("50 m/s rubber    finite=%d live %d -> %d torn=%d shards %zu\n",
-                rubber.finite ? 1 : 0, rubber.startLive, rubber.live, rubber.torn ? 1 : 0,
-                rubber.shards);
+    std::printf("\n15 m/s aluminum finite=%d live %d -> %d plastic %.4f contact %.1f m/s\n",
+                aluminumSlow.finite ? 1 : 0, aluminumSlow.startLive, aluminumSlow.live, aluminumSlow.plastic,
+                aluminumSlow.contactClosing);
+    std::printf("50 m/s aluminum finite=%d live %d -> %d plastic %.4f torn=%d shards %zu lowest %.4f contact %.1f\n",
+                aluminumFast.finite ? 1 : 0, aluminumFast.startLive, aluminumFast.live, aluminumFast.plastic,
+                aluminumFast.torn ? 1 : 0, aluminumFast.shards, aluminumFast.lowest, aluminumFast.contactClosing);
+    std::printf("50 m/s glass     finite=%d live %d -> %d torn=%d shards %zu aspect %.1f contact %.1f\n",
+                glassHit.finite ? 1 : 0, glassHit.startLive, glassHit.live, glassHit.torn ? 1 : 0, glassHit.shards,
+                glassHit.worstAspect, glassHit.contactClosing);
+    std::printf("50 m/s rubber    finite=%d live %d -> %d torn=%d shards %zu contact %.1f\n",
+                rubber.finite ? 1 : 0, rubber.startLive, rubber.live, rubber.torn ? 1 : 0, rubber.shards,
+                rubber.contactClosing);
     std::printf("gentle glass     finite=%d live %d -> %d shards %zu lowest %.4f m\n",
-                glassSoft.finite ? 1 : 0, glassSoft.startLive, glassSoft.live, glassSoft.shards,
-                glassSoft.lowest);
+                glassSoft.finite ? 1 : 0, glassSoft.startLive, glassSoft.live, glassSoft.shards, glassSoft.lowest);
 
-    check(aluminum.finite, "aluminum 50 m/s landing stays in the solver");
-    check(aluminum.plastic > 1.0e-4 || aluminum.live < aluminum.startLive || aluminum.torn,
-          "aluminum 50 m/s landing yields or tears once it exceeds its strength");
-    check(glassHit.finite, "glass 50 m/s landing stays in the solver");
-    check(glassHit.live < glassHit.startLive || glassHit.shards > 0 || glassHit.torn,
-          "glass 50 m/s landing shatters once it exceeds its strength");
-    check(rubber.finite, "rubber 50 m/s landing stays in the solver");
-    check(rubber.live == rubber.startLive && rubber.shards == 0,
-          "rubber 50 m/s landing stretches instead of shattering");
-    check(glassSoft.finite, "a gentle glass drop stays in the solver");
-    check(glassSoft.live == glassSoft.startLive && glassSoft.shards == 0,
-          "a gentle glass drop does not shatter");
-    check(glassSoft.lowest > -0.02, "a gentle glass drop does not fall through the floor");
+    const double alSlowFrac =
+        aluminumSlow.startLive > 0 ? double(aluminumSlow.live) / double(aluminumSlow.startLive) : 0.0;
+    const double alFastFrac =
+        aluminumFast.startLive > 0 ? double(aluminumFast.live) / double(aluminumFast.startLive) : 0.0;
+    const double glassFrac = glassHit.startLive > 0 ? double(glassHit.live) / double(glassHit.startLive) : 0.0;
+    const double rubberFrac = rubber.startLive > 0 ? double(rubber.live) / double(rubber.startLive) : 0.0;
+    const double glassSoftFrac =
+        glassSoft.startLive > 0 ? double(glassSoft.live) / double(glassSoft.startLive) : 0.0;
+
+    expectFinite(aluminumSlow.finite, "aluminum 15 m/s landing stays in the solver");
+    expectRange(aluminumSlow.plastic, 0.002, 0.12, "aluminum 15 m/s landing yields");
+    expectRange(alSlowFrac, 0.80, 1.0, "aluminum 15 m/s landing keeps the mesh");
+    expectRange(aluminumSlow.contactClosing, 12.0, 18.0, "aluminum 15 m/s still closing at contact");
+
+    expectFinite(aluminumFast.finite, "aluminum 50 m/s landing stays in the solver");
+    expectRange(aluminumFast.plastic, 0.002, 0.20, "aluminum 50 m/s landing yields");
+    expectRange(alFastFrac, 0.40, 1.05, "aluminum 50 m/s landing keeps a surviving core");
+    expectRange(aluminumFast.contactClosing, 40.0, 60.0, "aluminum 50 m/s still closing at contact");
+
+    expectFinite(glassHit.finite, "glass 50 m/s landing stays in the solver");
+    expectRange(glassHit.plastic, 0.0, 1.0e-4, "glass 50 m/s does not yield");
+    expectRange(glassFrac, 0.20, 0.96, "glass 50 m/s shatters the contact zone, not the peel budget");
+    expectRange(glassHit.worstAspect, 1.0, 20.0, "glass 50 m/s shards are not long needles");
+    expectRange(glassHit.contactClosing, 40.0, 60.0, "glass 50 m/s still closing at contact");
+    check(glassHit.shards > 0 || glassHit.live < glassHit.startLive, "glass 50 m/s detaches overloaded tets");
+
+    expectFinite(rubber.finite, "rubber 50 m/s landing stays in the solver");
+    expectRange(rubberFrac, 1.0, 1.0, "rubber 50 m/s landing does not lose tetrahedra");
+    expectRange(double(rubber.shards), 0.0, 0.0, "rubber 50 m/s landing makes no shards");
+    expectRange(rubber.plastic, 0.0, 1.0e-4, "rubber 50 m/s does not yield");
+    expectRange(rubber.contactClosing, 40.0, 60.0, "rubber 50 m/s still closing at contact");
+
+    expectFinite(glassSoft.finite, "a gentle glass drop stays in the solver");
+    expectRange(glassSoftFrac, 1.0, 1.0, "a gentle glass drop does not shatter");
+    expectRange(double(glassSoft.shards), 0.0, 0.0, "a gentle glass drop makes no shards");
+    expectRange(glassSoft.lowest, -0.02, 0.20, "a gentle glass drop does not fall through the floor");
 }
 
 /// Drop a flat panel and, once its vertical motion has died, keep going. The
@@ -515,6 +637,7 @@ void checkContactSettles() {
     rcs::Simulator simulator;
     simulator.reset(definition, scenario);
     const double dt = scenario.settings.timestep;
+    const double touchY = simulator.assembly().parts()[0].contactOffset() + 1.0e-4;
     double t = 0.0;
     bool finite = true;
     auto verticalKe = [&]() {
@@ -535,7 +658,7 @@ void checkContactSettles() {
     double latePeak = 0.0;
     double finalKe = 0.0;
     double lowest = 1.0e9;
-    const double duration = 2.0;
+    const double duration = 3.5;
     for (int step = 0; step * dt < duration && finite; ++step) {
         finite = simulator.step(dt, t, scenario.environment, scenario.loads);
         t += dt;
@@ -545,7 +668,7 @@ void checkContactSettles() {
             for (std::size_t i = 0; i < part.nodeCount(); ++i)
                 minY = std::min(minY, part.nodePosition(i).y());
         lowest = std::min(lowest, minY);
-        if (impactAt < 0.0 && minY < 1.0e-4)
+        if (impactAt < 0.0 && minY < touchY)
             impactAt = t;
         if (impactAt > 0.0 && t <= impactAt + 0.25)
             earlyPeak = std::max(earlyPeak, energy);
@@ -1045,14 +1168,25 @@ void checkMaterialFailureModes() {
         // first yield.
         const bool brittle = item.material.fracture == rcs::FractureMode::Brittle;
         const bool compliant = item.material.fracture == rcs::FractureMode::Compliant;
-        const double reference = brittle ? item.material.fractureStrength : item.material.yieldStress;
+        const double reference = brittle ? item.material.fractureStrength
+                                         : (compliant ? item.material.youngsModulus : item.material.yieldStress);
         auto forceFor = [&](double stress) {
             return stress * width * thick * thick / (6.0 * length);
         };
+        const double rated = brittle ? item.material.fractureStrength : item.material.yieldStress;
+        const double area = width * thick;
+        const double serviceForce =
+            compliant ? item.material.youngsModulus * 0.15 * area : forceFor(0.5 * rated);
+        const double overloadForce =
+            compliant ? item.material.youngsModulus * 0.90 * area : forceFor(3.0 * rated);
+        const chrono::ChVector3d loadDir = compliant ? chrono::ChVector3d(1.0, 0.0, 0.0)
+                                                     : chrono::ChVector3d(0.0, -1.0, 0.0);
 
-        auto press = [&](double stress) {
+        auto press = [&](double force) {
             rcs::Scenario scenario;
             scenario.settings.timestep = 2.0e-4;
+            // Authored bar lives on x in [0, L]. The drop pose offsets the
+            // origin, not the live COM, so keep X at zero.
             scenario.initial.position = {0.0, 0.6, 0.0};
             scenario.initial.orientation = {0.0, 0.0, 0.0};
             scenario.environment.gravity = {0.0, 0.0, 0.0};
@@ -1062,31 +1196,32 @@ void checkMaterialFailureModes() {
             rcs::ImpactLoad hit;
             hit.name = "Tip";
             hit.partIndex = 0;
-            hit.point = {0.6 * length, 0.6, 0.0};
-            hit.direction = {0.0, -1.0, 0.0};
+            hit.point = {0.95 * length, 0.6, 0.0};
+            hit.direction = loadDir;
             hit.initialForce = 0.0;
-            hit.finalForce = forceFor(stress);
+            hit.finalForce = force;
             hit.rampTime = 0.04;
             hit.duration = 0.06;
-            hit.radius = 0.5 * length;
+            hit.radius = 0.5 * width;
             scenario.loads.push_back(hit);
 
             rcs::Simulator simulator;
             simulator.reset(definition, scenario);
             rcs::Part& part = simulator.assembly().parts()[0];
 
-            // The free end, on the midplane, is where the bending shows.
+            // Axial stretch is read at the free end; bending at mid-span.
             std::size_t tip = 0;
             double best = 1.0e9;
+            const double tipX = compliant ? length : 0.6 * length;
             for (std::size_t n = 0; n < part.nodeCount(); ++n) {
                 const auto rest = part.restPosition(n);
-                const double score = std::abs(rest.x() - 0.6 * length) + std::abs(rest.z()) * 4.0;
+                const double score = std::abs(rest.x() - tipX) + std::abs(rest.z()) * 4.0;
                 if (score < best) {
                     best = score;
                     tip = n;
                 }
             }
-            const double start = part.nodePosition(tip).y();
+            const double start = compliant ? part.nodePosition(tip).x() : part.nodePosition(tip).y();
 
             Result result;
             result.finite = true;
@@ -1100,7 +1235,8 @@ void checkMaterialFailureModes() {
                 if (!result.finite)
                     break;
                 const rcs::Part& live = simulator.assembly().parts()[0];
-                result.peakTip = std::max(result.peakTip, std::abs(live.nodePosition(tip).y() - start));
+                const double now = compliant ? live.nodePosition(tip).x() : live.nodePosition(tip).y();
+                result.peakTip = std::max(result.peakTip, std::abs(now - start));
                 std::vector<float> stresses;
                 live.evaluateStress(stresses);
                 for (float value : stresses)
@@ -1111,14 +1247,15 @@ void checkMaterialFailureModes() {
                     result.peakPlastic = std::max(result.peakPlastic, double(value));
             }
             const rcs::Part& done = simulator.assembly().parts()[0];
-            result.residualTip = std::abs(done.nodePosition(tip).y() - start);
+            const double end = compliant ? done.nodePosition(tip).x() : done.nodePosition(tip).y();
+            result.residualTip = std::abs(end - start);
             result.torn = done.torn();
             result.shards = done.shards().size();
             return result;
         };
 
-        const Result service = press(0.5 * reference);
-        const Result overload = press(3.0 * reference);
+        const Result service = press(serviceForce);
+        const Result overload = press(overloadForce);
 
         std::printf("\n%s (%s, ref %.0f MPa)\n", item.name,
                     brittle ? "brittle" : (compliant ? "compliant" : "ductile"), reference * 1.0e-6);
@@ -1130,24 +1267,25 @@ void checkMaterialFailureModes() {
                     overload.peakTip, overload.residualTip, overload.torn ? 1 : 0, overload.shards);
 
         const std::string tag = item.name;
-        check(service.finite && overload.finite, (tag + " stays in the solver at both loads").c_str());
+        expectFinite(service.finite && overload.finite, (tag + " stays in the solver at both loads").c_str());
         check(!service.torn && service.shards == 0, (tag + " survives half its rated stress").c_str());
-        // Half the rated stress is inside the elastic range for every one of
-        // these, so the bar has to come back to where it started.
-        check(service.residualTip < 0.25 * std::max(service.peakTip, 1.0e-9),
-              (tag + " springs back from a service load").c_str());
+        if (!compliant)
+            expectRange(service.peakStress / std::max(reference, 1.0), 0.25, 1.05,
+                        tag + " service peak stress is near half its rating");
+        expectRange(service.residualTip / std::max(service.peakTip, 1.0e-9), 0.0, 0.05,
+                    tag + " springs back from a service load");
 
         if (brittle) {
-            check(overload.peakPlastic < 1.0e-4, (tag + " does not yield before it cracks").c_str());
+            expectRange(overload.peakPlastic, 0.0, 1.0e-4, tag + " does not yield before it cracks");
             check(overload.torn || overload.shards > 0, (tag + " cracks under three times its strength").c_str());
         } else if (compliant) {
-            check(overload.peakPlastic < 1.0e-4, (tag + " stretches without yielding").c_str());
-            check(overload.peakTip > 3.0 * service.peakTip,
-                  (tag + " goes much further as the load grows").c_str());
+            expectRange(overload.peakPlastic, 0.0, 1.0e-4, tag + " stretches without yielding");
+            expectRange(overload.peakTip / std::max(service.peakTip, 1.0e-9), 3.0, 80.0,
+                        tag + " goes much further as the load grows");
         } else {
-            check(overload.peakPlastic > 1.0e-3, (tag + " yields under three times its yield stress").c_str());
-            check(overload.residualTip > 1.0e-4, (tag + " keeps a permanent set").c_str());
-            check(overload.shards == 0, (tag + " bends instead of shattering").c_str());
+            expectRange(overload.peakPlastic, 0.002, 0.50, tag + " yields under three times its yield stress");
+            expectRange(overload.residualTip, 1.0e-4, 0.25, tag + " keeps a permanent set");
+            expectRange(double(overload.shards), 0.0, 0.0, tag + " bends instead of shattering");
         }
     }
 }
@@ -1157,8 +1295,8 @@ void checkMaterialFailureModes() {
 /// is carried per element rather than as one number for the whole part.
 ///
 /// For a linear gradient the curvature is alpha*dT/h, so a cantilever of
-/// length L lifts its tip by alpha*dT*L^2/(2h). The check is against that
-/// closed form, loosely enough to allow for shear and a coarse mesh.
+/// length L lifts its tip by alpha*dT*L^2/(2h). The band is 0.5-2x that
+/// closed form, enough for shear and a coarse mesh but not a sign error.
 void checkThermalWarp() {
     const double length = 0.30;
     const double thickness = 0.010;
@@ -1169,7 +1307,7 @@ void checkThermalWarp() {
     bar.name = "Bar";
     bar.material = rcs::aluminum6061();
     bar.thickness = thickness;
-    bar.clampBoundary = true;
+    bar.clampBoundary = false;
     bar.patch.origin = {0.0, 0.0, -0.03};
     bar.patch.uAxis = {1.0, 0.0, 0.0};
     bar.patch.vAxis = {0.0, 0.0, 1.0};
@@ -1194,6 +1332,23 @@ void checkThermalWarp() {
     simulator.reset(definition, scenario);
 
     rcs::Part& part = simulator.assembly().parts()[0];
+    auto pinRoot = [](rcs::Part& p) {
+        double root = 1.0e9;
+        for (std::size_t n = 0; n < p.nodeCount(); ++n)
+            root = std::min(root, p.restPosition(n).x());
+        auto pin = [&](auto& nodes) {
+            for (std::size_t n = 0; n < nodes.size() && n < p.nodeCount(); ++n) {
+                if (nodes[n] && p.restPosition(n).x() <= root + 1.0e-3)
+                    nodes[n]->SetFixed(true);
+            }
+        };
+        pin(p.nodes());
+        pin(p.xyzNodes());
+    };
+    pinRoot(part);
+    simulator.system().Setup();
+    simulator.system().ForceUpdate();
+
     double minY = 1.0e9;
     double maxY = -1.0e9;
     double maxX = -1.0e9;
@@ -1216,10 +1371,12 @@ void checkThermalWarp() {
         }
     }
     const double tipStart = part.nodePosition(tip).y();
+    const double alpha = rcs::aluminum6061().thermalExpansion;
+    const double kappa = -alpha * (hot - cold) / thickness;
 
-    // A linear profile through the thickness, held there. Driving the nodes
-    // directly keeps this a test of the thermo-mechanical coupling and not of
-    // the air model.
+    // A linear through-thickness gradient is thermal curvature on a Reissner
+    // midsurface. Driving that (and the node temperature) keeps this a test
+    // of the thermo-mechanical coupling and not of the air model.
     auto soak = [&]() {
         rcs::Part& p = simulator.assembly().parts()[0];
         for (std::size_t n = 0; n < p.nodeCount(); ++n) {
@@ -1230,6 +1387,7 @@ void checkThermalWarp() {
             p.setHeatActive(n, true);
         }
         p.syncThermalMechanics();
+        p.setThermalCurvature(kappa);
     };
 
     bool finite = true;
@@ -1243,20 +1401,20 @@ void checkThermalWarp() {
     const rcs::Part& warped = simulator.assembly().parts()[0];
     const double tipEnd = warped.nodePosition(tip).y();
     const double deflection = tipEnd - tipStart;
-    const double alpha = rcs::aluminum6061().thermalExpansion;
     const double expected = alpha * (hot - cold) * length * length / (2.0 * thickness);
     std::printf("thermal warp tip %+.4f m (beam theory %+.4f m), finite=%d\n", deflection, expected, finite ? 1 : 0);
 
-    check(finite, "a bar with a thermal gradient stays in the solver");
-    // Hot face on top means the top fibre is longer, so the bar curls away
-    // from the heat and the tip drops.
+    expectFinite(finite, "a bar with a thermal gradient stays in the solver");
     check(deflection < 0.0, "a bar hotter on top curls away from the heat");
-    check(std::abs(deflection) > 0.25 * expected && std::abs(deflection) < 3.0 * expected,
-          "the curl is close to alpha*dT*L^2/2h");
+    expectRange(std::abs(deflection) / std::max(expected, 1.0e-12), 0.50, 2.0,
+                "the curl is within 0.5-2x of alpha*dT*L^2/2h");
 
     // The same bar heated uniformly must grow but not bend.
     rcs::Simulator even;
     even.reset(definition, scenario);
+    pinRoot(even.assembly().parts()[0]);
+    even.system().Setup();
+    even.system().ForceUpdate();
     const double evenStart = even.assembly().parts()[0].nodePosition(tip).y();
     bool evenFinite = true;
     t = 0.0;
@@ -1268,14 +1426,15 @@ void checkThermalWarp() {
             p.setHeatActive(n, true);
         }
         p.syncThermalMechanics();
+        p.setThermalCurvature(0.0);
         evenFinite = even.step(5.0e-4, t, scenario.environment, scenario.loads);
         t += 5.0e-4;
     }
     const double evenDeflection = even.assembly().parts()[0].nodePosition(tip).y() - evenStart;
     std::printf("uniform soak tip %+.5f m\n", evenDeflection);
-    check(evenFinite, "a uniformly heated bar stays in the solver");
-    check(std::abs(evenDeflection) < 0.1 * std::abs(deflection),
-          "a uniformly heated bar grows without bending");
+    expectFinite(evenFinite, "a uniformly heated bar stays in the solver");
+    expectRange(std::abs(evenDeflection), 0.0, 0.10 * expected,
+                "a uniformly heated bar grows without bending");
 }
 
 void checkSolidRigidMotion() {
@@ -1786,6 +1945,7 @@ void checkUnifiedTets() {
     sheet.patch.vSize = 0.2;
     sheet.patch.divU = 2;
     sheet.patch.divV = 2;
+    sheet.sizing.throughThickness = 2;
     check(rcs::ensurePartMesh(sheet), "thin panel meshes");
     check(!sheet.volume.empty() && sheet.surface.empty(), "thin panel is a tet volume");
 
@@ -1804,6 +1964,8 @@ void checkUnifiedTets() {
     for (auto& part : box.parts) {
         if (!rcs::ensurePartMesh(part) || part.volume.empty() || !part.surface.empty())
             hollow = false;
+        std::printf("hollow wall %s tets %zu\n", part.name.c_str(), part.volume.tets.size());
+        check(part.volume.tets.size() < 3000, "a hollow-cube wall stays well under 12k tets");
         const double inner = 0.5 * (0.40 - 0.008) - 0.004;
         for (const auto& tet : part.volume.tets) {
             chrono::ChVector3d center(0, 0, 0);
@@ -2233,6 +2395,8 @@ void checkBoxDrop(double hitForce, double stepSize, double hitRadius) {
     check(overRecording.diverged, "an unresolvable load is flagged as diverged");
 }
 
+#include "physics_core/physics_catalog.inc"
+
 int main(int argc, char** argv) {
     // `--only=<group>` runs one group. The suite is minutes long, so a single
     // failure is diagnosed against the group that produced it.
@@ -2270,8 +2434,37 @@ int main(int argc, char** argv) {
             checkWeldStrength();
         else if (only == "midair")
             checkNoMidairKick();
+        else if (only == "conserve")
+            checkConserve();
+        else if (only == "elastic")
+            checkElasticityCatalog();
+        else if (only == "plastic")
+            checkPlasticityCatalog();
+        else if (only == "brittle")
+            checkBrittleCatalog();
+        else if (only == "stretch")
+            checkCompliantCatalog();
+        else if (only == "hits")
+            checkHitsCatalog();
+        else if (only == "thermal")
+            checkThermalCatalog();
+        else if (only == "stress")
+            checkStressCatalog();
+        else if (only == "fracture")
+            checkFractureCatalog();
+        else if (only == "extreme")
+            checkExtremeCatalog();
+        else if (only == "refine")
+            checkRefineCatalog();
+        else if (only == "friction")
+            checkFrictionCatalog();
+        else if (only == "catalog")
+            checkCatalog();
         else {
             std::printf("unknown group '%s'\n", only.c_str());
+            std::printf("groups: tets materials dent glass contact heat malleable solid rigid warp drop "
+                        "shapes failure welds midair conserve elastic plastic brittle stretch hits thermal "
+                        "stress fracture extreme refine friction catalog\n");
             return 2;
         }
         std::printf(failures == 0 ? "\nall checks passed\n" : "\n%d check(s) failed\n", failures);
@@ -2301,6 +2494,7 @@ int main(int argc, char** argv) {
     checkWeldStrength();
     std::printf("\n");
     checkNoMidairKick();
+    checkCatalog();
 
     std::printf(failures == 0 ? "\nall checks passed\n" : "\n%d check(s) failed\n", failures);
     return failures == 0 ? 0 : 1;

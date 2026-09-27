@@ -1,6 +1,7 @@
 #pragma once
 
 #include "chrono/fea/ChNodeFEAxyz.h"
+#include "chrono/fea/ChNodeFEAxyzrot.h"
 #include "chrono/physics/ChLoad.h"
 
 #include <memory>
@@ -21,6 +22,9 @@ struct ContactWorld {
     double halfX = 5.0;
     double halfZ = 5.0;
     double ceiling = 10.0;
+    /// Integrator substep, seconds. The contact ramp spans at most one of
+    /// these so a 50 m/s hit does not jump through a 200 µm onset.
+    double stepSize = 5.0e-4;
 };
 
 /// One node pressed against the floor, the walls, or the ceiling, written as a
@@ -35,6 +39,8 @@ class NodeContact : public chrono::ChLoadCustom {
 public:
     NodeContact(std::shared_ptr<chrono::fea::ChNodeFEAxyz> node,
                 std::shared_ptr<const ContactWorld> world);
+    NodeContact(std::shared_ptr<chrono::fea::ChNodeFEAxyzrot> node,
+                std::shared_ptr<const ContactWorld> world);
 
     /// Contact geometry and gains for this node. Rewritten whenever the skin
     /// changes, so a refined or detached face contacts with its new area.
@@ -46,6 +52,11 @@ public:
     /// scrap) is driven directly and must not also be pushed by a contact.
     void setActive(bool active) { _active = active; }
     bool active() const { return _active; }
+
+    /// Extra penalty drop above 25 m/s. Rankine glass needs it so HHT can
+    /// take the hit; ductile metal at the same speed has to keep the 0.02
+    /// floor or the cube walks through without yielding.
+    void setSoftenFast(bool soften) { _softenFast = soften; }
 
     /// Normal force carried on the last evaluation. Used for reporting and
     /// for the thermal contact conductance.
@@ -67,6 +78,7 @@ private:
                   chrono::ChVector3d& force);
 
     std::shared_ptr<chrono::fea::ChNodeFEAxyz> _node;
+    std::shared_ptr<chrono::fea::ChNodeFEAxyzrot> _rotNode;
     std::shared_ptr<const ContactWorld> _world;
     double _offset = 0.0;
     double _stiffness = 0.0;
@@ -74,6 +86,7 @@ private:
     double _damping = 0.0;
     double _normalForce = 0.0;
     bool _active = true;
+    bool _softenFast = false;
 };
 
 }  // namespace rcs

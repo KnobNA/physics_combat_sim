@@ -28,6 +28,8 @@ struct GroupDefinition {
     int parent = -1;
     /// Copied onto every child when the folder checkbox is used.
     bool simulate = true;
+    /// Sibling rank among folders that share `parent`.
+    int order = 0;
 };
 
 /// Authoring-time description of a whole machine: a bag of parts plus the
@@ -86,14 +88,20 @@ public:
     /// Detach shell elements past the material's tear limit. True if nodes were added.
     bool tearOverstretched();
     /// Refine and detach solid tetrahedra on the same slow clock as heat.
-    bool maintainVolume(double dt);
-    /// Shatter brittle solids that are about to take an over-strength hit.
-    bool prepareBrittleImpact(const Environment& environment, double dt);
-    /// Compliant solids have to stay in the solve, so a fast floor hit is
-    /// split into a few fixed substeps instead of one inverted tet.
-    int compliantImpactSubsteps(const Environment& environment, double dt) const;
+    /// `allowRefine` is false during a combat-speed floor hit so bisection
+    /// cannot grow the live tet count while the core is still landing.
+    bool maintainVolume(double dt, bool allowRefine = true);
+    /// Split a fast floor approach so one substep moves a node by at most 2 mm.
+    /// Capped at 16 so HHT is not left to walk the user step down to 1 µs.
+    int impactSubsteps(const Environment& environment, double dt) const;
+    /// Contact onset uses this as the free-flight length of one substep.
+    void setContactStep(double h);
     /// When clear, molten tetrahedra still leave but nothing is split finer.
     void setDynamicResolution(bool enabled) { _dynamicResolution = enabled; }
+    /// Throw away tet trial state from a rejected HHT step.
+    void discardTrial();
+    void captureKinematics();
+    void restoreKinematics();
     /// Remove chips that have not settled, so a bad one cannot abort the run.
     bool discardAwakeShards();
 
