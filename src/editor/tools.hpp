@@ -6,7 +6,8 @@ enum class Tool {
     Select,
     Move,
     Rotate,
-    Splice
+    Splice,
+    Weld
 };
 
 }  // namespace rcs

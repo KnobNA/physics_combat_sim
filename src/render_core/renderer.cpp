@@ -287,6 +287,11 @@ void SceneRenderer::update(const RecordingLayout& layout,
             const Vector3 b = toMagnum(partFrame.position(static_cast<std::size_t>(i1)));
             const Vector3 c = toMagnum(partFrame.position(static_cast<std::size_t>(i2)));
             const Vector3 d = toMagnum(partFrame.position(static_cast<std::size_t>(i3)));
+            auto finite3 = [](const Vector3& p) {
+                return std::isfinite(p.x()) && std::isfinite(p.y()) && std::isfinite(p.z());
+            };
+            if (!finite3(a) || !finite3(b) || !finite3(c) || !finite3(d))
+                return;
             const bool faceHit = faceSelected(a, b, c) || (i2 != i3 && faceSelected(a, c, d));
 
             Color3 color = selected ? 0xd4af37_rgbf : 0xb0b7be_rgbf;

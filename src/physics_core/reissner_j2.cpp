@@ -1,4 +1,5 @@
 #include "physics_core/reissner_j2.hpp"
+#include "physics_core/physics_units.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -106,8 +107,12 @@ void ThermalReissnerElasticity::ComputeStiffnessMatrix(chrono::ChMatrixRef mC,
         mC *= _stiffness;
 }
 
-ReissnerJ2::ReissnerJ2(double yieldStress, double youngsModulus)
-    : _yield(yieldStress), _young(std::max(youngsModulus, 1.0)) {}
+ReissnerJ2::ReissnerJ2(double yieldStress, double youngsModulus, double ultimateStress,
+                       double failPlasticStrain)
+    : _yield(yieldStress),
+      _ultimate(std::max(0.0, ultimateStress)),
+      _failPlastic(std::max(0.0, failPlasticStrain)),
+      _young(std::max(youngsModulus, 1.0)) {}
 
 bool ReissnerJ2::ComputeStressWithReturnMapping(
     chrono::ChVector3d& nU,
@@ -142,8 +147,8 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
 
     elasticity->ComputeStress(nU, nV, mU, mV, epsU, epsV, kurU, kurV, zInf, zSup, angle);
     const double thickness = std::abs(zSup - zInf);
-    const double yield = _yield * _yieldScale;
     const double vm = peakVonMises(nU, nV, mU, mV, thickness);
+    const double flow0 = flowStress(_yield, _ultimate, _failPlastic, old.p_strain_acc, _yieldScale);
 
     auto store = [&](const ReissnerPlasticData& state, bool yielded) {
         if (newState)
@@ -153,13 +158,12 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
         return yielded;
     };
 
-    if (!(vm > yield) || yield <= 0.0) {
+    if (flow0 <= 0.0 || !(vm >= flow0)) {
         ReissnerPlasticData kept = old;
         kept.p_strain_acc = old.p_strain_acc;
         return store(kept, false);
     }
 
-    double scale = std::clamp(yield / vm, 0.0, 1.0);
     double thermal = 0.0;
     if (const auto* law = dynamic_cast<const ThermalReissnerElasticity*>(elasticity))
         thermal = law->thermalStrain();
@@ -167,6 +171,29 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
     const double trialShear = std::sqrt(epsU.z() * epsU.z() + epsV.z() * epsV.z());
     const double kurY = kurU.y();
     const double kurX = kurV.x();
+    auto plasticFromScale = [&](double scale) {
+        const double dexx = (1.0 - scale) * (epsU.x() - thermal);
+        const double deyy = (1.0 - scale) * (epsV.y() - thermal);
+        const double dexy = (1.0 - scale) * 0.5 * (epsU.y() + epsV.x());
+        const double membrane =
+            std::sqrt(std::max(0.0, dexx * dexx - dexx * deyy + deyy * deyy + 3.0 * dexy * dexy));
+        const double bkxx = (1.0 - scale) * kurY * halfH;
+        const double bkyy = (1.0 - scale) * kurX * halfH;
+        const double bend = std::sqrt(std::max(0.0, bkxx * bkxx - bkxx * bkyy + bkyy * bkyy));
+        const double shearInc = (1.0 - scale) * trialShear;
+        return old.p_strain_acc + std::max(membrane, std::max(bend, shearInc));
+    };
+
+    double scale = std::clamp(flow0 / vm, 0.0, 1.0);
+    double ep = plasticFromScale(scale);
+    for (int iter = 0; iter < 8; ++iter) {
+        const double flow = flowStress(_yield, _ultimate, _failPlastic, ep, _yieldScale);
+        const double next = vm > 0.0 ? std::clamp(flow / vm, 0.0, 1.0) : 1.0;
+        if (std::abs(next - scale) <= 1.0e-8)
+            break;
+        scale = next;
+        ep = plasticFromScale(scale);
+    }
     // Thermal strain is a stress offset, not plastic strain. Scale only the
     // mechanical part that remains after it is removed, or the next step
     // subtracts the full thermal strain again and the residual runs away.
@@ -181,14 +208,16 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
     kurU *= scale;
     kurV *= scale;
     elasticity->ComputeStress(nU, nV, mU, mV, mechU, mechV, kurU, kurV, zInf, zSup, angle);
+    const double flow = flowStress(_yield, _ultimate, _failPlastic, ep, _yieldScale);
     const double vmBack = peakVonMises(nU, nV, mU, mV, thickness);
-    if (vmBack > yield && vmBack > 0.0) {
-        const double extra = yield / vmBack;
+    if (vmBack > flow && vmBack > 0.0) {
+        const double extra = flow / vmBack;
         nU *= extra;
         nV *= extra;
         mU *= extra;
         mV *= extra;
         scale *= extra;
+        ep = plasticFromScale(scale);
     }
 
     ReissnerPlasticData updated;
@@ -196,19 +225,16 @@ bool ReissnerJ2::ComputeStressWithReturnMapping(
     updated.epsV = epsVTrial - mechV;
     updated.kurU = kurUTrial - kurU;
     updated.kurV = kurVTrial - kurV;
-    // Equivalent plastic strain from the geometric increment. Dividing the
-    // trial stress by the cold modulus under-counts ductility once the
-    // handbook has softened the metal, so a molten sheet never reached its
-    // tear strain.
-    const double dexx = (1.0 - scale) * (epsU.x() - thermal);
-    const double deyy = (1.0 - scale) * (epsV.y() - thermal);
-    const double dexy = (1.0 - scale) * 0.5 * (epsU.y() + epsV.x());
-    const double membrane = std::sqrt(std::max(0.0, dexx * dexx - dexx * deyy + deyy * deyy + 3.0 * dexy * dexy));
-    const double bkxx = (1.0 - scale) * kurY * halfH;
-    const double bkyy = (1.0 - scale) * kurX * halfH;
-    const double bend = std::sqrt(std::max(0.0, bkxx * bkxx - bkxx * bkyy + bkyy * bkyy));
-    const double shearInc = (1.0 - scale) * trialShear;
-    updated.p_strain_acc = old.p_strain_acc + std::max(membrane, std::max(bend, shearInc));
+    updated.p_strain_acc = ep;
+    if (_failPlastic > 0.0 && ep > 0.5 * _failPlastic) {
+        const double span = std::max(0.5 * _failPlastic, 1.0e-12);
+        const double u = std::clamp((ep - 0.5 * _failPlastic) / span, 0.0, 1.0);
+        const double fade = 1.0 - 0.50 * u;
+        nU *= fade;
+        nV *= fade;
+        mU *= fade;
+        mV *= fade;
+    }
     return store(updated, true);
 }
 
@@ -223,14 +249,16 @@ void ReissnerJ2::ComputeStiffnessMatrixElastoplastic(
     double zSup,
     double angle)
 {
-    (void)data;
     if (!section || !section->GetElasticity())
         return;
     // Chrono's numerical perfect-plastic tangent is singular on a molten yield
     // surface and the step aborts. The temperature-scaled elastic tangent
-    // stays positive definite. The return mapping still caps the stress, so
-    // the face cannot carry a real load.
+    // stays positive definite. On the yield surface a fraction of that
+    // slope lets load-controlled flow take a plastic step, matching the tet
+    // J2 tangent. The return mapping still caps the stress.
     section->GetElasticity()->ComputeStiffnessMatrix(K, epsU, epsV, kurU, kurV, zInf, zSup, angle);
+    if (data.p_strain_acc > 1.0e-6)
+        K *= 0.35;
 }
 
 ThermalRayleighDamping::ThermalRayleighDamping(std::shared_ptr<ThermalReissnerElasticity> elasticity, double beta)

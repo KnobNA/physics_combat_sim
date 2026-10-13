@@ -1,6 +1,7 @@
 [submodule "external/chrono"]
 	path = external/chrono
-	url = https://github.com/projectchrono/chrono.git
+	url = https://github.com/KnobNA/chrono.git
+	branch = rcs-fea-patches
 [submodule "external/magnum"]
 	path = external/magnum
 	url = https://github.com/mosra/magnum.git

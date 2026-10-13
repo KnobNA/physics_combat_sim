@@ -22,7 +22,8 @@ PartDefinition panel(const std::string& name,
                      const ChVector3d& origin,
                      const ChVector3d& uAxis,
                      const ChVector3d& vAxis,
-                     double size)
+                     double uSize,
+                     double vSize)
 {
     PartDefinition part;
     part.name = name;
@@ -31,8 +32,8 @@ PartDefinition panel(const std::string& name,
     part.patch.origin = origin;
     part.patch.uAxis = uAxis;
     part.patch.vAxis = vAxis;
-    part.patch.uSize = size;
-    part.patch.vSize = size;
+    part.patch.uSize = uSize;
+    part.patch.vSize = vSize;
     part.patch.divU = std::max(1, divisions);
     part.patch.divV = std::max(1, divisions);
 
@@ -49,8 +50,11 @@ PartDefinition panel(const std::string& name,
         n.Normalize();
     const double h = 0.5 * std::max(thickness, 1.0e-6);
     auto corner = [&](double su, double sv, double side) {
-        return origin + u * (su * size) + v * (sv * size) + n * (side * h);
+        return origin + u * (su * uSize) + v * (sv * vSize) + n * (side * h);
     };
+    // Keep the 8-vertex solid. An inset 8 mm frame on the large skins is a
+    // sliver PLC: tetgen fills it with needle tets, weld pairing then puts
+    // two coincident rows 8 mm apart, and HHT Newton stalls.
     part.source.vertices = {corner(0.0, 0.0, -1.0), corner(1.0, 0.0, -1.0), corner(1.0, 1.0, -1.0),
                             corner(0.0, 1.0, -1.0), corner(0.0, 0.0, 1.0),  corner(1.0, 0.0, 1.0),
                             corner(1.0, 1.0, 1.0),  corner(0.0, 1.0, 1.0)};
@@ -67,6 +71,56 @@ PartDefinition panel(const std::string& name,
     part.sizing.throughThickness = 2;
     part.sizing.tetBudget = 800;
     return part;
+}
+
+struct PanelBox {
+    ChVector3d lo;
+    ChVector3d hi;
+};
+
+PanelBox panelBox(const PartDefinition& part) {
+    PanelBox box{part.source.vertices.front(), part.source.vertices.front()};
+    for (const auto& p : part.source.vertices) {
+        box.lo = {std::min(box.lo.x(), p.x()), std::min(box.lo.y(), p.y()), std::min(box.lo.z(), p.z())};
+        box.hi = {std::max(box.hi.x(), p.x()), std::max(box.hi.y(), p.y()), std::max(box.hi.z(), p.z())};
+    }
+    return box;
+}
+
+/// Contact patch between two kissing panels: the rectangle where their AABBs
+/// meet. Hand-authored Back-Right/Left beads used to sit on the outer back
+/// face, 8 mm from the real seam, which stretched weld links through air.
+std::vector<ChVector3d> kissBead(const PanelBox& a, const PanelBox& b) {
+    const ChVector3d lo{std::max(a.lo.x(), b.lo.x()), std::max(a.lo.y(), b.lo.y()),
+                        std::max(a.lo.z(), b.lo.z())};
+    const ChVector3d hi{std::min(a.hi.x(), b.hi.x()), std::min(a.hi.y(), b.hi.y()),
+                        std::min(a.hi.z(), b.hi.z())};
+    const double span[3] = {hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z()};
+    int axis = 0;
+    for (int i = 1; i < 3; ++i) {
+        if (span[i] < span[axis])
+            axis = i;
+    }
+    if (span[axis] < -1.0e-6)
+        return {};
+    const int u = (axis + 1) % 3;
+    const int v = (axis + 2) % 3;
+    const double mid = 0.5 * ((axis == 0 ? lo.x() : axis == 1 ? lo.y() : lo.z()) +
+                              (axis == 0 ? hi.x() : axis == 1 ? hi.y() : hi.z()));
+    const double ulo = u == 0 ? lo.x() : u == 1 ? lo.y() : lo.z();
+    const double uhi = u == 0 ? hi.x() : u == 1 ? hi.y() : hi.z();
+    const double vlo = v == 0 ? lo.x() : v == 1 ? lo.y() : lo.z();
+    const double vhi = v == 0 ? hi.x() : v == 1 ? hi.y() : hi.z();
+    if (uhi - ulo < 1.0e-9 || vhi - vlo < 1.0e-9)
+        return {};
+    auto at = [&](double uu, double vv) {
+        ChVector3d p(0, 0, 0);
+        p[axis] = mid;
+        p[u] = uu;
+        p[v] = vv;
+        return p;
+    };
+    return {at(ulo, vlo), at(uhi, vlo), at(uhi, vhi), at(ulo, vhi)};
 }
 
 std::string extensionOf(const std::string& path) {
@@ -314,10 +368,10 @@ bool isChunkySolid(const SurfaceMesh& mesh) {
 AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
     const double t = options.thickness;
     const int n = std::max(1, options.divisions);
-    // Each wall is a solid slab whose mid-surface matches the old shell
-    // layout, so the twelve welds still pair along coincident seams.
-    const double size = options.outerSize - t;
-    const double h = 0.5 * size;
+    const double outer = options.outerSize;
+    const double ho = 0.5 * outer;
+    const double hi = ho - t;
+    const double inner = outer - 2.0 * t;
 
     const ChVector3d x{1, 0, 0};
     const ChVector3d y{0, 1, 0};
@@ -327,13 +381,16 @@ AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
     assembly.name = "Welded test box";
     assembly.groups.push_back(GroupDefinition{"Hollow cube", -1});
 
-    // Axes are ordered so that u x v points out of the box.
-    assembly.parts.push_back(panel("Bottom", options.material, t, n, {-h, -h, -h}, x, z, size));
-    assembly.parts.push_back(panel("Top", options.material, t, n, {-h, h, -h}, z, x, size));
-    assembly.parts.push_back(panel("Front", options.material, t, n, {-h, -h, h}, x, y, size));
-    assembly.parts.push_back(panel("Back", options.material, t, n, {-h, -h, -h}, y, x, size));
-    assembly.parts.push_back(panel("Right", options.material, t, n, {h, -h, -h}, y, z, size));
-    assembly.parts.push_back(panel("Left", options.material, t, n, {-h, -h, -h}, z, y, size));
+    // Thickness-edge faces kiss at the inner envelope so tet skins share a
+    // contact strip instead of overlapping through each other. Back uses the
+    // same (x, y) UV as Front so the two walls are mirrors, not a swapped
+    // parametrisation that hid a weld-bead copy-paste on the outer back face.
+    assembly.parts.push_back(panel("Bottom", options.material, t, n, {-ho, -ho + 0.5 * t, -ho}, x, z, outer, outer));
+    assembly.parts.push_back(panel("Top", options.material, t, n, {-ho, ho - 0.5 * t, -ho}, z, x, outer, outer));
+    assembly.parts.push_back(panel("Front", options.material, t, n, {-ho, -hi, ho - 0.5 * t}, x, y, outer, inner));
+    assembly.parts.push_back(panel("Back", options.material, t, n, {-ho, -hi, -ho + 0.5 * t}, x, y, outer, inner));
+    assembly.parts.push_back(panel("Right", options.material, t, n, {ho - 0.5 * t, -hi, -hi}, y, z, inner, inner));
+    assembly.parts.push_back(panel("Left", options.material, t, n, {-ho + 0.5 * t, -hi, -hi}, z, y, inner, inner));
     for (auto& part : assembly.parts)
         part.group = 0;
 
@@ -344,13 +401,19 @@ AssemblyDefinition makeTestCube(const TestCubeOptions& options) {
         {kFront, kRight},  {kFront, kLeft},  {kBack, kRight},   {kBack, kLeft},
     };
 
-    for (const auto& seam : seams) {
+    std::vector<PanelBox> boxes;
+    boxes.reserve(assembly.parts.size());
+    for (const auto& part : assembly.parts)
+        boxes.push_back(panelBox(part));
+
+    for (int i = 0; i < 12; ++i) {
         WeldDefinition weld;
-        weld.partA = static_cast<std::size_t>(seam.first);
-        weld.partB = static_cast<std::size_t>(seam.second);
+        weld.partA = static_cast<std::size_t>(seams[i].first);
+        weld.partB = static_cast<std::size_t>(seams[i].second);
         weld.label = assembly.parts[weld.partA].name + " - " + assembly.parts[weld.partB].name;
-        weld.tolerance = 0.25 * t;
+        weld.tolerance = 0.5 * t;
         weld.throat = t;
+        weld.bead = kissBead(boxes[weld.partA], boxes[weld.partB]);
         assembly.welds.push_back(weld);
     }
 

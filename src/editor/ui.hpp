@@ -45,7 +45,13 @@ struct EditorState {
     std::vector<FaceId> selectedFaces;
     double spliceAngle = 0.0;
     SplicePreview splicePreview;
+    std::optional<FaceId> weldSource;
+    double weldAngle = 0.0;
+    double weldChordAngle = 0.0;
+    WeldPreview weldPreview;
+    std::optional<std::size_t> selectedWeld;
     std::vector<std::vector<chrono::ChVector3d>> faceOutlines;
+    std::vector<std::vector<chrono::ChVector3d>> weldOutlines;
 
     bool addGroupRequested = false;
     bool deleteSelectionRequested = false;
@@ -61,6 +67,7 @@ struct EditorState {
     int removeHeatIndex = -1;
     bool importRequested = false;
     bool addSolidCubeRequested = false;
+    bool addSolidSphereRequested = false;
     std::string importPath;
 
     std::string status;
@@ -83,6 +90,7 @@ struct UiContext {
     const Recording* recording = nullptr;
     const Frame* frame = nullptr;
     bool simulating = false;
+    bool cancelling = false;
     float progress = 0.0f;
     double simulatedTime = 0.0;
     double runDuration = 0.0;

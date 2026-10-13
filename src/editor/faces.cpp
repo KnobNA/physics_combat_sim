@@ -660,6 +660,614 @@ bool spliceFace(PartDefinition& part, const SplicePreview& preview, std::size_t&
     return true;
 }
 
+namespace {
+
+struct PlaneBasis {
+    ChVector3d origin{0, 0, 0};
+    ChVector3d e1{1, 0, 0};
+    ChVector3d e2{0, 1, 0};
+    ChVector3d n{0, 0, 1};
+};
+
+bool authoredLoop(const PartDefinition& part, std::size_t faceIndex, std::vector<ChVector3d>& out) {
+    out.clear();
+    if (faceIndex >= part.source.faces.size())
+        return false;
+    for (int index : part.source.faces[faceIndex].loop) {
+        if (index < 0 || static_cast<std::size_t>(index) >= part.source.vertices.size())
+            continue;
+        out.push_back(part.source.vertices[static_cast<std::size_t>(index)]);
+    }
+    return out.size() >= 3;
+}
+
+ChVector3d loopCentroid(const std::vector<ChVector3d>& loop) {
+    ChVector3d sum{0, 0, 0};
+    if (loop.empty())
+        return sum;
+    for (const auto& p : loop)
+        sum += p;
+    return sum / double(loop.size());
+}
+
+ChVector3d loopNormal(const std::vector<ChVector3d>& loop) {
+    if (loop.size() < 3)
+        return {0, 1, 0};
+    ChVector3d n{0, 0, 0};
+    for (std::size_t i = 0; i < loop.size(); ++i) {
+        const ChVector3d& a = loop[i];
+        const ChVector3d& b = loop[(i + 1) % loop.size()];
+        n += a.Cross(b);
+    }
+    if (n.Length() < 1.0e-12)
+        return {0, 1, 0};
+    n.Normalize();
+    return n;
+}
+
+PlaneBasis makeBasis(const std::vector<ChVector3d>& loop) {
+    PlaneBasis b;
+    b.origin = loop.empty() ? ChVector3d{0, 0, 0} : loop.front();
+    b.n = loopNormal(loop);
+    ChVector3d e1 = loop.size() > 1 ? loop[1] - loop[0] : ChVector3d{1, 0, 0};
+    e1 = e1 - b.n * e1.Dot(b.n);
+    if (e1.Length() < 1.0e-12)
+        e1 = b.n.Cross(ChVector3d(0, 1, 0));
+    if (e1.Length() < 1.0e-12)
+        e1 = {1, 0, 0};
+    e1.Normalize();
+    b.e1 = e1;
+    b.e2 = b.n.Cross(e1);
+    return b;
+}
+
+ChVector3d toPlane(const PlaneBasis& b, const ChVector3d& p) {
+    const ChVector3d d = p - b.origin;
+    return {d.Dot(b.e1), d.Dot(b.e2), 0.0};
+}
+
+ChVector3d fromPlane(const PlaneBasis& b, const ChVector3d& q) {
+    return b.origin + b.e1 * q.x() + b.e2 * q.y();
+}
+
+double cross2(const ChVector3d& a, const ChVector3d& b) {
+    return a.x() * b.y() - a.y() * b.x();
+}
+
+bool leftOf(const ChVector3d& p, const ChVector3d& a, const ChVector3d& b) {
+    return cross2(b - a, p - a) >= -1.0e-12;
+}
+
+ChVector3d intersect2(const ChVector3d& s, const ChVector3d& e, const ChVector3d& a, const ChVector3d& b) {
+    const ChVector3d d = e - s;
+    const ChVector3d c = b - a;
+    const double den = cross2(d, c);
+    if (std::abs(den) < 1.0e-18)
+        return s;
+    const double t = cross2(a - s, c) / den;
+    return s + d * t;
+}
+
+void ensureCcw(std::vector<ChVector3d>& poly) {
+    if (poly.size() < 3)
+        return;
+    double area = 0.0;
+    for (std::size_t i = 0; i < poly.size(); ++i)
+        area += cross2(poly[i], poly[(i + 1) % poly.size()]);
+    if (area < 0.0)
+        std::reverse(poly.begin(), poly.end());
+}
+
+std::vector<ChVector3d> clipConvex(std::vector<ChVector3d> subject, std::vector<ChVector3d> clip) {
+    if (subject.size() < 3 || clip.size() < 3)
+        return {};
+    ensureCcw(clip);
+    for (std::size_t i = 0; i < clip.size(); ++i) {
+        const ChVector3d a = clip[i];
+        const ChVector3d b = clip[(i + 1) % clip.size()];
+        std::vector<ChVector3d> input = std::move(subject);
+        subject.clear();
+        if (input.empty())
+            break;
+        for (std::size_t j = 0; j < input.size(); ++j) {
+            const ChVector3d s = input[j];
+            const ChVector3d e = input[(j + 1) % input.size()];
+            const bool sIn = leftOf(s, a, b);
+            const bool eIn = leftOf(e, a, b);
+            if (eIn) {
+                if (!sIn)
+                    subject.push_back(intersect2(s, e, a, b));
+                subject.push_back(e);
+            } else if (sIn) {
+                subject.push_back(intersect2(s, e, a, b));
+            }
+        }
+    }
+    return subject;
+}
+
+bool segmentHit2(const ChVector3d& a, const ChVector3d& b, const ChVector3d& c, const ChVector3d& d,
+                 ChVector3d& at) {
+    const ChVector3d r = b - a;
+    const ChVector3d s = d - c;
+    const double den = cross2(r, s);
+    if (std::abs(den) < 1.0e-18)
+        return false;
+    const double t = cross2(c - a, s) / den;
+    const double u = cross2(c - a, r) / den;
+    if (t < -kHitEps || t > 1.0 + kHitEps || u < -kHitEps || u > 1.0 + kHitEps)
+        return false;
+    at = a + r * std::clamp(t, 0.0, 1.0);
+    return true;
+}
+
+double interiorDeg(const ChVector3d& dirA, const ChVector3d& dirB) {
+    ChVector3d a = dirA;
+    ChVector3d b = dirB;
+    if (a.Length() < 1.0e-12 || b.Length() < 1.0e-12)
+        return 90.0;
+    a.Normalize();
+    b.Normalize();
+    return std::acos(std::clamp(std::abs(a.Dot(b)), 0.0, 1.0)) * 180.0 / kPi;
+}
+
+ChQuaterniond kissRotation(const ChVector3d& sourceNormal, const ChVector3d& destNormal, double spin) {
+    ChVector3d ns = sourceNormal;
+    ChVector3d nd = destNormal;
+    if (ns.Length() < 1.0e-12)
+        ns = {0, 1, 0};
+    else
+        ns.Normalize();
+    if (nd.Length() < 1.0e-12)
+        nd = {0, 1, 0};
+    else
+        nd.Normalize();
+    const ChVector3d target = -nd;
+    ChQuaterniond align{1, 0, 0, 0};
+    const double d = std::clamp(ns.Dot(target), -1.0, 1.0);
+    if (d > 0.999999)
+        align = ChQuaterniond(1, 0, 0, 0);
+    else if (d < -0.999999) {
+        ChVector3d axis = ns.Cross(ChVector3d(1, 0, 0));
+        if (axis.Length() < 1.0e-8)
+            axis = ns.Cross(ChVector3d(0, 1, 0));
+        axis.Normalize();
+        align = chrono::QuatFromAngleAxis(kPi, axis);
+    } else {
+        ChVector3d axis = ns.Cross(target);
+        axis.Normalize();
+        align = chrono::QuatFromAngleAxis(std::acos(d), axis);
+    }
+    return chrono::QuatFromAngleAxis(spin, nd) * align;
+}
+
+struct Key3 {
+    long long x = 0;
+    long long y = 0;
+    long long z = 0;
+    bool operator==(const Key3& o) const { return x == o.x && y == o.y && z == o.z; }
+    bool operator!=(const Key3& o) const { return !(*this == o); }
+    bool operator<(const Key3& o) const {
+        if (x != o.x)
+            return x < o.x;
+        if (y != o.y)
+            return y < o.y;
+        return z < o.z;
+    }
+};
+
+Key3 quantize(const ChVector3d& p) {
+    return {std::llround(p.x() * 1.0e7), std::llround(p.y() * 1.0e7), std::llround(p.z() * 1.0e7)};
+}
+
+std::vector<ChVector3d> perimeterFromPolys(const std::vector<std::vector<ChVector3d>>& polys) {
+    std::map<std::pair<Key3, Key3>, std::pair<ChVector3d, ChVector3d>> unique;
+    std::map<std::pair<Key3, Key3>, int> count;
+    auto undirected = [](Key3 a, Key3 b) {
+        return a < b ? std::make_pair(a, b) : std::make_pair(b, a);
+    };
+    for (const auto& poly : polys) {
+        if (poly.size() < 3)
+            continue;
+        for (std::size_t i = 0; i < poly.size(); ++i) {
+            const ChVector3d a = poly[i];
+            const ChVector3d b = poly[(i + 1) % poly.size()];
+            if ((a - b).Length() < 1.0e-9)
+                continue;
+            const auto key = undirected(quantize(a), quantize(b));
+            ++count[key];
+            unique[key] = {a, b};
+        }
+    }
+    std::map<Key3, std::vector<std::pair<Key3, ChVector3d>>> adj;
+    std::map<Key3, ChVector3d> point;
+    for (const auto& edge : count) {
+        if (edge.second != 1)
+            continue;
+        const auto found = unique.find(edge.first);
+        if (found == unique.end())
+            continue;
+        const Key3 ka = quantize(found->second.first);
+        const Key3 kb = quantize(found->second.second);
+        point[ka] = found->second.first;
+        point[kb] = found->second.second;
+        adj[ka].push_back({kb, found->second.second});
+        adj[kb].push_back({ka, found->second.first});
+    }
+    std::vector<ChVector3d> loop;
+    if (adj.empty())
+        return loop;
+    Key3 start = adj.begin()->first;
+    Key3 cursor = start;
+    Key3 prev{std::numeric_limits<long long>::min(), 0, 0};
+    for (int guard = 0; guard < 4096; ++guard) {
+        loop.push_back(point[cursor]);
+        const auto& nbrs = adj[cursor];
+        Key3 next = cursor;
+        bool found = false;
+        for (const auto& n : nbrs) {
+            if (n.first == prev && nbrs.size() > 1)
+                continue;
+            next = n.first;
+            found = true;
+            if (n.first != prev)
+                break;
+        }
+        if (!found)
+            break;
+        prev = cursor;
+        cursor = next;
+        if (cursor == start)
+            break;
+    }
+    return loop.size() >= 3 ? loop : std::vector<ChVector3d>{};
+}
+
+bool raySegment(const ChVector3d& origin, const ChVector3d& dir, const ChVector3d& a,
+                const ChVector3d& b, double& t, double& dist) {
+    const ChVector3d ab = b - a;
+    const ChVector3d n = dir.Cross(ab);
+    const double denom = n.Length2();
+    if (denom < 1.0e-18)
+        return false;
+    const ChVector3d ao = origin - a;
+    t = ao.Cross(ab).Dot(n) / denom;
+    if (t < 1.0e-6)
+        return false;
+    const double u = ao.Cross(dir).Dot(n) / denom;
+    if (u < -1.0e-6 || u > 1.0 + 1.0e-6)
+        return false;
+    const ChVector3d hit = origin + dir * t;
+    const ChVector3d closest = a + ab * std::clamp(u, 0.0, 1.0);
+    dist = (hit - closest).Length();
+    return true;
+}
+
+void fillChord(WeldChord& chord, const std::vector<ChVector3d>& dest, const ChVector3d& mouse,
+               const ChVector3d& n, const ChVector3d& dir) {
+    chord = {};
+    std::vector<std::pair<double, SpliceHit>> ranked;
+    for (std::size_t i = 0; i < dest.size(); ++i) {
+        const ChVector3d a = dest[i];
+        const ChVector3d b = dest[(i + 1) % dest.size()];
+        const ChVector3d edge = b - a;
+        const double denom = n.Dot(dir.Cross(edge));
+        if (std::abs(denom) < 1.0e-12)
+            continue;
+        const ChVector3d r = a - mouse;
+        const double u = n.Dot(r.Cross(dir)) / denom;
+        if (u < -kHitEps || u > 1.0 + kHitEps)
+            continue;
+        SpliceHit hit;
+        hit.edge = static_cast<int>(i);
+        hit.along = std::clamp(u, 0.0, 1.0);
+        hit.point = a + edge * hit.along;
+        ranked.push_back({(hit.point - mouse).Dot(dir), hit});
+    }
+    SpliceHit neg;
+    SpliceHit pos;
+    double bestNeg = -1.0e30;
+    double bestPos = 1.0e30;
+    bool haveNeg = false;
+    bool havePos = false;
+    for (const auto& entry : ranked) {
+        if (entry.first < 0.0 && entry.first > bestNeg) {
+            bestNeg = entry.first;
+            neg = entry.second;
+            haveNeg = true;
+        }
+        if (entry.first >= 0.0 && entry.first < bestPos) {
+            bestPos = entry.first;
+            pos = entry.second;
+            havePos = true;
+        }
+    }
+    if (!haveNeg || !havePos)
+        return;
+    chord.hits[0] = neg;
+    chord.hits[1] = pos;
+    chord.a = neg.point;
+    chord.b = pos.point;
+    chord.length = (chord.b - chord.a).Length();
+    ChVector3d chordDir = chord.b - chord.a;
+    if (chordDir.Length() > 1.0e-12)
+        chordDir.Normalize();
+    for (int h = 0; h < 2; ++h) {
+        const int e = chord.hits[h].edge;
+        if (e < 0)
+            continue;
+        ChVector3d edge = dest[static_cast<std::size_t>((e + 1) % dest.size())] -
+                          dest[static_cast<std::size_t>(e)];
+        const double deg = interiorDeg(chordDir, edge);
+        chord.interiorDeg[h] = deg;
+        chord.square[h] = std::abs(deg - 90.0) < 0.01;
+    }
+}
+
+void coincidentEdges(const PartDefinition& a, const PartDefinition& b, double tolerance,
+                     std::vector<std::vector<ChVector3d>>& out) {
+    auto nearOther = [&](const ChVector3d& p) {
+        for (const auto& q : b.source.vertices) {
+            if ((p - q).Length() <= tolerance)
+                return true;
+        }
+        return false;
+    };
+    for (const auto& face : a.source.faces) {
+        if (face.loop.size() < 2)
+            continue;
+        for (std::size_t i = 0; i < face.loop.size(); ++i) {
+            const int ia = face.loop[i];
+            const int ib = face.loop[(i + 1) % face.loop.size()];
+            if (ia < 0 || ib < 0)
+                continue;
+            if (static_cast<std::size_t>(ia) >= a.source.vertices.size() ||
+                static_cast<std::size_t>(ib) >= a.source.vertices.size())
+                continue;
+            const ChVector3d pa = a.source.vertices[static_cast<std::size_t>(ia)];
+            const ChVector3d pb = a.source.vertices[static_cast<std::size_t>(ib)];
+            if (nearOther(pa) && nearOther(pb))
+                out.push_back({pa, pb});
+        }
+    }
+}
+
+}  // namespace
+
+WeldPreview makeWeldPreview(const AssemblyDefinition& definition,
+                            const std::vector<FaceId>& destFaces, FaceId source, FaceId hovered,
+                            const ChVector3d& mouse, double outlineAngle, double chordAngle) {
+    WeldPreview preview;
+    preview.source = source;
+    preview.dest = hovered;
+    if (hovered.part >= definition.parts.size() || source.part >= definition.parts.size())
+        return preview;
+    if (hovered.part == source.part)
+        return preview;
+    const PartDefinition& destPart = definition.parts[hovered.part];
+    const PartDefinition& sourcePart = definition.parts[source.part];
+    std::vector<ChVector3d> destLoop;
+    std::vector<ChVector3d> sourceLoop;
+    if (!authoredLoop(destPart, hovered.face, destLoop) ||
+        !authoredLoop(sourcePart, source.face, sourceLoop))
+        return preview;
+
+    const ChVector3d destN = loopNormal(destLoop);
+    const ChVector3d sourceN = loopNormal(sourceLoop);
+    preview.sourceCentroid = loopCentroid(sourceLoop);
+    preview.mouse = mouse - destN * (mouse - loopCentroid(destLoop)).Dot(destN);
+    preview.rotation = kissRotation(sourceN, destN, outlineAngle);
+
+    preview.outline.reserve(sourceLoop.size());
+    for (const auto& p : sourceLoop)
+        preview.outline.push_back(preview.mouse + preview.rotation.Rotate(p - preview.sourceCentroid));
+
+    const PlaneBasis basis = makeBasis(destLoop);
+    std::vector<FaceId> canvas;
+    for (const FaceId& id : destFaces) {
+        if (id.part >= definition.parts.size())
+            continue;
+        std::vector<ChVector3d> loop;
+        if (!authoredLoop(definition.parts[id.part], id.face, loop))
+            continue;
+        const ChVector3d n = loopNormal(loop);
+        if (std::abs(n.Dot(destN)) < kNormalDot)
+            continue;
+        if (std::abs((loop.front() - destLoop.front()).Dot(destN)) > kCoplanar)
+            continue;
+        canvas.push_back(id);
+        WeldDestLoop drawn;
+        drawn.face = id;
+        drawn.loop = loop;
+        drawn.edgeLength.resize(loop.size(), 0.0);
+        for (std::size_t i = 0; i < loop.size(); ++i)
+            drawn.edgeLength[i] = (loop[(i + 1) % loop.size()] - loop[i]).Length();
+        preview.destLoops.push_back(std::move(drawn));
+    }
+    if (preview.destLoops.empty()) {
+        WeldDestLoop drawn;
+        drawn.face = hovered;
+        drawn.loop = destLoop;
+        drawn.edgeLength.resize(destLoop.size(), 0.0);
+        for (std::size_t i = 0; i < destLoop.size(); ++i)
+            drawn.edgeLength[i] = (destLoop[(i + 1) % destLoop.size()] - destLoop[i]).Length();
+        preview.destLoops.push_back(std::move(drawn));
+        canvas.push_back(hovered);
+    }
+
+    const bool span = canvas.size() > 1;
+    std::vector<ChVector3d> drawnOutline = preview.outline;
+    if (!span) {
+        std::vector<ChVector3d> dest2;
+        std::vector<ChVector3d> src2;
+        for (const auto& p : destLoop)
+            dest2.push_back(toPlane(basis, p));
+        for (const auto& p : preview.outline)
+            src2.push_back(toPlane(basis, p));
+        const auto clipped = clipConvex(src2, dest2);
+        if (clipped.size() >= 3) {
+            drawnOutline.clear();
+            for (const auto& q : clipped)
+                drawnOutline.push_back(fromPlane(basis, q));
+            preview.outline = drawnOutline;
+        }
+    }
+
+    std::vector<std::vector<ChVector3d>> intersections;
+    for (const FaceId& id : canvas) {
+        std::vector<ChVector3d> loop;
+        if (!authoredLoop(definition.parts[id.part], id.face, loop))
+            continue;
+        std::vector<ChVector3d> dest2;
+        std::vector<ChVector3d> src2;
+        const PlaneBasis local = makeBasis(loop);
+        for (const auto& p : loop)
+            dest2.push_back(toPlane(local, p));
+        for (const auto& p : preview.outline)
+            src2.push_back(toPlane(local, p));
+        auto clipped = clipConvex(src2, dest2);
+        if (clipped.size() < 3)
+            continue;
+        std::vector<ChVector3d> world;
+        for (const auto& q : clipped)
+            world.push_back(fromPlane(local, q));
+        intersections.push_back(std::move(world));
+    }
+    preview.bead = perimeterFromPolys(intersections);
+    if (preview.bead.size() < 3 && !intersections.empty())
+        preview.bead = intersections.front();
+
+    std::vector<ChVector3d> dest2;
+    std::vector<ChVector3d> src2;
+    for (const auto& p : destLoop)
+        dest2.push_back(toPlane(basis, p));
+    for (const auto& p : preview.outline)
+        src2.push_back(toPlane(basis, p));
+    for (std::size_t i = 0; i < src2.size(); ++i) {
+        const ChVector3d a = src2[i];
+        const ChVector3d b = src2[(i + 1) % src2.size()];
+        for (const FaceId& id : canvas) {
+            std::vector<ChVector3d> loop;
+            if (!authoredLoop(definition.parts[id.part], id.face, loop))
+                continue;
+            std::vector<ChVector3d> other2;
+            for (const auto& p : loop)
+                other2.push_back(toPlane(basis, p));
+            for (std::size_t j = 0; j < other2.size(); ++j) {
+                ChVector3d at;
+                if (!segmentHit2(a, b, other2[j], other2[(j + 1) % other2.size()], at))
+                    continue;
+                WeldEdgeHit hit;
+                hit.point = fromPlane(basis, at);
+                const ChVector3d outlineDir = preview.outline[(i + 1) % preview.outline.size()] - preview.outline[i];
+                const ChVector3d destDir = loop[(j + 1) % loop.size()] - loop[j];
+                hit.interiorDeg = interiorDeg(outlineDir, destDir);
+                hit.square = std::abs(hit.interiorDeg - 90.0) < 0.01;
+                bool dup = false;
+                for (const auto& other : preview.outlineHits) {
+                    if ((other.point - hit.point).Length() < 1.0e-6)
+                        dup = true;
+                }
+                if (!dup)
+                    preview.outlineHits.push_back(hit);
+            }
+        }
+    }
+
+    ChVector3d e1 = destLoop.size() > 1 ? destLoop[1] - destLoop[0] : ChVector3d{1, 0, 0};
+    e1 = e1 - destN * e1.Dot(destN);
+    if (e1.Length() < 1.0e-12)
+        e1 = destN.Cross(ChVector3d(0, 1, 0));
+    if (e1.Length() < 1.0e-12)
+        e1 = {1, 0, 0};
+    e1.Normalize();
+    const ChVector3d e2 = destN.Cross(e1);
+    const ChVector3d dirA = e1 * std::cos(chordAngle) + e2 * std::sin(chordAngle);
+    const ChVector3d dirB = destN.Cross(dirA);
+    fillChord(preview.chords[0], destLoop, preview.mouse, destN, dirA);
+    fillChord(preview.chords[1], destLoop, preview.mouse, destN, dirB);
+
+    preview.valid = preview.outline.size() >= 3;
+    return preview;
+}
+
+bool commitWeldPlacement(AssemblyDefinition& definition, const WeldPreview& preview) {
+    if (!preview.valid || preview.source.part >= definition.parts.size() ||
+        preview.dest.part >= definition.parts.size() || preview.source.part == preview.dest.part)
+        return false;
+    PartDefinition& source = definition.parts[preview.source.part];
+    PartDefinition& dest = definition.parts[preview.dest.part];
+    applyPartRotation(source, preview.rotation, preview.sourceCentroid);
+    applyPartTranslation(source, preview.mouse - preview.sourceCentroid);
+
+    WeldDefinition weld;
+    weld.partA = preview.dest.part;
+    weld.partB = preview.source.part;
+    weld.label = dest.name + " - " + source.name;
+    weld.throat = std::min(std::max(dest.thickness, 1.0e-4), std::max(source.thickness, 1.0e-4));
+    weld.tolerance = std::max(2.0e-3, 0.25 * weld.throat);
+    weld.bead = preview.bead;
+    if (weld.bead.size() < 3)
+        weld.bead = preview.outline;
+    definition.welds.push_back(std::move(weld));
+    return true;
+}
+
+void authoredWeldPolylines(const AssemblyDefinition& definition, std::size_t weldIndex,
+                           std::vector<std::vector<ChVector3d>>& out) {
+    out.clear();
+    if (weldIndex >= definition.welds.size())
+        return;
+    const WeldDefinition& weld = definition.welds[weldIndex];
+    if (weld.bead.size() >= 2) {
+        out.push_back(weld.bead);
+        return;
+    }
+    if (weld.partA >= definition.parts.size() || weld.partB >= definition.parts.size())
+        return;
+    coincidentEdges(definition.parts[weld.partA], definition.parts[weld.partB], weld.tolerance, out);
+    coincidentEdges(definition.parts[weld.partB], definition.parts[weld.partA], weld.tolerance, out);
+}
+
+std::optional<std::size_t> pickWeld(const AssemblyDefinition& definition,
+                                    const std::vector<std::size_t>& parts,
+                                    const ChVector3d& origin, const ChVector3d& direction,
+                                    const ChQuaterniond& worldRotation, const ChVector3d& worldOrigin,
+                                    double maxDistance) {
+    std::optional<std::size_t> hit;
+    double bestT = 1.0e9;
+    auto involves = [&](const WeldDefinition& weld) {
+        if (parts.empty())
+            return true;
+        return std::find(parts.begin(), parts.end(), weld.partA) != parts.end() ||
+               std::find(parts.begin(), parts.end(), weld.partB) != parts.end();
+    };
+    for (std::size_t i = 0; i < definition.welds.size(); ++i) {
+        if (!involves(definition.welds[i]))
+            continue;
+        std::vector<std::vector<ChVector3d>> loops;
+        authoredWeldPolylines(definition, i, loops);
+        for (const auto& loop : loops) {
+            if (loop.size() < 2)
+                continue;
+            const std::size_t segs = loop.size() >= 3 ? loop.size() : loop.size() - 1;
+            for (std::size_t s = 0; s < segs; ++s) {
+                const ChVector3d a = toWorld(loop[s], worldRotation, worldOrigin);
+                const ChVector3d b = toWorld(loop[(s + 1) % loop.size()], worldRotation, worldOrigin);
+                double t = 0.0;
+                double dist = 0.0;
+                if (!raySegment(origin, direction, a, b, t, dist))
+                    continue;
+                if (dist > maxDistance || t >= bestT)
+                    continue;
+                bestT = t;
+                hit = i;
+            }
+        }
+    }
+    return hit;
+}
+
 std::string formatMillimetres(double metres) {
     char buffer[64];
     std::snprintf(buffer, sizeof(buffer), "%.2f mm", metres * 1000.0);
@@ -780,7 +1388,93 @@ std::vector<std::size_t> collectTransformTargets(const AssemblyDefinition& defin
                 group.push_back(i);
         }
     }
+
+    std::vector<char> in(parts.size(), 0);
+    for (std::size_t index : group)
+        if (index < in.size())
+            in[index] = 1;
+    auto take = [&](std::size_t index) {
+        if (index >= in.size() || in[index])
+            return false;
+        in[index] = 1;
+        group.push_back(index);
+        return true;
+    };
+    bool grew = true;
+    while (grew) {
+        grew = false;
+        for (const auto& weld : definition.welds) {
+            if (weld.partA >= in.size() || weld.partB >= in.size())
+                continue;
+            if (in[weld.partA] == in[weld.partB])
+                continue;
+            grew = take(weld.partA) || grew;
+            grew = take(weld.partB) || grew;
+        }
+        for (const auto& screw : definition.screws) {
+            if (screw.partA >= in.size() || screw.partB >= in.size())
+                continue;
+            if (in[screw.partA] == in[screw.partB])
+                continue;
+            grew = take(screw.partA) || grew;
+            grew = take(screw.partB) || grew;
+        }
+        for (std::size_t n = 0; n < group.size(); ++n) {
+            for (std::size_t i = 0; i < parts.size(); ++i) {
+                if (parts[i].parentPart == static_cast<int>(group[n]))
+                    grew = take(i) || grew;
+            }
+        }
+    }
     return group;
+}
+
+void transformAuthoredJoints(AssemblyDefinition& definition,
+                             const std::vector<char>& inGroup,
+                             const chrono::ChVector3d& translation) {
+    for (auto& screw : definition.screws) {
+        if (screw.partA < inGroup.size() && inGroup[screw.partA])
+            screw.position += translation;
+        else if (screw.partB < inGroup.size() && inGroup[screw.partB])
+            screw.position += translation;
+    }
+    for (auto& weld : definition.welds) {
+        const bool incident = (weld.partA < inGroup.size() && inGroup[weld.partA]) ||
+                              (weld.partB < inGroup.size() && inGroup[weld.partB]);
+        if (!incident)
+            continue;
+        if (weld.useRegion) {
+            weld.regionMin += translation;
+            weld.regionMax += translation;
+        }
+        for (auto& point : weld.bead)
+            point += translation;
+    }
+}
+
+void rotateAuthoredJoints(AssemblyDefinition& definition,
+                          const std::vector<char>& inGroup,
+                          const chrono::ChQuaterniond& rotation,
+                          const chrono::ChVector3d& pivot) {
+    auto spin = [&](chrono::ChVector3d& p) { p = pivot + rotation.Rotate(p - pivot); };
+    for (auto& screw : definition.screws) {
+        if (screw.partA < inGroup.size() && inGroup[screw.partA])
+            spin(screw.position);
+        else if (screw.partB < inGroup.size() && inGroup[screw.partB])
+            spin(screw.position);
+    }
+    for (auto& weld : definition.welds) {
+        const bool incident = (weld.partA < inGroup.size() && inGroup[weld.partA]) ||
+                              (weld.partB < inGroup.size() && inGroup[weld.partB]);
+        if (!incident)
+            continue;
+        if (weld.useRegion) {
+            spin(weld.regionMin);
+            spin(weld.regionMax);
+        }
+        for (auto& point : weld.bead)
+            spin(point);
+    }
 }
 
 void deleteSelectedParts(AssemblyDefinition& definition, std::vector<std::size_t>& selected,

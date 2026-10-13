@@ -1,4 +1,5 @@
 #include "physics_core/part.hpp"
+#include "physics_core/physics_units.hpp"
 #include "physics_core/reissner_j2.hpp"
 
 #include "chrono/core/ChMatrix33.h"
@@ -7,9 +8,10 @@
 
 #include <algorithm>
 #include <cmath>
-#include <fstream>
 #include <limits>
 #include <map>
+#include <set>
+#include <utility>
 
 namespace rcs {
 namespace {
@@ -58,9 +60,10 @@ bool fitGradient(const double a[4][2], const double f[4][2], double g[2][2]) {
     return true;
 }
 
-double vonMisesPlaneStress(double sxx, double syy, double sxy) {
-    const double v = sxx * sxx - sxx * syy + syy * syy + 3.0 * sxy * sxy;
-    return v > 0.0 ? std::sqrt(v) : 0.0;
+double liveStretchLimit(const Material& material, double ductility) {
+    if (material.fracture == FractureMode::Ductile && material.failPlasticStrain > 0.0)
+        return ductileTearStretch(material.failPlasticStrain, ductility);
+    return 1.0 + std::max(0.0, material.tearStretch - 1.0) * ductility;
 }
 
 }  // namespace
@@ -72,13 +75,22 @@ void Part::build(const PartDefinition& definition) {
     _name = definition.name;
     _material = definition.material;
     _thickness = definition.thickness;
+    if (!_material.plies.empty()) {
+        double plySum = 0.0;
+        for (const Ply& ply : _material.plies)
+            plySum += std::max(ply.thickness, 0.0);
+        if (plySum > 1.0e-9)
+            _thickness = plySum;
+    }
     _refineLimit = definition.sizing.refineLimit > 0.0 ? definition.sizing.refineLimit : definition.sizing.maxElement;
+    _minElement = definition.sizing.minElement > 0.0 ? definition.sizing.minElement : 0.002;
     _initialTemperature = definition.initialTemperature;
     _temperature = _initialTemperature;
     _fixed = definition.fixed;
     _torn = false;
     _peakFractureTension = 0.0;
     _shattering = false;
+    _shatterLive0 = 0;
     _elasticity.reset();
     _plasticity.reset();
     _shellMaterial.reset();
@@ -87,6 +99,9 @@ void Part::build(const PartDefinition& definition) {
     _strainTemperature.clear();
     _heatActive.clear();
     _prescribedThermalKur = 0.0;
+    _thermalStamp = 0.0;
+    _thermalPrestress = false;
+    _thermalLoadChanged = false;
     _tearTwins.clear();
     _xyzNodes.clear();
     _trianglesElements.clear();
@@ -115,9 +130,12 @@ void Part::build(const PartDefinition& definition) {
         return;
     }
 
-    // The editor shows the authored surface. Tetrahedra are built only when a
-    // simulation starts, so adding a solid does not stall the view.
-    if (!definition.source.empty()) {
+    // A plate shell is the patch midsurface (Reissner), even when the CAD
+    // solid is still attached for display. Meshing that solid as BST triangles
+    // leaves the weld as a point constraint Newton cannot satisfy.
+    const bool patchShell = definition.sizing.throughThickness <= 0 && definition.patch.uSize > 1.0e-6 &&
+                            definition.patch.vSize > 1.0e-6;
+    if (!patchShell && !definition.source.empty()) {
         PartDefinition display = definition;
         display.surface = definition.source;
         if (display.surface.thickness.empty())
@@ -133,7 +151,9 @@ void Part::build(const PartDefinition& definition) {
         _elasticity, _material.dampingBeta);
     _plasticity.reset();
     if (_material.allowPlasticity && _material.yieldStress > 0.0)
-        _plasticity = chrono_types::make_shared<ReissnerJ2>(_material.yieldStress, _material.youngsModulus);
+        _plasticity = chrono_types::make_shared<ReissnerJ2>(
+            _material.yieldStress, _material.youngsModulus, _material.ultimateStress,
+            _material.failPlasticStrain);
     _shellMaterial = chrono_types::make_shared<ChMaterialShellReissner>(
         _elasticity, _plasticity, damping);
     _shellMaterial->SetDensity(_material.density);
@@ -275,6 +295,11 @@ void Part::transform(const chrono::ChVector3d& translation,
             if (alsoRest)
                 node->SetX0(node->GetPos());
         }
+        if (alsoRest) {
+            for (const auto& tet : _tetElements)
+                if (tet)
+                    tet->refreshRest();
+        }
         return;
     }
     for (auto& node : _nodes) {
@@ -311,6 +336,10 @@ void Part::addLoad(std::size_t nodeIndex, const chrono::ChVector3d& force) {
         _loads[nodeIndex] += force;
 }
 
+chrono::ChVector3d Part::nodeForce(std::size_t nodeIndex) const {
+    return nodeIndex < _loads.size() ? _loads[nodeIndex] : chrono::ChVector3d(0, 0, 0);
+}
+
 bool Part::nodeOnLiveShell(std::size_t index) const {
     const int node = static_cast<int>(index);
     for (std::size_t q = 0; q < _quads.size() && q < _elements.size(); ++q) {
@@ -319,6 +348,17 @@ bool Part::nodeOnLiveShell(std::size_t index) const {
         if (q < _rigidQuad.size() && _rigidQuad[q])
             continue;
         for (int corner : _quads[q]) {
+            if (corner == node)
+                return true;
+        }
+    }
+    for (std::size_t t = 0; t < _trianglesElements.size(); ++t) {
+        if (!_trianglesElements[t])
+            continue;
+        const std::size_t face = t + static_cast<std::size_t>(std::max(0, _skinTriangles));
+        if (face >= _triangles.size())
+            continue;
+        for (int corner : _triangles[face]) {
             if (corner == node)
                 return true;
         }
@@ -346,8 +386,10 @@ void Part::addStructuralLoad(std::size_t nodeIndex, const chrono::ChVector3d& fo
 }
 
 const std::vector<double>& Part::contactAreas() const {
-    const std::size_t faces = _quads.empty() ? static_cast<std::size_t>(std::max(0, _skinTriangles))
-                                             : _quads.size();
+    const std::size_t triFaces = _trianglesElements.empty()
+                                     ? static_cast<std::size_t>(std::max(0, _skinTriangles))
+                                     : _triangles.size();
+    const std::size_t faces = _quads.empty() ? triFaces : _quads.size();
     if (_contactAreaNodes == nodeCount() && _contactAreaFaces == faces && !_contactArea.empty())
         return _contactArea;
     _contactArea.assign(nodeCount(), 0.0);
@@ -387,21 +429,23 @@ const std::vector<double>& Part::contactAreas() const {
 }
 
 void Part::freezeUnusedNodes() {
-    std::vector<char> used(_nodes.size(), 0);
-    for (std::size_t q = 0; q < _quads.size() && q < _elements.size(); ++q) {
-        if (!_elements[q])
+    auto live = [&](std::size_t i) {
+        if (hasVolume() && nodeOnLiveTet(i))
+            return true;
+        return nodeOnLiveShell(i);
+    };
+    const std::size_t count = nodeCount();
+    if (_rigidNode.size() < count)
+        _rigidNode.resize(count, 0);
+    for (std::size_t i = 0; i < _xyzNodes.size(); ++i) {
+        if (live(i) || !_xyzNodes[i] || _xyzNodes[i]->IsFixed())
             continue;
-        if (q < _rigidQuad.size() && _rigidQuad[q])
-            continue;
-        for (int corner : _quads[q]) {
-            if (corner >= 0 && static_cast<std::size_t>(corner) < used.size())
-                used[static_cast<std::size_t>(corner)] = 1;
-        }
+        _xyzNodes[i]->SetFixed(true);
+        _xyzNodes[i]->SetPosDt(chrono::ChVector3d(0, 0, 0));
+        _rigidNode[i] = 1;
     }
-    if (_rigidNode.size() < _nodes.size())
-        _rigidNode.resize(_nodes.size(), 0);
     for (std::size_t i = 0; i < _nodes.size(); ++i) {
-        if (used[i] || !_nodes[i] || _nodes[i]->IsFixed())
+        if (live(i) || !_nodes[i] || _nodes[i]->IsFixed())
             continue;
         _nodes[i]->SetFixed(true);
         _nodes[i]->SetPosDt(chrono::ChVector3d(0, 0, 0));
@@ -412,12 +456,27 @@ void Part::freezeUnusedNodes() {
 
 void Part::commitLoads() {
     if (!_xyzNodes.empty()) {
-        for (std::size_t i = 0; i < _xyzNodes.size() && i < _loads.size(); ++i)
+        for (std::size_t i = 0; i < _xyzNodes.size() && i < _loads.size(); ++i) {
+            if (i < _rigidNode.size() && _rigidNode[i] && _xyzNodes[i]) {
+                _xyzNodes[i]->SetFixed(true);
+                _xyzNodes[i]->SetForce(chrono::ChVector3d(0, 0, 0));
+                continue;
+            }
             _xyzNodes[i]->SetForce(_loads[i]);
+        }
         return;
     }
     for (std::size_t i = 0; i < _nodes.size(); ++i)
         _nodes[i]->SetForce(_loads[i]);
+}
+
+void Part::enforceRigidNodes() {
+    for (std::size_t i = 0; i < _xyzNodes.size(); ++i) {
+        if (i < _rigidNode.size() && _rigidNode[i] && _xyzNodes[i]) {
+            _xyzNodes[i]->SetFixed(true);
+            _xyzNodes[i]->SetPosDt(chrono::ChVector3d(0, 0, 0));
+        }
+    }
 }
 
 double Part::thermalStrain() const {
@@ -486,7 +545,11 @@ void Part::setHeatActive(std::size_t index, bool active) {
 }
 
 void Part::setThermalCurvature(double kappa) {
+    if (std::abs(kappa - _prescribedThermalKur) > 1.0e-12)
+        _thermalLoadChanged = true;
     _prescribedThermalKur = kappa;
+    if (std::abs(kappa) > 1.0e-12)
+        _thermalPrestress = true;
     if (_elasticity)
         _elasticity->SetThermalCurvature(kappa);
     for (QuadThermal& slot : _quadThermal) {
@@ -517,7 +580,9 @@ std::shared_ptr<chrono::fea::ChMaterialShellReissner> Part::makeQuadMaterial(std
         elasticity, _material.dampingBeta);
     std::shared_ptr<ReissnerJ2> plasticity;
     if (_material.allowPlasticity && _material.yieldStress > 0.0)
-        plasticity = chrono_types::make_shared<ReissnerJ2>(_material.yieldStress, _material.youngsModulus);
+        plasticity = chrono_types::make_shared<ReissnerJ2>(
+            _material.yieldStress, _material.youngsModulus, _material.ultimateStress,
+            _material.failPlasticStrain);
     auto material = chrono_types::make_shared<ChMaterialShellReissner>(
         elasticity, plasticity, damping);
     material->SetDensity(_material.density);
@@ -659,21 +724,6 @@ void Part::syncThermalMechanics() {
         const double factor = std::max(0.5, 1.0 + alpha * (kelvin - t0));
         if (std::abs(factor - shard.thermalFactor) < 1.0e-5)
             continue;
-        // #region agent log
-        {
-            static int thermalLogs = 0;
-            if (thermalLogs < 30) {
-                ++thermalLogs;
-                std::ofstream dbg("c:/Users/nirav/Documents/Projects/Robot Sim/robot_combat_sim/debug-b58308.log",
-                                  std::ios::app);
-                if (dbg)
-                    dbg << "{\"sessionId\":\"b58308\",\"hypothesisId\":\"C\",\"location\":\"part.cpp:syncThermal\","
-                           "\"message\":\"shard thermal resize\",\"data\":{\"asleep\":"
-                        << (shard.asleep ? 1 : 0) << ",\"kelvin\":" << kelvin << ",\"factor\":" << factor
-                        << ",\"prev\":" << shard.thermalFactor << "},\"timestamp\":0}\n";
-            }
-        }
-        // #endregion
         double rest = 0.0;
         for (const auto& offset : shard.localRest)
             rest += offset.Length2();
@@ -727,6 +777,18 @@ void Part::syncThermalMechanics() {
         _triangleThermal[s]->setThermalStrain(alphaScale * ((strainKelvin / count) - t0));
         _triangleThermal[s]->setScales(thermalStiffnessRetention(_material, nodeKelvin / count),
                                        thermalStrengthRetention(_material, nodeKelvin / count));
+    }
+
+    double stamp = thermalKur;
+    _thermalPrestress = std::abs(thermalKur) > 1.0e-12;
+    for (std::size_t n = 0; n < _strainTemperature.size(); ++n) {
+        stamp += strainTemperature(n);
+        if (std::abs(strainTemperature(n) - t0) > 0.05)
+            _thermalPrestress = true;
+    }
+    if (std::abs(stamp - _thermalStamp) > 1.0e-4) {
+        _thermalLoadChanged = true;
+        _thermalStamp = stamp;
     }
 }
 
@@ -905,8 +967,23 @@ void Part::evaluateStress(std::vector<float>& out) const {
         out[q] = static_cast<float>(fiber.vonMises * scale);
     }
 
-    if (!_quads.empty() || _triangles.empty())
+    double tetPeak = 0.0;
+    for (std::size_t t = 0; t < _tetElements.size(); ++t) {
+        if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+            continue;
+        const double scale = thermalStiffnessRetention(_material, _temperature);
+        tetPeak = std::max(tetPeak, _tetElements[t]->vonMises() * scale);
+    }
+    if (!_quads.empty()) {
+        if (!out.empty() && tetPeak > 0.0)
+            out[0] = std::max(out[0], static_cast<float>(tetPeak));
         return;
+    }
+    if (_triangles.empty()) {
+        if (tetPeak > 0.0)
+            out.assign(1, static_cast<float>(tetPeak));
+        return;
+    }
 
     out.assign(_triangles.size(), 0.0f);
     std::map<std::array<int, 3>, std::size_t> faceHost;
@@ -1002,59 +1079,129 @@ void Part::discardTrial() {
             tet->discardTrial();
 }
 
+void Part::commitPlastic() {
+    for (const auto& tet : _tetElements)
+        if (tet)
+            tet->commitPlastic();
+}
+
+void Part::refreshTetTrials() {
+    if (_tetElements.empty() || _tets.empty())
+        return;
+    chrono::ChVectorDynamic<> fi(12);
+    fi.setZero();
+    for (std::size_t t = 0; t < _tetElements.size() && t < _tets.size(); ++t) {
+        if (!_tetElements[t])
+            continue;
+        const auto& corners = _tets[t];
+        chrono::ChVector3d p[4];
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) {
+            if (corners[static_cast<std::size_t>(k)] < 0) {
+                ok = false;
+                break;
+            }
+            p[k] = nodePosition(static_cast<std::size_t>(corners[static_cast<std::size_t>(k)]));
+            if (!std::isfinite(p[k].x()) || !std::isfinite(p[k].y()) || !std::isfinite(p[k].z())) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        const double vol = (p[1] - p[0]).Dot((p[2] - p[0]).Cross(p[3] - p[0])) / 6.0;
+        if (vol <= 1.0e-12)
+            continue;
+        _tetElements[t]->ComputeInternalForces(fi);
+    }
+}
+
+void Part::setImpactStep(double h) {
+    for (const auto& tet : _tetElements)
+        if (tet)
+            tet->setImpactStep(h);
+}
+
 void Part::captureKinematics() {
-    _savedPos.clear();
-    _savedVel.clear();
+    const std::size_t n = nodeCount();
+    _savedPos.resize(n);
+    _savedVel.resize(n);
+    _savedAcc.resize(n);
     _savedRot.clear();
     _savedRotDt.clear();
-    if (!_xyzNodes.empty()) {
-        _savedPos.reserve(_xyzNodes.size());
-        _savedVel.reserve(_xyzNodes.size());
-        for (const auto& node : _xyzNodes) {
-            if (!node)
-                continue;
-            _savedPos.push_back(node->GetPos());
-            _savedVel.push_back(node->GetPosDt());
-        }
-        return;
+    _savedAngAcc.clear();
+    for (std::size_t i = 0; i < n; ++i) {
+        _savedPos[i] = nodePosition(i);
+        _savedVel[i] = nodeVelocity(i);
+        if (!_xyzNodes.empty() && i < _xyzNodes.size() && _xyzNodes[i])
+            _savedAcc[i] = _xyzNodes[i]->GetPosDt2();
+        else if (i < _nodes.size() && _nodes[i])
+            _savedAcc[i] = _nodes[i]->GetPosDt2();
+        else
+            _savedAcc[i] = {0, 0, 0};
     }
-    _savedPos.reserve(_nodes.size());
-    _savedVel.reserve(_nodes.size());
-    _savedRot.reserve(_nodes.size());
-    _savedRotDt.reserve(_nodes.size());
-    for (const auto& node : _nodes) {
-        if (!node)
-            continue;
-        _savedPos.push_back(node->GetPos());
-        _savedVel.push_back(node->GetPosDt());
-        _savedRot.push_back(node->GetRot());
-        _savedRotDt.push_back(node->GetRotDt());
+    if (_xyzNodes.empty()) {
+        _savedRot.resize(n);
+        _savedRotDt.resize(n);
+        _savedAngAcc.resize(n);
+        for (std::size_t i = 0; i < n && i < _nodes.size(); ++i) {
+            if (!_nodes[i])
+                continue;
+            _savedRot[i] = _nodes[i]->GetRot();
+            _savedRotDt[i] = _nodes[i]->GetRotDt();
+            _savedAngAcc[i] = _nodes[i]->GetAngAccLocal();
+        }
     }
 }
 
 void Part::restoreKinematics() {
+    const std::size_t n = nodeCount();
+    for (std::size_t i = 0; i < n && i < _savedPos.size(); ++i) {
+        const chrono::ChVector3d vel = i < _savedVel.size() ? _savedVel[i] : nodeVelocity(i);
+        setNodeKinematics(i, _savedPos[i], vel);
+        const chrono::ChVector3d acc = i < _savedAcc.size() ? _savedAcc[i] : chrono::ChVector3d(0, 0, 0);
+        if (!_xyzNodes.empty()) {
+            if (i < _xyzNodes.size() && _xyzNodes[i] && !_xyzNodes[i]->IsFixed())
+                _xyzNodes[i]->SetPosDt2(acc);
+        } else if (i < _nodes.size() && _nodes[i] && !_nodes[i]->IsFixed()) {
+            _nodes[i]->SetPosDt2(acc);
+            if (i < _savedRot.size())
+                _nodes[i]->SetRot(_savedRot[i]);
+            if (i < _savedRotDt.size())
+                _nodes[i]->SetRotDt(_savedRotDt[i]);
+            if (i < _savedAngAcc.size())
+                _nodes[i]->SetAngAccLocal(_savedAngAcc[i]);
+        }
+    }
+}
+
+void Part::bakeRest() {
     if (!_xyzNodes.empty()) {
-        std::size_t i = 0;
         for (auto& node : _xyzNodes) {
-            if (!node || i >= _savedPos.size())
-                continue;
-            node->SetPos(_savedPos[i]);
-            node->SetPosDt(_savedVel[i]);
-            ++i;
+            if (node)
+                node->SetX0(node->GetPos());
+        }
+        for (const auto& tet : _tetElements) {
+            if (tet)
+                tet->refreshRest();
         }
         return;
     }
-    std::size_t i = 0;
     for (auto& node : _nodes) {
-        if (!node || i >= _savedPos.size())
+        if (!node)
             continue;
-        node->SetPos(_savedPos[i]);
-        node->SetPosDt(_savedVel[i]);
-        if (i < _savedRot.size())
-            node->SetRot(_savedRot[i]);
-        if (i < _savedRotDt.size())
-            node->SetRotDt(_savedRotDt[i]);
-        ++i;
+        node->SetX0(node->Frame());
+        node->ForceToRest();
+    }
+    if (_mesh) {
+        for (const auto& element : _elements) {
+            if (element)
+                _mesh->InitializeElement(element);
+        }
+        for (const auto& element : _trianglesElements) {
+            if (element)
+                _mesh->InitializeElement(element);
+        }
     }
 }
 
@@ -1099,8 +1246,6 @@ bool Part::finite() const {
         const auto v = nodeVelocity(i);
         if (!std::isfinite(v.x()) || !std::isfinite(v.y()) || !std::isfinite(v.z()))
             return false;
-        // A kilometre a second is past any combat impact this engine models.
-        // Positions-only let Rankine shatter keep a 1e6 m/s trial velocity.
         if (v.Length() > 1.0e3)
             return false;
     }
@@ -1121,6 +1266,34 @@ chrono::ChVector3d Part::nodeVelocity(std::size_t index) const {
     if (!_xyzNodes.empty())
         return index < _xyzNodes.size() ? _xyzNodes[index]->GetPosDt() : chrono::ChVector3d(0, 0, 0);
     return index < _nodes.size() ? _nodes[index]->GetPosDt() : chrono::ChVector3d(0, 0, 0);
+}
+
+chrono::ChVector3d Part::savedPosition(std::size_t index) const {
+    if (index < _savedPos.size())
+        return _savedPos[index];
+    return nodePosition(index);
+}
+
+chrono::ChVector3d Part::savedVelocity(std::size_t index) const {
+    if (index < _savedVel.size())
+        return _savedVel[index];
+    return nodeVelocity(index);
+}
+
+void Part::setNodeKinematics(std::size_t index,
+                             const chrono::ChVector3d& pos,
+                             const chrono::ChVector3d& vel) {
+    if (!_xyzNodes.empty()) {
+        if (index >= _xyzNodes.size() || !_xyzNodes[index] || _xyzNodes[index]->IsFixed())
+            return;
+        _xyzNodes[index]->SetPos(pos);
+        _xyzNodes[index]->SetPosDt(vel);
+        return;
+    }
+    if (index >= _nodes.size() || !_nodes[index] || _nodes[index]->IsFixed())
+        return;
+    _nodes[index]->SetPos(pos);
+    _nodes[index]->SetPosDt(vel);
 }
 
 chrono::ChVector3d Part::nodeRest(std::size_t index) const {
@@ -1232,22 +1405,25 @@ void Part::evaluatePlasticStrain(std::vector<float>& out) const {
                 out[t] = static_cast<float>(_tetElements[tet]->plasticStrain());
         }
     }
-    float tetPeak = 0.0f;
-    for (const auto& tet : _tetElements) {
-        if (tet)
-            tetPeak = std::max(tetPeak, static_cast<float>(tet->plasticStrain()));
-    }
-    if (tetPeak > 0.0f) {
-        if (out.empty())
-            out.push_back(tetPeak);
-        else
-            out[0] = std::max(out[0], tetPeak);
+    if (!_tetElements.empty()) {
+        const std::size_t base = out.size();
+        out.resize(base + _tetElements.size(), 0.0f);
+        for (std::size_t tet = 0; tet < _tetElements.size(); ++tet) {
+            if (_tetElements[tet])
+                out[base + tet] = static_cast<float>(_tetElements[tet]->plasticStrain());
+        }
     }
     for (std::size_t s = 0; s < _triangleThermal.size(); ++s) {
         const std::size_t tri = static_cast<std::size_t>(_skinTriangles) + s;
         if (tri < out.size() && _triangleThermal[s])
             out[tri] = static_cast<float>(_triangleThermal[s]->plastic());
     }
+}
+
+double Part::tetPlasticStrain(std::size_t index) const {
+    if (index >= _tetElements.size() || !_tetElements[index])
+        return 0.0;
+    return _tetElements[index]->plasticStrain();
 }
 
 int Part::cloneNode(int original) {
@@ -1345,14 +1521,13 @@ int Part::insertMidpoint(int a, int b) {
 }
 
 void Part::detachQuad(std::size_t quad) {
-    if (quad >= _quads.size() || quad >= _elements.size())
+    if (quad >= _quads.size())
         return;
-    int cloned[4];
-    for (int i = 0; i < 4; ++i)
-        cloned[i] = cloneNode(_quads[quad][static_cast<std::size_t>(i)]);
-    _elements[quad]->SetNodes(_nodes[cloned[0]], _nodes[cloned[1]], _nodes[cloned[2]], _nodes[cloned[3]]);
-    _mesh->InitializeElement(_elements[quad]);
-    _quads[quad] = {cloned[0], cloned[1], cloned[2], cloned[3]};
+    isolateQuad(static_cast<int>(quad));
+    if (quad < _elements.size() && _elements[quad]) {
+        _mesh->RemoveElement(_elements[quad]);
+        _elements[quad].reset();
+    }
 }
 
 bool Part::splitQuad(std::size_t quad, bool alongU) {
@@ -1509,13 +1684,84 @@ bool Part::discardAwakeShards() {
     return true;
 }
 
-void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChVector3d& arenaSize) {
+void Part::sanitizeShards() {
+    auto write = [&](std::size_t index, const chrono::ChVector3d& pos, const chrono::ChVector3d& vel) {
+        if (!_xyzNodes.empty()) {
+            if (index >= _xyzNodes.size() || !_xyzNodes[index])
+                return;
+            _xyzNodes[index]->SetPos(pos);
+            _xyzNodes[index]->SetPosDt(vel);
+            return;
+        }
+        if (index >= _nodes.size() || !_nodes[index])
+            return;
+        _nodes[index]->SetPos(pos);
+        _nodes[index]->SetPosDt(vel);
+    };
+    auto finiteVec = [](const chrono::ChVector3d& v) {
+        return std::isfinite(v.x()) && std::isfinite(v.y()) && std::isfinite(v.z()) && v.Length() <= 1.0e3;
+    };
+    auto sanitizeNode = [&](std::size_t index) {
+        chrono::ChVector3d p = nodePosition(index);
+        chrono::ChVector3d v = nodeVelocity(index);
+        if (finiteVec(p) && finiteVec(v))
+            return;
+        p = nodeRest(index);
+        if (!finiteVec(p))
+            p = {0, 0, 0};
+        write(index, p, {0, 0, 0});
+    };
+    for (std::size_t i = 0; i < nodeCount(); ++i)
+        sanitizeNode(i);
+    for (auto& shard : _shards) {
+        if (finiteVec(shard.com) && finiteVec(shard.velocity) && finiteVec(shard.angularVelocity))
+            continue;
+        chrono::ChVector3d com{0, 0, 0};
+        int corners = 0;
+        for (int k = 0; k < 4; ++k) {
+            const int node = shard.nodes[static_cast<std::size_t>(k)];
+            if (node < 0)
+                continue;
+            const chrono::ChVector3d p = savedPosition(static_cast<std::size_t>(node));
+            if (finiteVec(p)) {
+                com += p;
+                ++corners;
+            }
+        }
+        if (corners > 0)
+            shard.com = com / static_cast<double>(corners);
+        else if (!finiteVec(shard.com))
+            shard.com = {0, 0, 0};
+        shard.velocity = {0, 0, 0};
+        shard.angularVelocity = {0, 0, 0};
+        shard.asleep = true;
+        for (int k = 0; k < 4; ++k) {
+            const int node = shard.nodes[static_cast<std::size_t>(k)];
+            if (node < 0)
+                continue;
+            const chrono::ChVector3d arm = shard.rotation.Rotate(shard.local[static_cast<std::size_t>(k)]);
+            write(static_cast<std::size_t>(node), shard.com + arm, {0, 0, 0});
+        }
+    }
+}
+
+void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChVector3d& arenaSize,
+                       const chrono::ChVector3d& gravity, double restitution, double friction) {
     using namespace chrono;
     // A chip rests on the same surface as the body it came off.
     const double plane = floorHeight + contactOffset();
     const ChVector3d up{0, 1, 0};
-    constexpr double kFriction = 0.55;
+    const double mu = std::max(0.0, friction);
+    const double e = std::clamp(restitution, 0.0, 1.0);
+    const bool noBodyForce = !floorEnabled && gravity.Length2() < 0.01;
     for (auto& shard : _shards) {
+        if (!shard.asleep && noBodyForce && shard.mass > 0.0) {
+            // No floor and no gravity: leftover Newton velocity would walk a
+            // chip to y → −∞. The chip has already left the live solve.
+            shard.velocity = {0, 0, 0};
+            shard.angularVelocity = {0, 0, 0};
+            shard.asleep = true;
+        }
         if (!shard.asleep && floorEnabled && shard.mass > 0.0) {
             auto cornerAt = [&](int k) {
                 return shard.com + shard.rotation.Rotate(shard.local[static_cast<std::size_t>(k)]);
@@ -1529,13 +1775,17 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
                 spin.z() += moment.z() / std::max(shard.inertiaN, 1.0e-9);
                 shard.angularVelocity = shard.rotation.Rotate(spin);
             };
+            double size = 0.0;
+            for (int k = 0; k < 4; ++k)
+                size = std::max(size, shard.local[static_cast<std::size_t>(k)].Length());
+            const double skin = std::max({contactOffset(), contactSkin(), size * 0.05, 1.0e-4});
             // The floor pushes at the corner that is actually touching, so a
             // chip on its tip topples instead of being glued there.
             for (int pass = 0; pass < 4; ++pass) {
                 for (int k = 0; k < 4; ++k) {
                     const ChVector3d point = cornerAt(k);
                     const double pen = plane - point.y();
-                    if (pen <= 1.0e-4)
+                    if (pen <= 0.0)
                         continue;
                     const ChVector3d arm = point - shard.com;
                     const ChVector3d rxn = arm.Cross(up);
@@ -1548,17 +1798,17 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
                     if (eff < 1.0e-12)
                         continue;
                     const double vn = (shard.velocity + shard.angularVelocity.Cross(arm)).Dot(up);
-                    const double bias = std::min(std::max(0.0, pen - 1.0e-4) * 30.0, 1.0);
-                    const double j = -(vn + bias) / eff;
+                    const double bias = std::min(pen / skin, 1.0);
+                    const double j = vn < 0.0 ? -((1.0 + e) * vn + bias) / eff : -bias / eff;
                     if (j <= 0.0)
                         continue;
-                    const double limited = std::min(j, shard.mass * 20.0);
+                    const double limited = std::min(j, shard.mass * std::max(1.0, std::abs(vn) + bias));
                     applyImpulse(up * limited, arm);
                     ChVector3d tangent = shard.velocity + shard.angularVelocity.Cross(arm);
                     tangent.y() = 0.0;
                     const double slide = tangent.Length();
-                    if (slide > 1.0e-6) {
-                        const double jf = std::min(kFriction * limited, slide * shard.mass);
+                    if (slide > 1.0e-6 && mu > 0.0) {
+                        const double jf = std::min(mu * limited, slide * shard.mass);
                         applyImpulse(tangent * (-jf / slide), arm);
                     }
                 }
@@ -1567,98 +1817,17 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
             double lowest = std::numeric_limits<double>::max();
             for (int k = 0; k < 4; ++k)
                 lowest = std::min(lowest, cornerAt(k).y());
-            // A glass chip is a flat quad, so any triangle of it is the face.
-            // A melted tetrahedron has four faces, and the one on the floor is
-            // the one whose centroid is lowest, not corners 0, 1 and 3.
-            const int faces[4][3] = {{0, 1, 2}, {0, 1, 3}, {0, 2, 3}, {1, 2, 3}};
-            int support = 0;
-            ChVector3d normal = up;
-            double bestCentroid = std::numeric_limits<double>::max();
-            for (const auto& face : faces) {
-                const ChVector3d a = cornerAt(face[0]);
-                const ChVector3d b = cornerAt(face[1]);
-                const ChVector3d c = cornerAt(face[2]);
-                const double centroid = (a.y() + b.y() + c.y()) / 3.0;
-                if (centroid >= bestCentroid)
-                    continue;
-                bestCentroid = centroid;
-                ChVector3d n = (b - a).Cross(c - a);
-                if (n.Length() > 1.0e-12)
-                    n.Normalize();
-                else
-                    n = up;
-                if (n.y() < 0.0)
-                    n = -n;
-                normal = n;
-                support = 0;
-                for (int corner : face)
-                    if (cornerAt(corner).y() <= plane + 1.5e-3)
-                        ++support;
-            }
-            // Three corners of that face on the plane means it is down. A tip
-            // or an edge is not a resting pose. A lump that is already slow
-            // and supported is left where it lies instead of being kicked
-            // over every frame.
-            const bool slow = shard.velocity.Length() < 0.08 && shard.angularVelocity.Length() < 1.0;
-            const bool faceDown = support >= 3 && normal.y() > 0.85;
-            // #region agent log
-            {
-                static int settleLogs = 0;
-                const bool willSleep = support >= 3 && slow;
-                if (settleLogs < 40 && (willSleep || settleLogs < 12 || shard.asleep)) {
-                    ++settleLogs;
-                    std::ofstream dbg("c:/Users/nirav/Documents/Projects/Robot Sim/robot_combat_sim/debug-b58308.log",
-                                      std::ios::app);
-                    if (dbg)
-                        dbg << "{\"sessionId\":\"b58308\",\"hypothesisId\":\"A\",\"location\":\"part.cpp:finishShards\","
-                               "\"message\":\"shard settle\",\"data\":{\"support\":"
-                            << support << ",\"slow\":" << (slow ? 1 : 0) << ",\"faceDown\":" << (faceDown ? 1 : 0)
-                            << ",\"asleep\":" << (shard.asleep ? 1 : 0) << ",\"speed\":" << shard.velocity.Length()
-                            << ",\"spin\":" << shard.angularVelocity.Length() << ",\"ny\":" << normal.y()
-                            << ",\"lowest\":" << lowest << ",\"y\":" << shard.com.y()
-                            << "},\"timestamp\":0}\n";
-                }
-            }
-            // #endregion
-            // On the floor is the end of the chip. A face-down check never
-            // arrives: floor contact keeps a tetrahedron spinning, so it
-            // would stay in the shard loop for the rest of the run.
-            if (lowest <= plane + 1.5e-3) {
+            if (lowest < plane)
+                shard.com.y() += plane - lowest;
+            const double gAbs = std::abs(gravity.y());
+            const double vSleep = std::sqrt(std::max(gAbs, 1.0e-6) * skin);
+            const double wSleep = vSleep / skin;
+            const bool slow = shard.velocity.Length() < 0.25 * vSleep &&
+                              shard.angularVelocity.Length() < 0.25 * wSleep;
+            if (slow && lowest <= plane + skin) {
                 shard.velocity = {0, 0, 0};
                 shard.angularVelocity = {0, 0, 0};
                 shard.asleep = true;
-                if (lowest < plane)
-                    shard.com.y() += plane - lowest;
-            } else if (support >= 3 && slow) {
-                shard.velocity = {0, 0, 0};
-                shard.angularVelocity = {0, 0, 0};
-                shard.asleep = true;
-                if (lowest < plane)
-                    shard.com.y() += plane - lowest;
-            } else if (!faceDown && support > 0 && normal.y() < 0.75 &&
-                       shard.angularVelocity.Length() < 0.4) {
-                // #region agent log
-                {
-                    static int kickLogs = 0;
-                    if (kickLogs < 12) {
-                        ++kickLogs;
-                        std::ofstream dbg("c:/Users/nirav/Documents/Projects/Robot Sim/robot_combat_sim/debug-b58308.log",
-                                          std::ios::app);
-                        if (dbg)
-                            dbg << "{\"sessionId\":\"b58308\",\"hypothesisId\":\"F\",\"location\":\"part.cpp:finishShards\","
-                                   "\"message\":\"shard kick\",\"data\":{\"support\":"
-                                << support << ",\"ny\":" << normal.y() << ",\"speed\":" << shard.velocity.Length()
-                                << ",\"spin\":" << shard.angularVelocity.Length() << ",\"y\":" << shard.com.y()
-                                << "},\"timestamp\":0}\n";
-                    }
-                }
-                // #endregion
-                const ChVector3d axis = up.Cross(normal);
-                const double len = axis.Length();
-                (void)len;
-                (void)axis;
-            } else if (lowest < plane - 0.02) {
-                shard.com.y() += (plane - 0.002) - lowest;
             }
 
             const double hx = std::max(0.5, arenaSize.x() * 0.5);
@@ -1697,7 +1866,7 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
                         tangent -= wallNormal[w] * tangent.Dot(wallNormal[w]);
                         const double slide = tangent.Length();
                         if (slide > 1.0e-6) {
-                            const double jf = std::min(kFriction * limited, slide * shard.mass);
+                            const double jf = std::min(mu * limited, slide * shard.mass);
                             applyImpulse(tangent * (-jf / slide), arm);
                         }
                     }
@@ -1709,7 +1878,8 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
             const ChVector3d arm = shard.rotation.Rotate(shard.local[static_cast<std::size_t>(k)]);
             const ChVector3d pos = shard.com + arm;
             const ChVector3d vel = shard.velocity + shard.angularVelocity.Cross(arm);
-            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()))
+            if (!std::isfinite(pos.x()) || !std::isfinite(pos.y()) || !std::isfinite(pos.z()) ||
+                !std::isfinite(vel.x()) || !std::isfinite(vel.y()) || !std::isfinite(vel.z()))
                 continue;
             if (index < _xyzNodes.size() && _xyzNodes[index]) {
                 _xyzNodes[index]->SetPos(pos);
@@ -1727,8 +1897,9 @@ void Part::finishShards(bool floorEnabled, double floorHeight, const chrono::ChV
             node->SetX0(node->Frame());
         }
     }
-    // A chip that has landed is scenery. Drop it so later steps do not
-    // integrate, contact, or thermally resize it.
+    sanitizeShards();
+    // A chip that has actually come to rest is scenery. It is only marked
+    // asleep after its speed dies, so a first floor touch still bounces.
     _shards.erase(std::remove_if(_shards.begin(), _shards.end(),
                                  [](const RigidShard& shard) { return shard.asleep || shard.mass <= 0.0; }),
                   _shards.end());
@@ -1856,6 +2027,19 @@ void Part::releaseShard(int quadIndex) {
         _rigidNode.resize(_nodes.size(), 0);
     for (int k = 0; k < 4; ++k) {
         const int index = quad[static_cast<std::size_t>(k)];
+        bool shared = false;
+        for (std::size_t q = 0; q < _quads.size() && !shared; ++q) {
+            if (static_cast<int>(q) == quadIndex)
+                continue;
+            if (q < _rigidQuad.size() && _rigidQuad[q])
+                continue;
+            if (q >= _elements.size() || !_elements[q])
+                continue;
+            for (int corner : _quads[q])
+                shared = shared || corner == index;
+        }
+        if (shared)
+            continue;
         auto& node = _nodes[static_cast<std::size_t>(index)];
         node->SetX0(node->Frame());
         node->SetFixed(true);
@@ -1915,45 +2099,77 @@ void Part::promoteLooseFragments(bool moltenOnly) {
     // A free fragment of any size leaves the shell solve. Cutting stops at
     // 64 shards so a face cannot become a thousand-body contact problem;
     // pieces already free are still released, just not subdivided further.
-    constexpr int kMaxShards = 64;
+    constexpr int kMaxShards = 128;
     const double minEdge = _material.minimumShardSize > 1.0e-4 ? _material.minimumShardSize : 0.02;
 
-    for (const auto& group : groups) {
+    struct LiveGroup {
         std::vector<int> quads;
         bool anchored = false;
+    };
+    std::vector<LiveGroup> liveGroups;
+    liveGroups.reserve(groups.size());
+    for (const auto& group : groups) {
+        LiveGroup live;
         for (int quadIndex : group.second) {
             if (quadIndex < 0 || _rigidQuad[static_cast<std::size_t>(quadIndex)])
                 continue;
-            quads.push_back(quadIndex);
+            live.quads.push_back(quadIndex);
             const auto& quad = _quads[static_cast<std::size_t>(quadIndex)];
             for (int k = 0; k < 4; ++k) {
                 const int index = quad[static_cast<std::size_t>(k)];
                 if (index < 0 || static_cast<std::size_t>(index) >= _nodes.size()) {
-                    anchored = true;
+                    live.anchored = true;
                     continue;
                 }
                 const bool linked =
                     static_cast<std::size_t>(index) < _linked.size() && _linked[static_cast<std::size_t>(index)];
-                anchored = anchored || _nodes[static_cast<std::size_t>(index)]->IsFixed() || linked;
+                live.anchored = live.anchored || _nodes[static_cast<std::size_t>(index)]->IsFixed() || linked;
             }
         }
-        // A clamped corner or a live weld is still part of the plate.
-        if (quads.empty() || anchored)
+        if (live.quads.empty())
             continue;
-        if (moltenOnly) {
+        liveGroups.push_back(std::move(live));
+    }
+
+    for (auto& live : liveGroups) {
+        std::vector<int>& quads = live.quads;
+        (void)live.anchored;
+
+        auto quadMolten = [&](int quadIndex) {
             double kelvin = 0.0;
             int samples = 0;
-            for (int quadIndex : quads) {
-                for (int corner : _quads[static_cast<std::size_t>(quadIndex)]) {
-                    if (corner < 0)
-                        continue;
-                    kelvin += nodeTemperature(static_cast<std::size_t>(corner));
-                    ++samples;
-                }
+            for (int corner : _quads[static_cast<std::size_t>(quadIndex)]) {
+                if (corner < 0)
+                    continue;
+                kelvin += nodeTemperature(static_cast<std::size_t>(corner));
+                ++samples;
             }
-            if (samples == 0 || kelvin / samples < _material.meltTemperature)
+            return samples > 0 && kelvin / samples >= _material.meltTemperature;
+        };
+
+        std::vector<int> failed;
+        failed.reserve(quads.size());
+        for (int quadIndex : quads) {
+            if (quadIndex < 0 || static_cast<std::size_t>(quadIndex) >= _quads.size())
                 continue;
+            const bool rigid = static_cast<std::size_t>(quadIndex) < _rigidQuad.size() &&
+                               _rigidQuad[static_cast<std::size_t>(quadIndex)];
+            const bool liveElem = static_cast<std::size_t>(quadIndex) < _elements.size() &&
+                                  _elements[static_cast<std::size_t>(quadIndex)];
+            const bool molten = quadMolten(quadIndex);
+            if (moltenOnly) {
+                if (molten)
+                    failed.push_back(quadIndex);
+                continue;
+            }
+            if (molten)
+                failed.push_back(quadIndex);
+            else if ((rigid || !liveElem) && _material.fracture == FractureMode::Brittle)
+                failed.push_back(quadIndex);
         }
+        if (failed.empty())
+            continue;
+        quads.swap(failed);
 
         bool splitting = !moltenOnly;
         while (splitting) {
@@ -2000,12 +2216,11 @@ void Part::promoteLooseFragments(bool moltenOnly) {
 }
 
 bool Part::shatterQuads() {
+    using chrono::ChVector3d;
     if (_fixed || _elements.empty() || _material.fractureStrength <= 0.0)
         return false;
 
     const double minEdge = _material.minimumShardSize > 1.0e-4 ? _material.minimumShardSize : 0.02;
-    const int budget = _material.shatterToDust ? 24 : 4;
-    const double toughness = _material.fractureToughness;
 
     struct Candidate {
         std::size_t quad = 0;
@@ -2035,13 +2250,12 @@ bool Part::shatterQuads() {
         }
         kelvin = corners ? kelvin / corners : _initialTemperature;
         const double strength = _material.fractureStrength * thermalStrengthRetention(_material, kelvin);
-        const double modulus = _material.youngsModulus * thermalStiffnessRetention(_material, kelvin);
-        const double gc = (modulus > 0.0 && toughness > 0.0) ? toughness * toughness / modulus : 0.0;
         const double longest = std::max(fiber.edgeU, fiber.edgeV);
-        const double crackLength = std::max(minEdge, std::min(fiber.edgeU, fiber.edgeV));
-        const double crackArea = crackLength * _thickness;
-        const bool energyOk = gc <= 0.0 || fiber.energy >= gc * crackArea;
-        const bool over = fiber.tension >= strength && energyOk;
+        // Handbook Rankine already includes typical flaw size. Requiring a
+        // Griffith energy as well left 12×-overstrength panes sitting in the
+        // floor: G_c·A is not a second gate on σ_t.
+        const double crackArea = std::max(fiber.edgeU, fiber.edgeV) * std::max(_thickness, 1.0e-6);
+        const bool over = fiber.tension >= strength && energyAllowsOpening(_material, fiber.energy, crackArea);
         const bool dust = _material.shatterToDust && _shattering && longest > minEdge;
         if (!over && !dust)
             continue;
@@ -2052,12 +2266,10 @@ bool Part::shatterQuads() {
     std::sort(candidates.begin(), candidates.end(),
               [](const Candidate& a, const Candidate& b) { return a.tension > b.tension; });
 
-    int live = 0;
-    for (std::size_t q = 0; q < _elements.size() && q < _quads.size(); ++q) {
-        if (_elements[q] && (q >= _rigidQuad.size() || !_rigidQuad[q]))
-            ++live;
-    }
-
+    // Rankine-failed elements leave the live shell this step. A 4-quad peel
+    // plus an 8% contact remnant is what left a 12×-overstrength pane sitting
+    // in the floor and pinning whatever was welded to it.
+    const int budget = std::min(128, std::max(1, static_cast<int>(candidates.size())));
     bool changed = false;
     int made = 0;
     for (const Candidate& candidate : candidates) {
@@ -2065,25 +2277,41 @@ bool Part::shatterQuads() {
             break;
         if (candidate.quad >= _quads.size())
             continue;
-        const double longest = std::max(candidate.edgeU, candidate.edgeV);
-        const double shortest = std::min(candidate.edgeU, candidate.edgeV);
-        const double aspect = shortest > 1.0e-9 ? longest / shortest : 1.0;
-        if (longest < minEdge || aspect > 8.0) {
-            if (!candidate.over && longest < minEdge)
-                continue;
-            detachQuad(candidate.quad);
-        } else if (live >= 48) {
-            // Further cracks leave the shell instead of refining it.
+        if (candidate.over) {
             detachQuad(candidate.quad);
         } else {
-            // A needle is cut across its long side. Rankine still chooses
-            // the direction while the quad is roughly square.
-            // Always bisect the long edge. Rankine still picks which quads
-            // fail; cutting the short edge is what made 35:1 needles.
-            const bool alongU = candidate.edgeV >= candidate.edgeU;
-            if (!splitQuad(candidate.quad, alongU))
-                continue;
-            ++live;
+            const double longest = std::max(candidate.edgeU, candidate.edgeV);
+            const double shortest = std::min(candidate.edgeU, candidate.edgeV);
+            const double aspect = shortest > 1.0e-9 ? longest / shortest : 1.0;
+            if (longest < minEdge || aspect > 8.0)
+                detachQuad(candidate.quad);
+            else {
+                bool alongU = candidate.edgeV >= candidate.edgeU;
+                if ((_material.breakFabric == BreakFabric::Grain || !_material.plies.empty()) &&
+                    candidate.quad < _quads.size()) {
+                    const auto& quad = _quads[candidate.quad];
+                    bool finiteQuad = true;
+                    for (int node : quad)
+                        finiteQuad = finiteQuad && node >= 0 && static_cast<std::size_t>(node) < _nodes.size();
+                    if (finiteQuad) {
+                        const ChVector3d u = _nodes[static_cast<std::size_t>(quad[1])]->GetPos() -
+                                             _nodes[static_cast<std::size_t>(quad[0])]->GetPos();
+                        const ChVector3d v = _nodes[static_cast<std::size_t>(quad[3])]->GetPos() -
+                                             _nodes[static_cast<std::size_t>(quad[0])]->GetPos();
+                        ChVector3d fiber(_material.grainDirection[0], _material.grainDirection[1],
+                                         _material.grainDirection[2]);
+                        if (!_material.plies.empty())
+                            fiber = {_material.plies.front().direction[0], _material.plies.front().direction[1],
+                                     _material.plies.front().direction[2]};
+                        if (fiber.Length2() > 0.25 && u.Length2() > 1.0e-12 && v.Length2() > 1.0e-12) {
+                            fiber.Normalize();
+                            alongU = std::abs(u.GetNormalized().Dot(fiber)) >= std::abs(v.GetNormalized().Dot(fiber));
+                        }
+                    }
+                }
+                if (!splitQuad(candidate.quad, alongU))
+                    continue;
+            }
         }
         changed = true;
         _shattering = true;
@@ -2091,24 +2319,27 @@ bool Part::shatterQuads() {
     }
     if (changed) {
         promoteLooseFragments();
+        freezeUnusedNodes();
         rebuildTrianglesFromQuads();
     }
     return changed;
 }
 
 bool Part::tearFailed() {
+    using chrono::ChVector3d;
     for (const auto& tet : _tetElements)
         if (tet)
             tet->commitPlastic();
     bool changed = false;
+    bool tetChanged = false;
     if (!_tetElements.empty())
-        changed = releaseMoltenTets() || changed;
+        tetChanged = releaseMoltenTets();
     if (!_elements.empty()) {
         if (_material.fracture == FractureMode::Brittle) {
             const bool shattered = shatterQuads();
-            if (shattered || changed)
+            if (shattered)
                 _torn = true;
-            return shattered || changed;
+            return shattered || tetChanged;
         }
 
         std::vector<std::size_t> failed;
@@ -2126,7 +2357,7 @@ bool Part::tearFailed() {
             }
             kelvin = corners ? kelvin / corners : _initialTemperature;
             const double ductility = thermalDuctilityRetention(_material, kelvin);
-            const double stretchLimit = 1.0 + std::max(0.0, _material.tearStretch - 1.0) * ductility;
+            const double stretchLimit = liveStretchLimit(_material, ductility);
             const double plasticLimit = _material.failPlasticStrain * ductility;
             const bool stretchFail =
                 _material.fracture != FractureMode::Brittle && stretch >= stretchLimit;
@@ -2154,10 +2385,10 @@ bool Part::tearFailed() {
             changed = true;
         }
         if (changed) {
-            // The quads that tore are gone. Anything they cut loose that is
-            // already molten cannot carry load, so it leaves with them
-            // instead of staying as a strengthless shell.
-            promoteLooseFragments(true);
+            // Room-temp fragments that the tear cut loose must leave too:
+            // a disconnected Reissner shell under a 10x yield load NaNs (X1).
+            // Molten-only promotion would keep those shells in HHT.
+            promoteLooseFragments(false);
             freezeUnusedNodes();
             rebuildTrianglesFromQuads();
         }
@@ -2168,13 +2399,23 @@ bool Part::tearFailed() {
         std::vector<std::size_t> failed;
         for (std::size_t t = static_cast<std::size_t>(_skinTriangles);
              t < _triangles.size() && (t - static_cast<std::size_t>(_skinTriangles)) < _trianglesElements.size(); ++t) {
-            const bool stretchFail = _material.fracture != FractureMode::Brittle &&
-                                     maxEdgeStretch(_triangles[t].data(), 3) >= _material.tearStretch;
+            const double stretch = maxEdgeStretch(_triangles[t].data(), 3);
+            const bool stretchFail = _material.fracture != FractureMode::Brittle && stretch >= _material.tearStretch;
             const bool brittleFail = _material.fracture == FractureMode::Brittle &&
                                      t < stress.size() &&
                                      stress[t] >= static_cast<float>(_material.fractureStrength);
-            if (stretchFail || brittleFail)
-                failed.push_back(t);
+            if (stretchFail || brittleFail) {
+                const ChVector3d a = nodePosition(static_cast<std::size_t>(_triangles[t][0]));
+                const ChVector3d b = nodePosition(static_cast<std::size_t>(_triangles[t][1]));
+                const ChVector3d c = nodePosition(static_cast<std::size_t>(_triangles[t][2]));
+                const double area = 0.5 * (b - a).Cross(c - a).Length();
+                const double longest = std::max({(b - a).Length(), (c - b).Length(), (a - c).Length()});
+                const double sigma = t < stress.size() ? static_cast<double>(stress[t]) : 0.0;
+                const double energy = 0.5 * sigma * sigma / std::max(_material.youngsModulus, 1.0) * area *
+                                      std::max(_thickness, 1.0e-6);
+                if (energyAllowsOpening(_material, energy, longest * std::max(_thickness, 1.0e-6)))
+                    failed.push_back(t);
+            }
         }
         for (std::size_t t : failed) {
             const std::size_t slot = t - static_cast<std::size_t>(_skinTriangles);
@@ -2190,7 +2431,7 @@ bool Part::tearFailed() {
     }
     if (changed)
         _torn = true;
-    return changed;
+    return tetChanged || changed;
 }
 
 int Part::liveTetCount() const {
@@ -2198,6 +2439,89 @@ int Part::liveTetCount() const {
     for (char flag : _tetLive)
         live += flag ? 1 : 0;
     return live;
+}
+
+int Part::invertedTetCount() const {
+    int inverted = 0;
+    for (std::size_t t = 0; t < _tets.size(); ++t) {
+        if (t >= _tetLive.size() || !_tetLive[t])
+            continue;
+        const auto& corners = _tets[t];
+        chrono::ChVector3d rest[4];
+        chrono::ChVector3d live[4];
+        bool ok = true;
+        for (int k = 0; k < 4; ++k) {
+            const int idx = corners[static_cast<std::size_t>(k)];
+            if (idx < 0) {
+                ok = false;
+                break;
+            }
+            rest[k] = restPosition(static_cast<std::size_t>(idx));
+            live[k] = nodePosition(static_cast<std::size_t>(idx));
+            if (!std::isfinite(live[k].x()) || !std::isfinite(live[k].y()) || !std::isfinite(live[k].z())) {
+                ok = false;
+                break;
+            }
+        }
+        if (!ok)
+            continue;
+        const double restVol = (rest[1] - rest[0]).Dot((rest[2] - rest[0]).Cross(rest[3] - rest[0]));
+        const double liveVol = (live[1] - live[0]).Dot((live[2] - live[0]).Cross(live[3] - live[0]));
+        if (!std::isfinite(liveVol) || liveVol * restVol <= 0.0)
+            ++inverted;
+        else if (std::abs(restVol) > 0.0 && std::abs(liveVol) < 1.0e-12 * std::abs(restVol))
+            ++inverted;
+    }
+    return inverted;
+}
+
+bool Part::pastBrittleRankine() const {
+    if (_material.fracture != FractureMode::Brittle || _material.fractureStrength <= 0.0)
+        return false;
+    const double strength = _material.fractureStrength * std::max(thermalStrengthRetention(_material, _temperature), 1.0e-4);
+    for (std::size_t t = 0; t < _tetElements.size(); ++t) {
+        if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+            continue;
+        if (_tetElements[t]->overstrength())
+            return true;
+        // A collapsed or inverted tet never reports Rankine; restoring it
+        // hid every corner hit. On glass that element has failed.
+        if (_tetElements[t]->inverted() || _tetElements[t]->deformationSingular())
+            return true;
+        if (_tetElements[t]->rawTension() >= strength)
+            return true;
+        if (brittleShouldCrush(_material, _temperature, _tetElements[t]->rawCompression()))
+            return true;
+    }
+    const std::size_t limit = std::min(_quads.size(), _elements.size());
+    for (std::size_t q = 0; q < limit; ++q) {
+        if (q < _rigidQuad.size() && _rigidQuad[q])
+            continue;
+        if (!_elements[q])
+            continue;
+        if (quadMechanics(q).tension >= strength)
+            return true;
+    }
+    return false;
+}
+
+int Part::liveElementCount() const {
+    if (!_tetElements.empty())
+        return liveTetCount();
+    int live = 0;
+    for (const auto& element : _elements)
+        if (element)
+            ++live;
+    for (const auto& element : _trianglesElements)
+        if (element)
+            ++live;
+    return live;
+}
+
+int Part::totalElementCount() const {
+    if (!_tetElements.empty())
+        return tetCount();
+    return static_cast<int>(_elements.size() + _trianglesElements.size());
 }
 
 bool Part::hasFreeNodes() const {
@@ -2266,6 +2590,7 @@ void Part::buildVolume(const PartDefinition& definition) {
         element->configure(_material.youngsModulus, _material.poissonRatio,
                            _material.allowPlasticity ? _material.yieldStress : 0.0,
                            _material.density, _material.dampingBeta);
+        element->setHardening(_material.ultimateStress);
         if (_material.fracture == FractureMode::Brittle)
             element->setRankine(rankineTensionLimit(_material), rankineCompressionLimit(_material));
         if (_material.fracture == FractureMode::Ductile)
@@ -2342,14 +2667,75 @@ void Part::buildVolume(const PartDefinition& definition) {
                 _xyzNodes[static_cast<std::size_t>(index)]->SetFixed(true);
         }
     }
+    stampPlyPlanes();
 }
 
-bool Part::maintainVolume(bool refine) {
+void Part::stampPlyPlanes() {
+    if (_material.plies.size() < 2 || _tetElements.empty() || _xyzNodes.empty())
+        return;
+    using chrono::ChVector3d;
+    ChVector3d normal(_material.stackNormal[0], _material.stackNormal[1], _material.stackNormal[2]);
+    if (normal.Length2() < 0.25)
+        normal = {0, 1, 0};
+    else
+        normal.Normalize();
+    double lo = 1.0e30;
+    double hi = -1.0e30;
+    for (const auto& node : _xyzNodes) {
+        if (!node)
+            continue;
+        const double s = node->GetPos().Dot(normal);
+        lo = std::min(lo, s);
+        hi = std::max(hi, s);
+    }
+    const double span = hi - lo;
+    if (span < 1.0e-8)
+        return;
+    double thickSum = 0.0;
+    for (const Ply& ply : _material.plies)
+        thickSum += std::max(ply.thickness, 0.0);
+    std::vector<double> planes;
+    if (thickSum < 1.0e-8) {
+        const double step = span / static_cast<double>(_material.plies.size());
+        for (std::size_t i = 1; i < _material.plies.size(); ++i)
+            planes.push_back(lo + step * static_cast<double>(i));
+    } else {
+        double cursor = lo;
+        for (std::size_t i = 0; i + 1 < _material.plies.size(); ++i) {
+            cursor += span * std::max(_material.plies[i].thickness, 0.0) / thickSum;
+            planes.push_back(cursor);
+        }
+    }
+    for (double plane : planes) {
+        const ChVector3d origin = normal * plane;
+        std::vector<std::size_t> hit;
+        for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
+            if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+                continue;
+            int pos = 0;
+            int neg = 0;
+            for (int node : _tets[t]) {
+                if (node < 0 || static_cast<std::size_t>(node) >= _xyzNodes.size() || !_xyzNodes[static_cast<std::size_t>(node)])
+                    continue;
+                const double s = _xyzNodes[static_cast<std::size_t>(node)]->GetPos().Dot(normal) - plane;
+                if (s > 1.0e-8)
+                    ++pos;
+                else if (s < -1.0e-8)
+                    ++neg;
+            }
+            if (pos > 0 && neg > 0)
+                hit.push_back(t);
+        }
+        std::map<std::pair<int, int>, int> shared;
+        for (std::size_t tet : hit)
+            splitTetOnPlane(tet, origin, normal, &shared);
+    }
+}
+
+bool Part::maintainVolume() {
     if (_tetElements.empty())
         return false;
-    const bool released = releaseMoltenTets();
-    const bool refined = refine && refineActiveTets();
-    return refined || released;
+    return releaseMoltenTets(false);
 }
 
 int Part::xyzMidpoint(int a, int b) {
@@ -2380,6 +2766,588 @@ int Part::xyzMidpoint(int a, int b) {
     return index;
 }
 
+int Part::xyzOnPlane(int a, int b, const ChVector3d& origin, const ChVector3d& normal) {
+    using namespace chrono;
+    using namespace chrono::fea;
+    const std::size_t ia = static_cast<std::size_t>(a);
+    const std::size_t ib = static_cast<std::size_t>(b);
+    const auto& srcA = _xyzNodes[ia];
+    const auto& srcB = _xyzNodes[ib];
+    const ChVector3d pa = srcA->GetPos();
+    const ChVector3d pb = srcB->GetPos();
+    const double da = (pa - origin).Dot(normal);
+    const double db = (pb - origin).Dot(normal);
+    double t = 0.5;
+    if (std::abs(da - db) > 1.0e-12)
+        t = da / (da - db);
+    t = std::clamp(t, 0.05, 0.95);
+    const ChVector3d pos = pa + (pb - pa) * t;
+    const ChVector3d rest = srcA->GetX0() + (srcB->GetX0() - srcA->GetX0()) * t;
+    auto node = chrono_types::make_shared<ChNodeFEAxyz>(pos);
+    node->SetMass(0);
+    node->SetFixed(_fixed);
+    node->SetX0(rest);
+    node->SetPosDt(srcA->GetPosDt() + (srcB->GetPosDt() - srcA->GetPosDt()) * t);
+    _mesh->AddNode(node);
+    _xyzNodes.push_back(node);
+    const int index = static_cast<int>(_xyzNodes.size()) - 1;
+    _nodeMass.push_back(0.0);
+    if (_loads.size() < _xyzNodes.size())
+        _loads.resize(_xyzNodes.size(), ChVector3d(0, 0, 0));
+    noteNewNode(index, nodeTemperature(ia) + (nodeTemperature(ib) - nodeTemperature(ia)) * t);
+    const bool boundaryA = std::find(_boundaryNodes.begin(), _boundaryNodes.end(), a) != _boundaryNodes.end();
+    const bool boundaryB = std::find(_boundaryNodes.begin(), _boundaryNodes.end(), b) != _boundaryNodes.end();
+    if (boundaryA && boundaryB)
+        _boundaryNodes.push_back(index);
+    return index;
+}
+
+void Part::releaseTetAlongFace(std::size_t index, const chrono::ChVector3d& normal) {
+    if (index >= _tets.size() || index >= _tetElements.size() || !_tetElements[index])
+        return;
+    if (index < _tetLive.size() && !_tetLive[index])
+        return;
+    using chrono::ChVector3d;
+    const auto tet = _tets[index];
+    const int faces[4][3] = {{0, 2, 1}, {0, 1, 3}, {0, 3, 2}, {1, 2, 3}};
+    int best = -1;
+    double bestDot = -1.0;
+    for (int face = 0; face < 4; ++face) {
+        bool valid = true;
+        for (int corner : faces[face])
+            valid = valid && tet[corner] >= 0 && static_cast<std::size_t>(tet[corner]) < _xyzNodes.size();
+        if (!valid)
+            continue;
+        const ChVector3d a = _xyzNodes[static_cast<std::size_t>(tet[faces[face][0]])]->GetPos();
+        const ChVector3d b = _xyzNodes[static_cast<std::size_t>(tet[faces[face][1]])]->GetPos();
+        const ChVector3d c = _xyzNodes[static_cast<std::size_t>(tet[faces[face][2]])]->GetPos();
+        ChVector3d n = (b - a).Cross(c - a);
+        if (n.Length2() < 1.0e-24)
+            continue;
+        n.Normalize();
+        const double align = std::abs(n.Dot(normal));
+        if (align > bestDot) {
+            bestDot = align;
+            best = face;
+        }
+    }
+    if (best < 0)
+        return;
+    int clones[3];
+    for (int k = 0; k < 3; ++k)
+        clones[k] = cloneNode(tet[static_cast<std::size_t>(faces[best][k])]);
+    std::array<int, 4> next = tet;
+    for (int k = 0; k < 3; ++k)
+        next[static_cast<std::size_t>(faces[best][k])] = clones[k];
+    _tets[index] = next;
+    _tetElements[index]->SetNodes(_xyzNodes[static_cast<std::size_t>(next[0])],
+                                  _xyzNodes[static_cast<std::size_t>(next[1])],
+                                  _xyzNodes[static_cast<std::size_t>(next[2])],
+                                  _xyzNodes[static_cast<std::size_t>(next[3])]);
+    const int original[3] = {tet[static_cast<std::size_t>(faces[best][0])],
+                             tet[static_cast<std::size_t>(faces[best][1])],
+                             tet[static_cast<std::size_t>(faces[best][2])]};
+    for (int face = 0; face < _skinTriangles && face < static_cast<int>(_triangles.size()); ++face) {
+        int hits = 0;
+        for (int corner : _triangles[static_cast<std::size_t>(face)])
+            for (int node : original)
+                hits += corner == node ? 1 : 0;
+        if (hits == 3)
+            _triangles[static_cast<std::size_t>(face)] = {clones[0], clones[1], clones[2]};
+    }
+}
+
+bool Part::fractureCluster(const std::vector<std::size_t>& seeds, std::vector<char>& shard) {
+    using chrono::ChVector3d;
+    std::vector<char> in(_tets.size(), 0);
+    std::vector<std::size_t> cluster;
+    ChVector3d origin(0, 0, 0);
+    ChVector3d axis(0, 0, 0);
+    int samples = 0;
+    for (std::size_t seed : seeds) {
+        if (seed >= _tets.size() || seed >= _tetElements.size() || !_tetElements[seed])
+            continue;
+        if (seed < _tetLive.size() && !_tetLive[seed])
+            continue;
+        if (seed < in.size() && in[seed])
+            continue;
+        in[seed] = 1;
+        cluster.push_back(seed);
+        for (int node : _tets[seed]) {
+            if (node < 0 || static_cast<std::size_t>(node) >= _xyzNodes.size())
+                continue;
+            origin += _xyzNodes[static_cast<std::size_t>(node)]->GetPos();
+            ++samples;
+        }
+        axis += fabricCrackNormal(_material, _tetElements[seed]->tensionAxis());
+    }
+    if (cluster.empty() || samples == 0)
+        return false;
+    origin *= 1.0 / static_cast<double>(samples);
+    if (axis.Length2() < 0.25)
+        axis = {1, 0, 0};
+    else
+        axis.Normalize();
+
+    auto shareFace = [](const std::array<int, 4>& a, const std::array<int, 4>& b) {
+        int hits = 0;
+        for (int i : a)
+            for (int j : b)
+                hits += i == j ? 1 : 0;
+        return hits >= 3;
+    };
+    auto crosses = [&](std::size_t tet) {
+        int pos = 0;
+        int neg = 0;
+        for (int node : _tets[tet]) {
+            if (node < 0 || static_cast<std::size_t>(node) >= _xyzNodes.size())
+                continue;
+            const double s = (_xyzNodes[static_cast<std::size_t>(node)]->GetPos() - origin).Dot(axis);
+            if (s > 1.0e-10)
+                ++pos;
+            else if (s < -1.0e-10)
+                ++neg;
+        }
+        return pos > 0 && neg > 0;
+    };
+    for (std::size_t k = 0; k < cluster.size() && cluster.size() < 24; ++k) {
+        for (std::size_t other = 0; other < _tets.size(); ++other) {
+            if (other < in.size() && in[other])
+                continue;
+            if (other >= _tetElements.size() || !_tetElements[other])
+                continue;
+            if (other < _tetLive.size() && !_tetLive[other])
+                continue;
+            if (!shareFace(_tets[cluster[k]], _tets[other]) || !crosses(other))
+                continue;
+            if (other >= in.size())
+                in.resize(other + 1, 0);
+            in[other] = 1;
+            cluster.push_back(other);
+        }
+    }
+
+    auto usesEdge = [](const std::array<int, 4>& tet, int a, int b) {
+        bool hasA = false;
+        bool hasB = false;
+        for (int node : tet) {
+            hasA = hasA || node == a;
+            hasB = hasB || node == b;
+        }
+        return hasA && hasB;
+    };
+    std::map<std::pair<int, int>, int> cuts;
+    for (std::size_t tet : cluster) {
+        if (!crosses(tet))
+            continue;
+        const auto corners = _tets[tet];
+        double s[4];
+        for (int k = 0; k < 4; ++k) {
+            const int node = corners[static_cast<std::size_t>(k)];
+            s[k] = node >= 0 && static_cast<std::size_t>(node) < _xyzNodes.size()
+                       ? (_xyzNodes[static_cast<std::size_t>(node)]->GetPos() - origin).Dot(axis)
+                       : 0.0;
+        }
+        const int edge[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+        for (const auto& pair : edge) {
+            if ((s[pair[0]] > 0.0) == (s[pair[1]] > 0.0))
+                continue;
+            int a = corners[static_cast<std::size_t>(pair[0])];
+            int b = corners[static_cast<std::size_t>(pair[1])];
+            if (a > b)
+                std::swap(a, b);
+            if (cuts.count({a, b}))
+                continue;
+            cuts.emplace(std::make_pair(a, b), xyzOnPlane(a, b, origin, axis));
+        }
+    }
+    for (const auto& edge : cuts) {
+        std::vector<std::size_t> users;
+        for (std::size_t tet = 0; tet < _tets.size(); ++tet) {
+            if (tet < in.size() && in[tet])
+                continue;
+            if (tet >= _tetElements.size() || !_tetElements[tet])
+                continue;
+            if (tet < _tetLive.size() && !_tetLive[tet])
+                continue;
+            if (usesEdge(_tets[tet], edge.first.first, edge.first.second))
+                users.push_back(tet);
+        }
+        for (std::size_t tet : users) {
+            if (tet < _tets.size() && usesEdge(_tets[tet], edge.first.first, edge.first.second))
+                bisectTet(tet, edge.first.first, edge.first.second, edge.second);
+        }
+    }
+
+    std::vector<std::size_t> opened;
+    std::vector<std::size_t> fallback;
+    for (std::size_t tet : cluster) {
+        if (tet >= _tets.size() || tet >= _tetElements.size() || !_tetElements[tet])
+            continue;
+        if (tet < _tetLive.size() && !_tetLive[tet])
+            continue;
+        const auto kids = splitTetOnPlane(tet, origin, axis, &cuts);
+        if (kids.size() < 2)
+            fallback.push_back(tet);
+        else
+            opened.insert(opened.end(), kids.begin(), kids.end());
+    }
+    for (std::size_t tet : fallback) {
+        releaseTetAlongFace(tet, axis);
+        if (tet < shard.size())
+            shard[tet] = 0;
+    }
+    if (opened.empty())
+        return !fallback.empty();
+
+    std::vector<char> child(std::max(_tets.size(), opened.back() + 1), 0);
+    for (std::size_t tet : opened) {
+        if (tet >= child.size())
+            child.resize(tet + 1, 0);
+        child[tet] = 1;
+    }
+    std::set<int> midpoints;
+    for (const auto& edge : cuts)
+        midpoints.insert(edge.second);
+    std::set<int> front;
+    for (std::size_t tet = 0; tet < _tets.size() && tet < _tetElements.size(); ++tet) {
+        if (!_tetElements[tet] || (tet < _tetLive.size() && !_tetLive[tet]))
+            continue;
+        if (tet < child.size() && child[tet])
+            continue;
+        for (int node : _tets[tet])
+            if (midpoints.count(node))
+                front.insert(node);
+    }
+    std::map<int, int> cloned;
+    std::vector<std::size_t> positive;
+    for (std::size_t tet : opened) {
+        if (tet >= _tets.size() || tet >= _tetElements.size() || !_tetElements[tet])
+            continue;
+        ChVector3d c(0, 0, 0);
+        int corners = 0;
+        for (int node : _tets[tet]) {
+            if (node < 0 || static_cast<std::size_t>(node) >= _xyzNodes.size())
+                continue;
+            c += _xyzNodes[static_cast<std::size_t>(node)]->GetPos();
+            ++corners;
+        }
+        if (corners == 0)
+            continue;
+        c *= 1.0 / static_cast<double>(corners);
+        if ((c - origin).Dot(axis) < 0.0) {
+            if (tet < shard.size())
+                shard[tet] = 0;
+            continue;
+        }
+        positive.push_back(tet);
+        auto next = _tets[tet];
+        bool moved = false;
+        for (int& node : next) {
+            if (!midpoints.count(node) || front.count(node))
+                continue;
+            if (!cloned.count(node))
+                cloned.emplace(node, cloneNode(node));
+            node = cloned[node];
+            moved = true;
+        }
+        if (!moved)
+            continue;
+        _tets[tet] = next;
+        _tetElements[tet]->SetNodes(_xyzNodes[static_cast<std::size_t>(next[0])],
+                                    _xyzNodes[static_cast<std::size_t>(next[1])],
+                                    _xyzNodes[static_cast<std::size_t>(next[2])],
+                                    _xyzNodes[static_cast<std::size_t>(next[3])]);
+    }
+
+    double volume = 0.0;
+    for (std::size_t tet : positive) {
+        if (tet < _tetElements.size() && _tetElements[tet])
+            volume += std::abs(_tetElements[tet]->volume());
+    }
+    const double speck = 0.125 * _material.minimumShardSize * _material.minimumShardSize * _material.minimumShardSize;
+    const bool erase = _material.shatterToDust || (_material.minimumShardSize > 0.0 && volume < speck);
+    for (std::size_t tet : positive) {
+        if (shard.size() <= tet)
+            shard.resize(tet + 1, 0);
+        shard[tet] = erase ? 1 : 0;
+        if (tet < _tetElements.size() && _tetElements[tet])
+            _tetElements[tet]->commitDamage(1.0);
+    }
+    return true;
+}
+
+std::vector<std::size_t> Part::splitTetOnTensionPlane(std::size_t index) {
+    using chrono::ChVector3d;
+    if (index >= _tetElements.size() || !_tetElements[index])
+        return {};
+    ChVector3d centroid(0, 0, 0);
+    if (index >= _tets.size())
+        return {};
+    for (int node : _tets[index]) {
+        if (node < 0 || static_cast<std::size_t>(node) >= _xyzNodes.size())
+            return {};
+        centroid += _xyzNodes[static_cast<std::size_t>(node)]->GetPos();
+    }
+    centroid *= 0.25;
+    return splitTetOnPlane(index, centroid, fabricCrackNormal(_material, _tetElements[index]->tensionAxis()), nullptr);
+}
+
+std::vector<std::size_t> Part::splitTetOnPlane(std::size_t index, const chrono::ChVector3d& origin,
+                                              const chrono::ChVector3d& axisIn,
+                                              std::map<std::pair<int, int>, int>* cuts) {
+    using namespace chrono;
+    using namespace chrono::fea;
+    std::vector<std::size_t> children;
+    if (index >= _tets.size() || index >= _tetElements.size() || !_tetElements[index])
+        return children;
+    if (index < _tetLive.size() && !_tetLive[index])
+        return children;
+    const auto parent = _tets[index];
+    const auto parentElement = _tetElements[index];
+    ChVector3d axis = axisIn;
+    if (axis.Length2() < 0.25)
+        axis = {1, 0, 0};
+    else
+        axis.Normalize();
+    ChVector3d p[4];
+    for (int k = 0; k < 4; ++k)
+        p[k] = _xyzNodes[static_cast<std::size_t>(parent[static_cast<std::size_t>(k)])]->GetPos();
+    double s[4];
+    int pos = 0;
+    int neg = 0;
+    int isolated = -1;
+    for (int k = 0; k < 4; ++k) {
+        s[k] = (p[k] - origin).Dot(axis);
+        if (s[k] > 1.0e-10) {
+            ++pos;
+            isolated = k;
+        } else if (s[k] < -1.0e-10) {
+            ++neg;
+            isolated = k;
+        }
+    }
+    if (pos == 0 || neg == 0)
+        return children;
+    if (!((pos == 1 && neg == 3) || (pos == 3 && neg == 1) || (pos == 2 && neg == 2)))
+        return children;
+
+    auto shapeOk = [](const ChVector3d& a, const ChVector3d& b, const ChVector3d& c, const ChVector3d& d) {
+        const double volume = std::abs((b - a).Dot((c - a).Cross(d - a))) / 6.0;
+        const ChVector3d q[4] = {a, b, c, d};
+        double longest = 0.0;
+        double shortest = 1.0e30;
+        double sum = 0.0;
+        for (int i = 0; i < 4; ++i) {
+            for (int j = i + 1; j < 4; ++j) {
+                const double len = (q[i] - q[j]).Length();
+                longest = std::max(longest, len);
+                shortest = std::min(shortest, len);
+                sum += len;
+            }
+        }
+        if (shortest < 1.0e-12 || longest > 20.0 * shortest)
+            return false;
+        const double mean = sum / 6.0;
+        return mean > 0.0 && volume / (mean * mean * mean) >= 1.0e-4;
+    };
+    auto cutPoint = [&](int i, int j) {
+        const double denom = s[i] - s[j];
+        double t = std::abs(denom) > 1.0e-12 ? s[i] / denom : 0.5;
+        t = std::clamp(t, 0.05, 0.95);
+        return p[i] + (p[j] - p[i]) * t;
+    };
+    bool sound = true;
+    if ((pos == 1 && neg == 3) || (pos == 3 && neg == 1)) {
+        int others[3];
+        int n = 0;
+        for (int k = 0; k < 4; ++k)
+            if (k != isolated)
+                others[n++] = k;
+        if (n == 3) {
+            const ChVector3d m0 = cutPoint(isolated, others[0]);
+            const ChVector3d m1 = cutPoint(isolated, others[1]);
+            const ChVector3d m2 = cutPoint(isolated, others[2]);
+            sound = shapeOk(p[isolated], m0, m1, m2) && shapeOk(m0, p[others[0]], p[others[1]], p[others[2]]) &&
+                    shapeOk(m1, m0, p[others[1]], p[others[2]]) && shapeOk(m2, m0, m1, p[others[2]]);
+        }
+    } else {
+        int a[2];
+        int b[2];
+        int na = 0;
+        int nb = 0;
+        for (int k = 0; k < 4; ++k) {
+            if (s[k] > 0.0)
+                a[na++] = k;
+            else
+                b[nb++] = k;
+        }
+        if (na == 2 && nb == 2) {
+            const ChVector3d p02 = cutPoint(a[0], b[0]);
+            const ChVector3d p03 = cutPoint(a[0], b[1]);
+            const ChVector3d p12 = cutPoint(a[1], b[0]);
+            const ChVector3d p13 = cutPoint(a[1], b[1]);
+            sound = shapeOk(p[a[0]], p[a[1]], p02, p12) && shapeOk(p[a[0]], p02, p03, p12) &&
+                    shapeOk(p[a[0]], p03, p13, p12) && shapeOk(p[b[0]], p[b[1]], p02, p12) &&
+                    shapeOk(p[b[0]], p02, p03, p12) && shapeOk(p[b[0]], p03, p13, p12);
+        }
+    }
+    if (!sound)
+        return children;
+
+    parentElement->commitPlastic();
+    const ChVector3d p0 = p[0];
+    const ChVector3d p1 = p[1];
+    const ChVector3d p2 = p[2];
+    const ChVector3d p3 = p[3];
+    const double oldVolume = std::abs((p1 - p0).Dot((p2 - p0).Cross(p3 - p0))) / 6.0;
+    const double oldShare = _material.density * oldVolume / 4.0;
+    for (int node : parent)
+        if (node >= 0 && static_cast<std::size_t>(node) < _nodeMass.size())
+            _nodeMass[static_cast<std::size_t>(node)] =
+                std::max(0.0, _nodeMass[static_cast<std::size_t>(node)] - oldShare);
+
+    auto addChild = [&](int n0, int n1, int n2, int n3) -> std::size_t {
+        const ChVector3d q0 = _xyzNodes[static_cast<std::size_t>(n0)]->GetPos();
+        const ChVector3d q1 = _xyzNodes[static_cast<std::size_t>(n1)]->GetPos();
+        const ChVector3d q2 = _xyzNodes[static_cast<std::size_t>(n2)]->GetPos();
+        const ChVector3d q3 = _xyzNodes[static_cast<std::size_t>(n3)]->GetPos();
+        double volume = (q1 - q0).Dot((q2 - q0).Cross(q3 - q0));
+        if (std::abs(volume) < 1.0e-18)
+            return static_cast<std::size_t>(-1);
+        if (volume < 0.0) {
+            std::swap(n2, n3);
+            volume = -volume;
+        }
+        auto element = chrono_types::make_shared<ThermalTet4>();
+        element->configure(_material.youngsModulus, _material.poissonRatio,
+                           _material.allowPlasticity ? _material.yieldStress : 0.0, _material.density,
+                           _material.dampingBeta);
+        element->setHardening(_material.ultimateStress);
+        if (_material.fracture == FractureMode::Brittle)
+            element->setRankine(rankineTensionLimit(_material), rankineCompressionLimit(_material));
+        if (_material.fracture == FractureMode::Ductile)
+            element->setFailureStrain(_material.failPlasticStrain);
+        element->SetNodes(_xyzNodes[static_cast<std::size_t>(n0)], _xyzNodes[static_cast<std::size_t>(n1)],
+                          _xyzNodes[static_cast<std::size_t>(n2)], _xyzNodes[static_cast<std::size_t>(n3)]);
+        element->copyPlasticFrom(*parentElement);
+        _mesh->AddElement(element);
+        const double share = _material.density * (volume / 6.0) / 4.0;
+        for (int node : {n0, n1, n2, n3})
+            if (static_cast<std::size_t>(node) < _nodeMass.size())
+                _nodeMass[static_cast<std::size_t>(node)] += share;
+        if (children.empty()) {
+            _tets[index] = {n0, n1, n2, n3};
+            _tetElements[index] = element;
+            children.push_back(index);
+            return index;
+        }
+        _tets.push_back({n0, n1, n2, n3});
+        _tetElements.push_back(element);
+        _tetLive.push_back(1);
+        children.push_back(_tets.size() - 1);
+        return _tets.size() - 1;
+    };
+
+    std::map<std::pair<int, int>, int> localCuts;
+    std::map<std::pair<int, int>, int>& sharedCuts = cuts ? *cuts : localCuts;
+    auto cutEdge = [&](int i, int j) {
+        int a = parent[static_cast<std::size_t>(i)];
+        int b = parent[static_cast<std::size_t>(j)];
+        if (a > b)
+            std::swap(a, b);
+        const auto key = std::make_pair(a, b);
+        const auto found = sharedCuts.find(key);
+        if (found != sharedCuts.end())
+            return found->second;
+        const int mid = xyzOnPlane(a, b, origin, axis);
+        sharedCuts.emplace(key, mid);
+        return mid;
+    };
+
+    if ((pos == 1 && neg == 3) || (pos == 3 && neg == 1)) {
+        int others[3];
+        int n = 0;
+        for (int k = 0; k < 4; ++k)
+            if (k != isolated)
+                others[n++] = k;
+        if (n != 3)
+            return children;
+        const int m0 = cutEdge(isolated, others[0]);
+        const int m1 = cutEdge(isolated, others[1]);
+        const int m2 = cutEdge(isolated, others[2]);
+        addChild(parent[static_cast<std::size_t>(isolated)], m0, m1, m2);
+        addChild(m0, parent[static_cast<std::size_t>(others[0])], parent[static_cast<std::size_t>(others[1])],
+                 parent[static_cast<std::size_t>(others[2])]);
+        addChild(m1, m0, parent[static_cast<std::size_t>(others[1])], parent[static_cast<std::size_t>(others[2])]);
+        addChild(m2, m0, m1, parent[static_cast<std::size_t>(others[2])]);
+    } else if (pos == 2 && neg == 2) {
+        int a[2];
+        int b[2];
+        int na = 0;
+        int nb = 0;
+        for (int k = 0; k < 4; ++k) {
+            if (s[k] > 0.0)
+                a[na++] = k;
+            else
+                b[nb++] = k;
+        }
+        if (na != 2 || nb != 2)
+            return children;
+        const int p02 = cutEdge(a[0], b[0]);
+        const int p03 = cutEdge(a[0], b[1]);
+        const int p12 = cutEdge(a[1], b[0]);
+        const int p13 = cutEdge(a[1], b[1]);
+        addChild(parent[static_cast<std::size_t>(a[0])], parent[static_cast<std::size_t>(a[1])], p02, p12);
+        addChild(parent[static_cast<std::size_t>(a[0])], p02, p03, p12);
+        addChild(parent[static_cast<std::size_t>(a[0])], p03, p13, p12);
+        addChild(parent[static_cast<std::size_t>(b[0])], parent[static_cast<std::size_t>(b[1])], p02, p12);
+        addChild(parent[static_cast<std::size_t>(b[0])], p02, p03, p12);
+        addChild(parent[static_cast<std::size_t>(b[0])], p03, p13, p12);
+    }
+    if (children.size() < 2)
+        return {};
+    if (_mesh)
+        _mesh->RemoveElement(parentElement);
+
+    const int corner[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
+    for (const auto& e : corner) {
+        const int ia = parent[static_cast<std::size_t>(e[0])];
+        const int ib = parent[static_cast<std::size_t>(e[1])];
+        if ((s[e[0]] > 0.0) == (s[e[1]] > 0.0))
+            continue;
+        for (int face = 0; face < _skinTriangles && face < static_cast<int>(_triangles.size()); ++face) {
+            auto& tri = _triangles[static_cast<std::size_t>(face)];
+            int hits = 0;
+            for (int cornerNode : tri)
+                hits += (cornerNode == ia || cornerNode == ib) ? 1 : 0;
+            if (hits != 2)
+                continue;
+            int keep = -1;
+            for (int cornerNode : tri)
+                if (cornerNode != ia && cornerNode != ib)
+                    keep = cornerNode;
+            if (keep < 0)
+                continue;
+            int lo = ia;
+            int hi = ib;
+            if (lo > hi)
+                std::swap(lo, hi);
+            int mid = -1;
+            const auto found = sharedCuts.find({lo, hi});
+            if (found != sharedCuts.end())
+                mid = found->second;
+            else
+                mid = xyzOnPlane(ia, ib, origin, axis);
+            tri = {ia, mid, keep};
+            _triangles.insert(_triangles.begin() + face + 1, {mid, ib, keep});
+            ++_skinTriangles;
+            ++face;
+        }
+    }
+    return children;
+}
+
 void Part::bisectTet(std::size_t index, int a, int b, int mid) {
     if (index >= _tets.size() || index >= _tetElements.size() || !_tetElements[index])
         return;
@@ -2408,6 +3376,7 @@ void Part::bisectTet(std::size_t index, int a, int b, int mid) {
         element->configure(_material.youngsModulus, _material.poissonRatio,
                            _material.allowPlasticity ? _material.yieldStress : 0.0, _material.density,
                            _material.dampingBeta);
+        element->setHardening(_material.ultimateStress);
         if (_material.fracture == FractureMode::Brittle)
             element->setRankine(rankineTensionLimit(_material), rankineCompressionLimit(_material));
         if (_material.fracture == FractureMode::Ductile)
@@ -2468,207 +3437,210 @@ void Part::bisectTet(std::size_t index, int a, int b, int mid) {
     }
 }
 
-bool Part::refineActiveTets() {
-    if (_tetElements.empty() || _refineLimit <= 0.0)
-        return false;
-    double limit = _refineLimit;
-    if (_material.fracture == FractureMode::Brittle)
-        limit *= 0.5;
-    else if (_material.fracture == FractureMode::Compliant)
-        limit *= 2.0;
-    const double yield = _material.allowPlasticity ? _material.yieldStress : 0.0;
-    const double thermalSpan = std::max(1.0, _material.meltTemperature - _material.softenTemperature);
-    struct Candidate {
-        int a = 0;
-        int b = 0;
-        double score = 0.0;
-    };
-    std::vector<Candidate> edges;
-    const int corner[6][2] = {{0, 1}, {0, 2}, {0, 3}, {1, 2}, {1, 3}, {2, 3}};
-    auto consider = [&](std::size_t index) {
-        if (index >= _tets.size() || index >= _tetElements.size() || !_tetElements[index] ||
-            (index < _tetLive.size() && !_tetLive[index]))
-            return;
-        const auto& tet = _tets[index];
-        const auto& element = _tetElements[index];
-        double kelvin = 0.0;
-        double hottest = 0.0;
-        double coldest = 1.0e9;
-        for (int node : tet) {
-            if (node < 0)
-                return;
-            const double t = nodeTemperature(static_cast<std::size_t>(node));
-            kelvin += t;
-            hottest = std::max(hottest, t);
-            coldest = std::min(coldest, t);
-        }
-        kelvin *= 0.25;
-        const double localStrength = thermalStrengthRetention(_material, kelvin);
-        double score = 0.0;
-        if (_material.fracture == FractureMode::Brittle && _material.fractureStrength > 0.0)
-            score = element->tension() / (_material.fractureStrength * std::max(localStrength, 1.0e-4));
-        else if (_material.fracture == FractureMode::Compliant) {
-            const double stretch = maxEdgeStretch(tet.data(), 4);
-            const double allow = std::max(0.05, _material.tearStretch - 1.0);
-            score = std::max(0.0, stretch - 1.0) / allow;
-        } else if (yield > 0.0) {
-            const double plasticLimit = std::max(1.0e-4, _material.failPlasticStrain);
-            score = std::max(element->plasticStrain() / plasticLimit,
-                             element->vonMises() / (yield * std::max(localStrength, 1.0e-4)));
-        }
-        const double heat = (hottest - coldest) / thermalSpan;
-        if (hottest >= _material.softenTemperature)
-            score = std::max(score, heat * 2.0);
-        if (score < (_material.fracture == FractureMode::Brittle ? 0.25 : 0.55))
-            return;
-        int ea = tet[0];
-        int eb = tet[1];
-        double best = -1.0;
-        const chrono::ChVector3d axis = element->tensionAxis();
-        for (const auto& pair : corner) {
-            const int a = tet[static_cast<std::size_t>(pair[0])];
-            const int b = tet[static_cast<std::size_t>(pair[1])];
-            const chrono::ChVector3d edge =
-                nodePosition(static_cast<std::size_t>(b)) - nodePosition(static_cast<std::size_t>(a));
-            const double length = edge.Length();
-            if (length <= limit * 1.4)
-                continue;
-            double rank = length;
-            if (_material.fracture == FractureMode::Brittle && axis.Length() > 0.5 && length > 1.0e-8) {
-                const double along = std::abs(edge.Dot(axis) / length);
-                rank = length * (1.0 - along);
-            }
-            if (rank > best) {
-                best = rank;
-                ea = a;
-                eb = b;
-            }
-        }
-        if (best < 0.0)
-            return;
-        if (ea > eb)
-            std::swap(ea, eb);
-        edges.push_back({ea, eb, score});
-    };
-    const std::size_t count = _tets.size();
-    for (std::size_t t = 0; t < count; ++t)
-        consider(t);
-    if (edges.empty())
-        return false;
-    std::sort(edges.begin(), edges.end(), [](const Candidate& a, const Candidate& b) {
-        if (a.a != b.a)
-            return a.a < b.a;
-        if (a.b != b.b)
-            return a.b < b.b;
-        return a.score > b.score;
-    });
-    edges.erase(std::unique(edges.begin(), edges.end(),
-                            [](const Candidate& a, const Candidate& b) { return a.a == b.a && a.b == b.b; }),
-                edges.end());
-    std::sort(edges.begin(), edges.end(),
-              [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
-    if (edges.size() > 48)
-        edges.resize(48);
-    std::vector<std::pair<int, int>> split;
-    split.reserve(edges.size());
-    for (const auto& edge : edges)
-        split.emplace_back(edge.a, edge.b);
-
-    bool changed = false;
-    for (const auto& edge : split) {
-        const int mid = xyzMidpoint(edge.first, edge.second);
-        std::vector<std::size_t> hosts;
-        for (std::size_t t = 0; t < _tets.size(); ++t) {
-            if (t >= _tetElements.size() || !_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
-                continue;
-            int hits = 0;
-            for (int node : _tets[t])
-                hits += (node == edge.first || node == edge.second) ? 1 : 0;
-            if (hits == 2)
-                hosts.push_back(t);
-        }
-        for (std::size_t host : hosts)
-            bisectTet(host, edge.first, edge.second, mid);
-        changed = changed || !hosts.empty();
-    }
-    if (changed)
-        _torn = true;
-    if (changed)
-        syncThermalMechanics();
-    return changed;
-}
-
-bool Part::releaseMoltenTets() {
+bool Part::releaseMoltenTets(bool includeBrittle) {
     if (_tetElements.empty())
         return false;
 
-    // At most a contact layer per call. The highest tension or plastic strain
-    // goes first, so an impact cannot turn the whole solid into chips at once.
-    std::vector<char> chosen(_tets.size(), 0);
-    {
-        struct Candidate {
-            std::size_t index = 0;
-            double score = 0.0;
+    auto meanFaceArea = [&](const std::array<int, 4>& tet) {
+        auto tri = [&](int i, int j, int k) {
+            const chrono::ChVector3d a = nodePosition(static_cast<std::size_t>(tet[static_cast<std::size_t>(i)]));
+            const chrono::ChVector3d b = nodePosition(static_cast<std::size_t>(tet[static_cast<std::size_t>(j)]));
+            const chrono::ChVector3d c = nodePosition(static_cast<std::size_t>(tet[static_cast<std::size_t>(k)]));
+            return 0.5 * (b - a).Cross(c - a).Length();
         };
-        std::vector<Candidate> candidates;
-        for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
-            if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+        return 0.25 * (tri(0, 1, 2) + tri(0, 1, 3) + tri(0, 2, 3) + tri(1, 2, 3));
+    };
+    auto brittleOpen = [&](std::size_t t, double kelvin) {
+        if (!includeBrittle)
+            return false;
+        return brittleShouldOpen(_material, kelvin, _tetElements[t]->rawTension(),
+                                 _tetElements[t]->trialEnergy(), _tetElements[t]->tensileStrain(),
+                                 meanFaceArea(_tets[t]), _tetElements[t]->rawCompression(),
+                                 _tetElements[t]->rawMean(), _tetElements[t]->tensionAxis());
+    };
+
+    struct Candidate {
+        std::size_t index = 0;
+        double score = 0.0;
+        int kind = 2;
+    };
+    std::vector<Candidate> candidates;
+    for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
+        if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
+            continue;
+        const auto& tet = _tets[t];
+        int corners = 0;
+        bool molten = true;
+        double kelvin = 0.0;
+        for (int index : tet) {
+            if (index < 0) {
+                molten = false;
                 continue;
-            const auto& tet = _tets[t];
-            int corners = 0;
-            bool molten = true;
-            double kelvin = 0.0;
-            for (int index : tet) {
-                if (index < 0) {
-                    molten = false;
-                    continue;
-                }
-                ++corners;
-                kelvin += nodeTemperature(static_cast<std::size_t>(index));
-                if (nodeTemperature(static_cast<std::size_t>(index)) < _material.meltTemperature)
-                    molten = false;
             }
-            if (corners != 4)
-                continue;
-            kelvin /= 4.0;
-            const double retention = thermalStrengthRetention(_material, kelvin);
-            const double ductility = thermalDuctilityRetention(_material, kelvin);
-            const double plasticLimit = _material.failPlasticStrain * ductility;
-            const double stretchLimit = 1.0 + std::max(0.0, _material.tearStretch - 1.0) * ductility;
-            const double plastic = _tetElements[t]->plasticStrain();
-            const double stretch = maxEdgeStretch(tet.data(), 4);
-            const double tension = _tetElements[t]->tension();
-            double softest = 1.0;
-            for (int index : tet) {
-                if (index < 0)
-                    continue;
-                softest = std::min(softest, thermalStiffnessRetention(_material, nodeTemperature(static_cast<std::size_t>(index))));
-            }
-            double score = 0.0;
-            if (molten || softest <= kThermalFloor * 2.0)
-                score = 1.0e6 + tension;
-            else if (_material.fracture == FractureMode::Brittle && _material.fractureStrength > 0.0) {
-                const double limit = _material.fractureStrength * std::max(retention, 1.0e-4);
-                if (_tetElements[t]->overstrength() || tension >= limit)
-                    score = std::max(tension, limit);
-            } else if (_material.fracture == FractureMode::Ductile) {
-                if ((plasticLimit > 0.0 && plastic >= plasticLimit) || stretch >= stretchLimit)
-                    score = plastic * 1.0e9 + tension;
-            } else if (stretch >= stretchLimit) {
-                score = stretch;
-            }
-            if (score > 0.0)
-                candidates.push_back({t, score});
+            ++corners;
+            kelvin += nodeTemperature(static_cast<std::size_t>(index));
+            if (nodeTemperature(static_cast<std::size_t>(index)) < _material.meltTemperature)
+                molten = false;
         }
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
-        if (candidates.size() > 48)
-            candidates.resize(48);
+        if (corners != 4)
+            continue;
+        kelvin /= 4.0;
+        const bool crush =
+            includeBrittle && brittleShouldCrush(_material, kelvin, _tetElements[t]->rawCompression());
+        const bool invertedFail = includeBrittle && _material.fracture == FractureMode::Brittle &&
+                                 (_tetElements[t]->inverted() || _tetElements[t]->deformationSingular());
+        const bool opened =
+            includeBrittle && _material.fracture == FractureMode::Brittle &&
+            (invertedFail || brittleOpen(t, kelvin));
+        if (includeBrittle && _material.fracture == FractureMode::Brittle)
+            _tetElements[t]->commitDamage((opened || crush) ? 1.0 : 0.0);
+        const double ductility = thermalDuctilityRetention(_material, kelvin);
+        const double grain = grainOpeningScale(_material, _tetElements[t]->tensionAxis());
+        const double plasticLimit = _material.failPlasticStrain * ductility * grain;
+        const double stretchLimit = 1.0 + (liveStretchLimit(_material, ductility) - 1.0) * grain;
+        const double plastic = _tetElements[t]->plasticStrain();
+        const double stretch = maxEdgeStretch(tet.data(), 4);
+        const double tension = _tetElements[t]->tension();
+        double softest = 1.0;
+        for (int index : tet) {
+            if (index < 0)
+                continue;
+            softest = std::min(softest, thermalStiffnessRetention(_material, nodeTemperature(static_cast<std::size_t>(index))));
+        }
+        double score = 0.0;
+        int kind = 2;
+        // Only a fully molten tet leaves as a chip. One hot corner used to
+        // mark every neighbour as melt (softest <= thermal floor) and the
+        // core vanished with the surface.
+        if (molten) {
+            score = 1.0e6 + tension;
+            kind = 0;
+        } else if (!includeBrittle) {
+            continue;
+        } else if (interfaceShouldOpen(_material, kelvin, tension, _tetElements[t]->tensionAxis(),
+                                      _tetElements[t]->trialEnergy(), meanFaceArea(_tets[t]))) {
+            score = tension;
+            kind = 5;
+        } else if (opened) {
+            // Tensile Rankine chips leave even when the failed cluster is a
+            // thin-sheet corner smaller than minimumShardSize³. That cube-volume
+            // floor is what kept an over-strength pane in the floor.
+            score = std::max({_tetElements[t]->trialEnergy(), _tetElements[t]->rawTension(),
+                              _tetElements[t]->rawCompression()}) /
+                    std::max(grain, 1.0e-6);
+            kind = 1;
+        } else if (crush) {
+            // Cluster volume vs minimumShardSize³ is the crush-powder gate:
+            // B3's tiny hoop zone stays, B4's crushed neighbourhood releases.
+            score = std::max({_tetElements[t]->trialEnergy(), _tetElements[t]->rawTension(),
+                              _tetElements[t]->rawCompression()});
+            kind = 4;
+        } else if (_material.fracture == FractureMode::Ductile) {
+            if (((plasticLimit > 0.0 && plastic >= plasticLimit) || stretch >= stretchLimit) &&
+                energyAllowsOpening(_material, _tetElements[t]->trialEnergy(), meanFaceArea(_tets[t])))
+                score = plastic * 1.0e9 + tension;
+        } else if (_material.fracture != FractureMode::Brittle && stretch >= stretchLimit &&
+                   energyAllowsOpening(_material, _tetElements[t]->trialEnergy(), meanFaceArea(_tets[t]))) {
+            score = stretch;
+        }
+        if (score > 0.0)
+            candidates.push_back({t, score, kind});
+    }
+    if (!_material.shatterToDust && _material.minimumShardSize > 0.0) {
+        const double minVol = 0.125 * _material.minimumShardSize * _material.minimumShardSize *
+                              _material.minimumShardSize;
+        std::vector<char> brittle(_tets.size(), 0);
         for (const auto& candidate : candidates)
-            chosen[candidate.index] = 1;
+            if (candidate.kind == 4 && candidate.index < brittle.size())
+                brittle[candidate.index] = 1;
+        std::vector<int> parent(_tets.size());
+        for (int i = 0; i < static_cast<int>(_tets.size()); ++i)
+            parent[static_cast<std::size_t>(i)] = i;
+        auto shareFace = [](const std::array<int, 4>& a, const std::array<int, 4>& b) {
+            int hits = 0;
+            for (int i : a)
+                for (int j : b)
+                    hits += i == j ? 1 : 0;
+            return hits >= 3;
+        };
+        for (std::size_t i = 0; i < _tets.size(); ++i) {
+            if (!brittle[i])
+                continue;
+            for (std::size_t j = i + 1; j < _tets.size(); ++j) {
+                if (!brittle[j])
+                    continue;
+                if (shareFace(_tets[i], _tets[j]))
+                    unite(parent, static_cast<int>(i), static_cast<int>(j));
+            }
+        }
+        std::vector<double> groupVol(_tets.size(), 0.0);
+        for (std::size_t i = 0; i < _tets.size() && i < _tetElements.size(); ++i) {
+            if (!brittle[i] || !_tetElements[i])
+                continue;
+            groupVol[static_cast<std::size_t>(findRoot(parent, static_cast<int>(i)))] += _tetElements[i]->volume();
+        }
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                                        [&](const Candidate& c) {
+                                            if (c.kind != 4 || c.index >= groupVol.size())
+                                                return false;
+                                            const int root = findRoot(parent, static_cast<int>(c.index));
+                                            return groupVol[static_cast<std::size_t>(root)] < minVol;
+                                        }),
+                         candidates.end());
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& a, const Candidate& b) { return a.score > b.score; });
+
+    std::vector<char> chosen(_tets.size(), 0);
+    int meltTaken = 0;
+    int otherTaken = 0;
+    for (const auto& candidate : candidates) {
+        if (candidate.kind == 0) {
+            if (meltTaken >= 48)
+                continue;
+            ++meltTaken;
+        } else if (candidate.kind == 1 || candidate.kind == 4) {
+            // Brittle count follows the load, not a scene-size budget.
+        } else {
+            if (otherTaken >= 16)
+                continue;
+            ++otherTaken;
+        }
+        chosen[candidate.index] = 1;
     }
 
     bool changed = false;
+    {
+        std::vector<std::size_t> interfaces;
+        std::vector<std::size_t> opening;
+        for (const auto& candidate : candidates) {
+            if (candidate.index >= chosen.size() || !chosen[candidate.index])
+                continue;
+            if (candidate.kind == 5)
+                interfaces.push_back(candidate.index);
+            else if (candidate.kind == 1 || candidate.kind == 2)
+                opening.push_back(candidate.index);
+        }
+        chrono::ChVector3d stack(_material.stackNormal[0], _material.stackNormal[1], _material.stackNormal[2]);
+        if (stack.Length2() < 0.25)
+            stack = {0, 1, 0};
+        else
+            stack.Normalize();
+        for (std::size_t tet : interfaces) {
+            releaseTetAlongFace(tet, stack);
+            if (tet < chosen.size())
+                chosen[tet] = 0;
+            changed = true;
+        }
+        if (!opening.empty()) {
+            if (chosen.size() < _tets.size())
+                chosen.resize(_tets.size(), 0);
+            if (fractureCluster(opening, chosen))
+                changed = true;
+        }
+    }
+
+    const std::size_t shardsBefore = _shards.size();
     for (std::size_t t = 0; t < _tets.size() && t < _tetElements.size(); ++t) {
         if (t >= chosen.size() || !chosen[t])
             continue;
@@ -2692,27 +3664,15 @@ bool Part::releaseMoltenTets() {
         if (corners != 4)
             continue;
         kelvin /= 4.0;
-        const double retention = thermalStrengthRetention(_material, kelvin);
         const double ductility = thermalDuctilityRetention(_material, kelvin);
-        const double plasticLimit = _material.failPlasticStrain * ductility;
-        const double stretchLimit = 1.0 + std::max(0.0, _material.tearStretch - 1.0) * ductility;
+        const double grain = grainOpeningScale(_material, _tetElements[t]->tensionAxis());
+        const double plasticLimit = _material.failPlasticStrain * ductility * grain;
+        const double stretchLimit = 1.0 + (liveStretchLimit(_material, ductility) - 1.0) * grain;
         const double plastic = _tetElements[t]->plasticStrain();
         const double stretch = maxEdgeStretch(tet.data(), 4);
-        const double tension = _tetElements[t]->tension();
         bool failed = molten;
-        double softest = 1.0;
-        for (int index : tet) {
-            if (index < 0)
-                continue;
-            softest = std::min(softest, thermalStiffnessRetention(_material, nodeTemperature(static_cast<std::size_t>(index))));
-        }
-        // A corner already on the numerical floor would collapse the implicit
-        // step if the tet stayed in. Contained metal above that still sags.
-        if (softest <= kThermalFloor * 2.0)
-            failed = true;
         if (!failed && _material.fracture == FractureMode::Brittle && _material.fractureStrength > 0.0)
-            failed = _tetElements[t]->overstrength() ||
-                     tension >= _material.fractureStrength * std::max(retention, 1.0e-4);
+            failed = _tetElements[t]->damage() >= 1.0;
         if (!failed && _material.fracture == FractureMode::Ductile)
             failed = (plasticLimit > 0.0 && plastic >= plasticLimit) || stretch >= stretchLimit;
         if (!failed && _material.fracture == FractureMode::Compliant)
@@ -2745,12 +3705,25 @@ bool Part::releaseMoltenTets() {
                 _triangles.push_back({clones[face[0]], clones[face[1]], clones[face[2]]});
             }
         }
+        const std::array<int, 4> originals = {tet[0], tet[1], tet[2], tet[3]};
         _tets[t] = {clones[0], clones[1], clones[2], clones[3]};
         if (_mesh)
             _mesh->RemoveElement(_tetElements[t]);
         _tetElements[t].reset();
         if (t < _tetLive.size())
             _tetLive[t] = 0;
+        // The hole is not a 2000 K furnace. Neighbours that kept these
+        // corners used to melt in the 0.4 s fall and spawn extra chips.
+        const double belowMelt = _material.meltTemperature - 25.0;
+        for (int orig : originals) {
+            if (orig < 0)
+                continue;
+            const std::size_t node = static_cast<std::size_t>(orig);
+            if (nodeTemperature(node) > belowMelt)
+                setNodeTemperature(node, belowMelt);
+            if (node < _strainTemperature.size() && strainTemperature(node) > belowMelt)
+                setStrainTemperature(node, belowMelt);
+        }
 
         using namespace chrono;
         RigidShard shard;
@@ -2793,7 +3766,8 @@ bool Part::releaseMoltenTets() {
         changed = true;
     }
     if (changed) {
-        _torn = true;
+        if (_shards.size() > shardsBefore)
+            _torn = true;
         _contactArea.clear();
         _contactAreaNodes = 0;
         _contactAreaFaces = 0;
@@ -2804,6 +3778,16 @@ bool Part::releaseMoltenTets() {
             for (int node : _tets[i])
                 if (node >= 0 && static_cast<std::size_t>(node) < used.size())
                     used[static_cast<std::size_t>(node)] = 1;
+        }
+        for (std::size_t q = 0; q < _quads.size() && q < _elements.size(); ++q) {
+            if (!_elements[q])
+                continue;
+            if (q < _rigidQuad.size() && _rigidQuad[q])
+                continue;
+            for (int node : _quads[q]) {
+                if (node >= 0 && static_cast<std::size_t>(node) < used.size())
+                    used[static_cast<std::size_t>(node)] = 1;
+            }
         }
         if (_rigidNode.size() < _xyzNodes.size())
             _rigidNode.resize(_xyzNodes.size(), 0);
@@ -2824,6 +3808,7 @@ void Part::buildSurface(const PartDefinition& definition, bool append) {
 
     const SurfaceMesh& surface = definition.surface;
     std::vector<int> map(surface.vertices.size(), -1);
+    const int volumeNodes = append ? static_cast<int>(_xyzNodes.size()) : 0;
     if (!append) {
         _nodes.clear();
         _elements.clear();
@@ -2940,6 +3925,29 @@ void Part::buildSurface(const PartDefinition& definition, bool append) {
     }
     std::sort(_boundaryNodes.begin(), _boundaryNodes.end());
     _boundaryNodes.erase(std::unique(_boundaryNodes.begin(), _boundaryNodes.end()), _boundaryNodes.end());
+    if (append && volumeNodes > 0) {
+        _shellSolidTies.clear();
+        const double reach = std::max(_thickness, 1.0e-4);
+        const double reach2 = reach * reach;
+        for (int index : _boundaryNodes) {
+            if (index < volumeNodes || index < 0 || static_cast<std::size_t>(index) >= _xyzNodes.size())
+                continue;
+            const ChVector3d p = _xyzNodes[static_cast<std::size_t>(index)]->GetPos();
+            int nearest = -1;
+            double best = reach2;
+            for (int solid = 0; solid < volumeNodes; ++solid) {
+                if (solid < 0 || static_cast<std::size_t>(solid) >= _xyzNodes.size() || !_xyzNodes[static_cast<std::size_t>(solid)])
+                    continue;
+                const double d = (_xyzNodes[static_cast<std::size_t>(solid)]->GetPos() - p).Length2();
+                if (d < best) {
+                    best = d;
+                    nearest = solid;
+                }
+            }
+            if (nearest >= 0)
+                _shellSolidTies.push_back({index, nearest});
+        }
+    }
     if (!append) {
         _loads.assign(nodeCount(), ChVector3d(0, 0, 0));
         seedTemperatures();

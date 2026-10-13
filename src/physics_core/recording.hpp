@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -18,6 +19,8 @@ struct Vec3f {
 /// IEEE binary16. Playback only needs millimetre-level positions, and a
 /// multi-second recording is otherwise dominated by three floats per node.
 inline std::uint16_t packHalf(float value) {
+    if (!std::isfinite(value))
+        return 0;
     std::uint32_t bits = 0;
     static_assert(sizeof(float) == 4, "float is not 32-bit");
     std::memcpy(&bits, &value, sizeof(bits));
@@ -27,7 +30,7 @@ inline std::uint16_t packHalf(float value) {
     if (exponent <= 0)
         return static_cast<std::uint16_t>(sign);
     if (exponent >= 31)
-        return static_cast<std::uint16_t>(sign | 0x7c00u);
+        return static_cast<std::uint16_t>(sign | (30u << 10) | 0x3ffu);
     return static_cast<std::uint16_t>(sign | (static_cast<std::uint32_t>(exponent) << 10) | (mantissa >> 13));
 }
 

@@ -33,6 +33,12 @@ public:
 
     void writeAir(AirFrame& out) const;
 
+    /// True when the last advance moved lagged strain temperature, so the
+    /// mechanical step still has an unbalanced thermal residual.
+    bool strainMoved() const { return _strainMoved; }
+    /// True while strain temperature is still catching node temperature.
+    bool easing() const { return _easing; }
+
 private:
     struct Cache {
         bool on = false;
@@ -76,6 +82,7 @@ private:
     bool _sourceOn = false;
     bool _dirty = false;
     bool _easing = false;
+    bool _strainMoved = false;
 };
 
 }  // namespace rcs

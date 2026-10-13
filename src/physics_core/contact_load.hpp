@@ -22,19 +22,20 @@ struct ContactWorld {
     double halfX = 5.0;
     double halfZ = 5.0;
     double ceiling = 10.0;
-    /// Integrator substep, seconds. The contact ramp spans at most one of
-    /// these so a 50 m/s hit does not jump through a 200 µm onset.
+    /// Integrator substep, seconds.
     double stepSize = 5.0e-4;
+    /// Rigid-chip bounce only. Deformable residual uses continuum penalty
+    /// (k δ); it does not read this.
+    double restitution = 0.15;
 };
 
 /// One node pressed against the floor, the walls, or the ceiling, written as a
 /// Chrono load so the implicit integrator sees its stiffness.
 ///
-/// The explicit alternative cannot work here. A penalty force applied from the
-/// state at the start of the step is stable only while `k < m/dt^2`, which for
-/// a millimetre timestep is millions of times softer than metal. A body then
-/// either sinks through the floor or is thrown off it. Inside the Jacobian the
-/// same spring can carry the real `E*A/L` and the step stays stable.
+/// Penalty is continuum: F_n = k δ plus critical-fraction damping on that k,
+/// and extra viscous stabilization only while the gap is closing. k is a
+/// fraction of element stiffness E √A, not m/dt². Rebound comes from
+/// continuum elasticity and plasticity, not a rigid-body χ.
 class NodeContact : public chrono::ChLoadCustom {
 public:
     NodeContact(std::shared_ptr<chrono::fea::ChNodeFEAxyz> node,
@@ -44,49 +45,55 @@ public:
 
     /// Contact geometry and gains for this node. Rewritten whenever the skin
     /// changes, so a refined or detached face contacts with its new area.
-    /// `dissipation` is the Hunt-Crossley coefficient in s/m: restitution
-    /// drops as roughly 1 - dissipation * closing speed.
-    void configure(double offset, double stiffness, double dissipation);
+    /// `stiffness` is the material penalty k = c E √A. `dissipation` is unused
+    /// (kept so call sites stay stable). `mass` sets 0.2-of-critical damping
+    /// on that k.
+    void configure(double offset, double stiffness, double dissipation, double mass = 0.0);
 
     /// A node that has left the deformable body (a rigid chip, a frozen
     /// scrap) is driven directly and must not also be pushed by a contact.
     void setActive(bool active) { _active = active; }
     bool active() const { return _active; }
 
-    /// Extra penalty drop above 25 m/s. Rankine glass needs it so HHT can
-    /// take the hit; ductile metal at the same speed has to keep the 0.02
-    /// floor or the cube walks through without yielding.
-    void setSoftenFast(bool soften) { _softenFast = soften; }
-
     /// Normal force carried on the last evaluation. Used for reporting and
     /// for the thermal contact conductance.
     double normalForce() const { return _normalForce; }
+    double stiffness() const { return _stiffness; }
+    double offset() const { return _offset; }
 
     NodeContact* Clone() const override { return new NodeContact(*this); }
 
     void ComputeQ(chrono::ChState* state_x, chrono::ChStateDelta* state_w) override;
+    void ComputeJacobian(chrono::ChState* state_x, chrono::ChStateDelta* state_w) override;
     /// The load depends on position, so the integrator has to differentiate
-    /// it. This is what makes the contact implicit.
+    /// it. Analytical K = −dQ/dx matches Chrono's convention for ChLoadCustom.
     bool IsStiff() override { return true; }
 
 private:
     /// Accumulate one half-space into `force`, given the node state.
+    /// When `jac` is set, also add analytical K = −dQ/dx and R = −dQ/dv
+    /// into the load Jacobians.
     void addPlane(const chrono::ChVector3d& position,
                   const chrono::ChVector3d& velocity,
                   const chrono::ChVector3d& normal,
                   double planeOffset,
-                  chrono::ChVector3d& force);
+                  int slot,
+                  chrono::ChVector3d& force,
+                  bool jac);
+
+    bool _fillJac = false;
 
     std::shared_ptr<chrono::fea::ChNodeFEAxyz> _node;
     std::shared_ptr<chrono::fea::ChNodeFEAxyzrot> _rotNode;
     std::shared_ptr<const ContactWorld> _world;
     double _offset = 0.0;
     double _stiffness = 0.0;
-    /// Hunt-Crossley dissipation coefficient, s/m.
     double _damping = 0.0;
+    double _mass = 0.0;
     double _normalForce = 0.0;
+    double _planeForce[6] = {};
+    chrono::ChVector3d _planeNormal[6] = {};
     bool _active = true;
-    bool _softenFast = false;
 };
 
 }  // namespace rcs

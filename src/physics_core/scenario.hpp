@@ -39,11 +39,9 @@ struct Environment {
     /// Penalty contact, per node. Stiffness and damping are clamped per node
     /// to whatever the timestep can integrate stably.
     ///
-    /// The floor is fixed concrete: stiff, and it does not give the impact
-    /// back. `floorRestitution` is the fraction of the normal impact speed
-    /// returned on the way out (0 is a dead stop, 1 is elastic). Aluminum on
-    /// dry concrete is about 0.15; a trampoline is near 1. Friction is the
-    /// dry-concrete range.
+    /// The floor is fixed concrete. Deformable rebound comes from continuum
+    /// elasticity, not this coefficient. `floorRestitution` is only the
+    /// rigid-chip bounce in finishShards. Friction is the dry-concrete range.
     double contactStiffness = 1.0e6;  ///< N/m
     double contactDamping = 2.0e4;    ///< N*s/m, clamped to the stable limit
     double floorRestitution = 0.15;
@@ -187,9 +185,6 @@ struct SimulationSettings {
     /// 1 keeps each part's element size. Higher cuts that size down for every
     /// part, so the same knob adds tetrahedra everywhere.
     double meshResolution = 1.0;
-    /// When set, a hot or loaded tetrahedron is split finer during the run.
-    /// When clear, the mesh stays at the resolution chosen above.
-    bool dynamicResolution = true;
 };
 
 struct Scenario {

@@ -16,6 +16,20 @@ enum class FractureMode {
     Compliant
 };
 
+/// Where a crack prefers to run. FractureMode is still when it fails.
+enum class BreakFabric {
+    Isotropic,
+    Tempered,
+    Grain
+};
+
+/// One ply in a laminate. The direction is the fiber in the part rest frame.
+/// Delamination uses `Material::interfaceStrength`, not this ply's tensile strength.
+struct Ply {
+    double thickness = 0.0;
+    double direction[3] = {1.0, 0.0, 0.0};
+};
+
 /// Isotropic structural material. Strength values drive weld failure, the
 /// stress colour map, and fracture. Expansion, heat capacity, and conductivity
 /// feed the heat solver. Stiffness and yield follow handbook curves and keep
@@ -42,6 +56,20 @@ struct Material {
     bool allowPlasticity = true;
 
     FractureMode fracture = FractureMode::Ductile;
+    BreakFabric breakFabric = BreakFabric::Isotropic;
+    /// Unit grain / fiber in the part rest frame. Used when `breakFabric` is Grain.
+    double grainDirection[3] = {1.0, 0.0, 0.0};
+    /// Laminate. Empty means a single continuum. Two or more plies can separate
+    /// on `interfaceStrength` without the ply itself reaching its tensile limit.
+    std::vector<Ply> plies;
+    /// Unit normal of the stack, part rest frame. Delamination opens on this plane.
+    double stackNormal[3] = {0.0, 1.0, 0.0};
+    /// Peel / shear strength of the ply interface, Pa. Zero disables delamination.
+    double interfaceStrength = 0.0;
+    /// K_Ic of that interface, Pa*sqrt(m). Zero skips the interface energy gate.
+    double interfaceToughness = 0.0;
+    /// Extra tensile drive (Pa) for tempered glass. Unused unless Tempered.
+    double residualTension = 0.0;
     /// Rankine tensile strength, Pa. Brittle shells crack above this.
     double fractureStrength = 0.0;
     /// Rankine compressive strength, Pa. Brittle solids crush above this.
@@ -302,6 +330,37 @@ inline Material temperedGlass() {
     m.fractureStrength = 1.20e8;
     m.shatterToDust = true;
     m.minimumShardSize = 0.015;
+    m.breakFabric = BreakFabric::Tempered;
+    m.residualTension = 4.0e7;
+    return m;
+}
+
+inline Material wood() {
+    Material m;
+    m.name = "Hardwood";
+    m.density = 700.0;
+    m.youngsModulus = 1.2e10;
+    m.poissonRatio = 0.30;
+    m.yieldStress = 4.0e7;
+    m.ultimateStress = 5.0e7;
+    m.weldShearStrength = 8.0e6;
+    m.dampingBeta = 8.0e-4;
+    m.tearStretch = 1.04;
+    m.failPlasticStrain = 0.02;
+    m.fracture = FractureMode::Brittle;
+    m.fractureStrength = 5.0e6;
+    m.fractureToughness = 0.5e6;
+    m.minimumShardSize = 0.03;
+    m.breakFabric = BreakFabric::Grain;
+    m.grainDirection[0] = 1.0;
+    m.grainDirection[1] = 0.0;
+    m.grainDirection[2] = 0.0;
+    m.thermalExpansion = 5.0e-6;
+    m.specificHeat = 1700.0;
+    m.conductivity = 0.16;
+    m.emissivity = 0.90;
+    m.softenTemperature = 450.0;
+    m.meltTemperature = 550.0;
     return m;
 }
 
@@ -351,7 +410,7 @@ inline Material ar500() {
 
 /// Library order used by the assembly panel picker.
 inline std::vector<Material> materialPresets() {
-    return {aluminum6061(), mildSteel(), ar500(), glass(), temperedGlass(), rubber()};
+    return {aluminum6061(), mildSteel(), ar500(), glass(), temperedGlass(), rubber(), wood()};
 }
 
 inline int presetIndex(const Material& material) {

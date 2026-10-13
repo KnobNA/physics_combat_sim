@@ -20,6 +20,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <optional>
 #include <vector>
 
@@ -197,6 +198,8 @@ private:
     void refreshFaceVisuals();
     void updateSplicePreview(const Vector3& origin, const Vector3& dir);
     bool commitSplice();
+    void updateWeldPreview(const Vector3& origin, const Vector3& dir);
+    bool commitWeld();
     std::vector<FaceHighlight> gpuFaceHighlights() const;
     chrono::ChQuaterniond worldRotation() const;
     chrono::ChVector3d worldOrigin() const;
@@ -227,6 +230,8 @@ private:
     bool _havePointer = false;
     bool _spliceHovering = false;
     SplicePreview _authoredSplice;
+    bool _weldHovering = false;
+    WeldPreview _authoredWeld;
 };
 
 CombatApp::CombatApp(const Arguments& arguments):
@@ -288,12 +293,14 @@ void CombatApp::startSimulation() {
             continue;
         if (part.source.empty() && (part.patch.uSize <= 1.0e-6 || part.patch.vSize <= 1.0e-6))
             continue;
-        const int base = std::max(200, part.sizing.tetBudget);
-        part.sizing.tetBudget = std::clamp(static_cast<int>(base * resolution), 400, 8000);
-        part.sizing.refineLimit = part.sizing.minElement;
-        part.sizing.cached = false;
-        part.volume = {};
-        part.surface = {};
+        applyResolutionSizing(part, resolution);
+    }
+    seedWeldBeads(meshed);
+    for (auto& part : meshed.parts) {
+        if (!part.simulate)
+            continue;
+        if (part.source.empty() && (part.patch.uSize <= 1.0e-6 || part.patch.vSize <= 1.0e-6))
+            continue;
         if (!ensurePartMesh(part))
             _editor.status = "Could not mesh " + part.name + ".";
     }
@@ -362,6 +369,7 @@ void CombatApp::handleEditorRequests() {
     if (_editor.cancelRequested) {
         _editor.cancelRequested = false;
         _job.cancel();
+        _editor.status = "Stopping...";
     }
 
     if (_editor.addGroupRequested) {
@@ -389,6 +397,18 @@ void CombatApp::handleEditorRequests() {
             _editor.selectedFaces.clear();
             rebuildPreview();
             _editor.status = "Added a 400 mm solid aluminum cube.";
+        }
+    }
+
+    if (_editor.addSolidSphereRequested) {
+        _editor.addSolidSphereRequested = false;
+        if (editingAllowed()) {
+            _definition.parts.push_back(makeSolidSphere(0.10, {-0.50, 0.0, 0.0}));
+            _editor.selectedParts = {_definition.parts.size() - 1};
+            _editor.selectedGroup.reset();
+            _editor.selectedFaces.clear();
+            rebuildPreview();
+            _editor.status = "Added a 200 mm solid aluminum sphere.";
         }
     }
 
@@ -420,16 +440,30 @@ void CombatApp::handleEditorRequests() {
     if (_editor.deleteSelectionRequested) {
         _editor.deleteSelectionRequested = false;
         if (editingAllowed() && _run.frames.empty()) {
-            if (_editor.selectedGroup && *_editor.selectedGroup < _definition.groups.size()) {
+            if (_editor.selectedWeld && *_editor.selectedWeld < _definition.welds.size()) {
+                _definition.welds.erase(_definition.welds.begin() +
+                                        static_cast<std::ptrdiff_t>(*_editor.selectedWeld));
+                _editor.selectedWeld.reset();
+                _editor.status = "Removed weld.";
+                rebuildPreview();
+            } else if (_editor.selectedGroup && *_editor.selectedGroup < _definition.groups.size()) {
                 deleteSelectedGroup(_definition, *_editor.selectedGroup, _editor.selectedParts);
                 _editor.selectedGroup.reset();
+                _editor.selectedFaces.clear();
+                _editor.selectFaces = false;
+                _editor.splicePreview = {};
+                _editor.weldSource.reset();
+                _editor.weldPreview = {};
+                rebuildPreview();
             } else {
                 deleteSelectedParts(_definition, _editor.selectedParts, _editor.scenario.loads);
+                _editor.selectedFaces.clear();
+                _editor.selectFaces = false;
+                _editor.splicePreview = {};
+                _editor.weldSource.reset();
+                _editor.weldPreview = {};
+                rebuildPreview();
             }
-            _editor.selectedFaces.clear();
-            _editor.selectFaces = false;
-            _editor.splicePreview = {};
-            rebuildPreview();
         }
     }
 
@@ -484,10 +518,23 @@ void CombatApp::pruneEditorSelection() {
                            return id.face >= _definition.parts[id.part].source.faces.size();
                        }),
         _editor.selectedFaces.end());
+    if (_editor.selectedWeld && *_editor.selectedWeld >= _definition.welds.size())
+        _editor.selectedWeld.reset();
+    if (_editor.weldSource) {
+        const FaceId id = *_editor.weldSource;
+        if (id.part >= _definition.parts.size() ||
+            id.face >= _definition.parts[id.part].source.faces.size())
+            _editor.weldSource.reset();
+    }
     if (_editor.selectedParts.empty())
         _editor.selectFaces = false;
-    if (_editor.selectedFaces.empty() && _editor.tool == Tool::Splice)
+    if (_editor.selectedFaces.empty() &&
+        (_editor.tool == Tool::Splice || _editor.tool == Tool::Weld))
         _editor.tool = Tool::Select;
+    if (_editor.tool != Tool::Weld) {
+        _editor.weldPreview = {};
+        _editor.weldSource.reset();
+    }
 }
 
 void CombatApp::seedSelectedPartFaces() {
@@ -528,6 +575,7 @@ Vector3 CombatApp::selectionCenter() const {
 
 void CombatApp::refreshFaceVisuals() {
     _editor.faceOutlines.clear();
+    _editor.weldOutlines.clear();
     const chrono::ChQuaterniond rotation = worldRotation();
     const chrono::ChVector3d origin = worldOrigin();
     for (const FaceId& id : _editor.selectedFaces) {
@@ -537,6 +585,26 @@ void CombatApp::refreshFaceVisuals() {
         faceLoopWorld(_definition.parts[id.part], id.face, rotation, origin, loop);
         if (!loop.empty())
             _editor.faceOutlines.push_back(std::move(loop));
+    }
+    auto pushWeld = [&](std::size_t index) {
+        std::vector<std::vector<chrono::ChVector3d>> loops;
+        authoredWeldPolylines(_definition, index, loops);
+        for (auto& loop : loops) {
+            for (auto& point : loop)
+                point = toWorld(point, rotation, origin);
+            if (loop.size() >= 2)
+                _editor.weldOutlines.push_back(std::move(loop));
+        }
+    };
+    if (_editor.selectedWeld && *_editor.selectedWeld < _definition.welds.size()) {
+        pushWeld(*_editor.selectedWeld);
+    } else if (_editor.selectedFaces.empty()) {
+        for (std::size_t i = 0; i < _definition.welds.size(); ++i) {
+            const WeldDefinition& weld = _definition.welds[i];
+            if (!partIsSelected(_editor, weld.partA) && !partIsSelected(_editor, weld.partB))
+                continue;
+            pushWeld(i);
+        }
     }
 }
 
@@ -627,9 +695,87 @@ bool CombatApp::commitSplice() {
     return true;
 }
 
+void CombatApp::updateWeldPreview(const Vector3& origin, const Vector3& dir) {
+    _editor.weldPreview = {};
+    _authoredWeld = {};
+    _weldHovering = false;
+    if (_editor.tool != Tool::Weld || !_editor.weldSource || _editor.selectedFaces.empty())
+        return;
+    seedSelectedPartFaces();
+    if (_editor.weldSource->part < _definition.parts.size())
+        ensureAuthoredFaces(_definition.parts[_editor.weldSource->part]);
+    std::vector<std::size_t> destParts;
+    for (const FaceId& id : _editor.selectedFaces) {
+        if (std::find(destParts.begin(), destParts.end(), id.part) == destParts.end())
+            destParts.push_back(id.part);
+    }
+    chrono::ChVector3d worldHit{0, 0, 0};
+    const auto hit = pickAuthoredFace(_definition, destParts, toChrono(origin), toChrono(dir),
+                                      worldRotation(), worldOrigin(), &worldHit);
+    if (!hit || !faceIsSelected(_editor, *hit))
+        return;
+    _weldHovering = true;
+    const chrono::ChVector3d mouse = worldRotation().RotateBack(worldHit - worldOrigin());
+    WeldPreview preview = makeWeldPreview(_definition, _editor.selectedFaces, *_editor.weldSource,
+                                          *hit, mouse, _editor.weldAngle, _editor.weldChordAngle);
+    _authoredWeld = preview;
+    auto toPlaced = [&](chrono::ChVector3d point) {
+        return toWorld(point, worldRotation(), worldOrigin());
+    };
+    preview.mouse = toPlaced(preview.mouse);
+    for (auto& point : preview.outline)
+        point = toPlaced(point);
+    for (auto& dest : preview.destLoops)
+        for (auto& point : dest.loop)
+            point = toPlaced(point);
+    for (auto& hitPt : preview.outlineHits)
+        hitPt.point = toPlaced(hitPt.point);
+    for (int c = 0; c < 2; ++c) {
+        preview.chords[c].a = toPlaced(preview.chords[c].a);
+        preview.chords[c].b = toPlaced(preview.chords[c].b);
+        preview.chords[c].hits[0].point = toPlaced(preview.chords[c].hits[0].point);
+        preview.chords[c].hits[1].point = toPlaced(preview.chords[c].hits[1].point);
+    }
+    _editor.weldPreview = std::move(preview);
+}
+
+bool CombatApp::commitWeld() {
+    if (!_weldHovering || !_authoredWeld.valid)
+        return false;
+    if (!commitWeldPlacement(_definition, _authoredWeld))
+        return false;
+    _editor.weldSource.reset();
+    _editor.weldPreview = {};
+    _authoredWeld = {};
+    _weldHovering = false;
+    _editor.tool = Tool::Select;
+    _editor.status = "Welded.";
+    rebuildPreview();
+    return true;
+}
+
 void CombatApp::selectAt(const Vector2& windowPosition, bool additive) {
     Vector3 origin, dir;
     rayAt(windowPosition, origin, dir);
+
+    if (!_editor.selectFaces && _editor.selectedFaces.empty()) {
+        const double maxDist = std::max(0.008, double(gizmoScale()) * 0.15);
+        std::vector<std::size_t> parts = _editor.selectedParts;
+        if (_editor.selectedWeld && *_editor.selectedWeld < _definition.welds.size()) {
+            parts.push_back(_definition.welds[*_editor.selectedWeld].partA);
+            parts.push_back(_definition.welds[*_editor.selectedWeld].partB);
+        }
+        const auto weld = pickWeld(_definition, parts, toChrono(origin), toChrono(dir),
+                                   worldRotation(), worldOrigin(), maxDist);
+        if (weld) {
+            _editor.selectedWeld = weld;
+            _editor.selectedParts.clear();
+            _editor.selectedGroup.reset();
+            _editor.selectedFaces.clear();
+            _editor.selectFaces = false;
+            return;
+        }
+    }
 
     if (_editor.selectFaces && !_editor.selectedParts.empty()) {
         seedSelectedPartFaces();
@@ -667,10 +813,12 @@ void CombatApp::selectAt(const Vector2& windowPosition, bool additive) {
             _editor.selectedGroup.reset();
             _editor.selectedFaces.clear();
             _editor.selectFaces = false;
+            _editor.selectedWeld.reset();
         }
         return;
     }
     _editor.selectedGroup.reset();
+    _editor.selectedWeld.reset();
     if (additive) {
         auto found = std::find(_editor.selectedParts.begin(), _editor.selectedParts.end(), *hit);
         if (found == _editor.selectedParts.end())
@@ -708,20 +856,7 @@ void CombatApp::applyTranslation(const Vector3& delta) {
         applyPartTranslation(_definition.parts[index], local);
     }
 
-    for (auto& screw : _definition.screws) {
-        if (screw.partA < inGroup.size() && screw.partB < inGroup.size() &&
-            inGroup[screw.partA] && inGroup[screw.partB])
-            screw.position += local;
-    }
-    for (auto& weld : _definition.welds) {
-        if (!weld.useRegion)
-            continue;
-        if (weld.partA < inGroup.size() && weld.partB < inGroup.size() &&
-            inGroup[weld.partA] && inGroup[weld.partB]) {
-            weld.regionMin += local;
-            weld.regionMax += local;
-        }
-    }
+    transformAuthoredJoints(_definition, inGroup, local);
     rebuildPreview();
 }
 
@@ -745,6 +880,12 @@ void CombatApp::applyRotation(const Vector3& axis, Rad angle) {
             continue;
         applyPartRotation(_definition.parts[index], rotation, pivot);
     }
+    std::vector<char> inGroup(_definition.parts.size(), 0);
+    for (std::size_t index : group) {
+        if (index < inGroup.size())
+            inGroup[index] = 1;
+    }
+    rotateAuthoredJoints(_definition, inGroup, rotation, pivot);
     rebuildPreview();
 }
 
@@ -761,10 +902,13 @@ void CombatApp::drawEvent() {
         _editor.stressScale = std::max(recording.maxStress, 1.0e6f);
 
     pruneEditorSelection();
-    if (_editor.tool == Tool::Splice && editingAllowed() && _run.frames.empty()) {
+    if (editingAllowed() && _run.frames.empty()) {
         Vector3 origin, dir;
         rayAt(_havePointer ? _lastPointer : Vector2{windowSize()} * 0.5f, origin, dir);
-        updateSplicePreview(origin, dir);
+        if (_editor.tool == Tool::Splice)
+            updateSplicePreview(origin, dir);
+        if (_editor.tool == Tool::Weld)
+            updateWeldPreview(origin, dir);
     }
     refreshFaceVisuals();
 
@@ -802,6 +946,7 @@ void CombatApp::drawEvent() {
     context.recording = &recording;
     context.frame = frame;
     context.simulating = _job.running();
+    context.cancelling = _job.cancelling();
     context.progress = _job.progress();
     context.simulatedTime = _job.simulatedTime();
     context.runDuration = _job.runDuration();
@@ -905,6 +1050,40 @@ void CombatApp::pointerPressEvent(PointerEvent& event) {
         }
     }
 
+    if (canEdit && _editor.tool == Tool::Weld) {
+        Vector3 origin, dir;
+        rayAt(event.position(), origin, dir);
+        if (_editor.weldSource) {
+            updateWeldPreview(origin, dir);
+            if (commitWeld()) {
+                event.setAccepted();
+                return;
+            }
+            event.setAccepted();
+            return;
+        }
+        for (std::size_t i = 0; i < _definition.parts.size(); ++i)
+            ensureAuthoredFaces(_definition.parts[i]);
+        std::vector<std::size_t> others;
+        for (std::size_t i = 0; i < _definition.parts.size(); ++i) {
+            bool dest = false;
+            for (const FaceId& id : _editor.selectedFaces)
+                dest = dest || id.part == i;
+            if (!dest)
+                others.push_back(i);
+        }
+        const auto face = pickAuthoredFace(_definition, others, toChrono(origin), toChrono(dir),
+                                           worldRotation(), worldOrigin());
+        if (face) {
+            _editor.weldSource = *face;
+            _editor.weldAngle = 0.0;
+            _editor.weldChordAngle = 0.0;
+            _editor.status = "Place the weld on the selected faces.";
+        }
+        event.setAccepted();
+        return;
+    }
+
     const bool additive = bool(event.modifiers() & Modifier::Ctrl);
     selectAt(event.position(), additive);
     event.setAccepted();
@@ -969,6 +1148,8 @@ void CombatApp::pointerMoveEvent(PointerMoveEvent& event) {
 
     if (canEdit && _editor.tool == Tool::Splice)
         updateSplicePreview(origin, dir);
+    if (canEdit && _editor.tool == Tool::Weld)
+        updateWeldPreview(origin, dir);
 
     if (canEdit && _activeHandle != GizmoHandle::None && (event.pointers() & Pointer::MouseLeft)) {
         if (_editor.tool == Tool::Move) {
@@ -1019,6 +1200,22 @@ void CombatApp::scrollEvent(ScrollEvent& event) {
             return;
         }
     }
+    if (editingAllowed() && _run.frames.empty() && _editor.tool == Tool::Weld &&
+        _editor.weldSource && !_editor.selectedFaces.empty()) {
+        Vector3 origin, dir;
+        rayAt(event.position(), origin, dir);
+        updateWeldPreview(origin, dir);
+        if (_editor.weldPreview.valid) {
+            const double step = double(event.offset().y()) * (5.0 * 3.14159265358979323846 / 180.0);
+            if (event.modifiers() & Modifier::Ctrl)
+                _editor.weldChordAngle += step;
+            else
+                _editor.weldAngle += step;
+            updateWeldPreview(origin, dir);
+            event.setAccepted();
+            return;
+        }
+    }
     _camera.zoom(event.offset().y());
     event.setAccepted();
 }
@@ -1026,11 +1223,33 @@ void CombatApp::scrollEvent(ScrollEvent& event) {
 void CombatApp::keyPressEvent(KeyEvent& event) {
     const bool typing = ImGui::GetIO().WantTextInput;
     if (!typing && event.key() == Key::Delete && editingAllowed() && _run.frames.empty()) {
-        if (!_editor.selectedParts.empty() || _editor.selectedGroup) {
+        if (_editor.selectedWeld || !_editor.selectedParts.empty() || _editor.selectedGroup) {
             _editor.deleteSelectionRequested = true;
             event.setAccepted();
             return;
         }
+    }
+    if (!typing && editingAllowed() && _run.frames.empty() &&
+        event.key() == Key::W && (event.modifiers() & Modifier::Ctrl) &&
+        !_editor.selectedFaces.empty()) {
+        _editor.tool = Tool::Weld;
+        _editor.weldSource.reset();
+        _editor.weldPreview = {};
+        _editor.status = "Pick a face on another part to weld.";
+        event.setAccepted();
+        return;
+    }
+    if (!typing && editingAllowed() && _run.frames.empty() && event.key() == Key::Esc &&
+        _editor.tool == Tool::Weld) {
+        if (_editor.weldSource) {
+            _editor.weldSource.reset();
+            _editor.weldPreview = {};
+            _editor.status = "Pick a face on another part to weld.";
+        } else {
+            _editor.tool = Tool::Select;
+        }
+        event.setAccepted();
+        return;
     }
     if (_imgui.handleKeyPressEvent(event)) {
         event.setAccepted();

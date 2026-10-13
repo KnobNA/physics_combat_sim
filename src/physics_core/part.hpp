@@ -15,8 +15,10 @@
 
 #include <array>
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace rcs {
@@ -48,6 +50,8 @@ struct SurfaceMesh {
     std::vector<AuthoredFace> faces;
     /// Per-triangle thickness, metres. Empty means the part thickness.
     std::vector<double> thickness;
+    /// PLC facet marker. 2 is a weld or ply interface. Empty means every face is 1.
+    std::vector<int> markers;
 
     bool empty() const { return vertices.empty() || triangles.empty(); }
 };
@@ -72,6 +76,8 @@ struct VolumeMesh {
     std::vector<chrono::ChVector3d> vertices;
     std::vector<std::array<int, 4>> tets;
     std::vector<std::array<int, 3>> boundary;
+    /// Parallel to `boundary`. 2 is an interface face (weld or ply).
+    std::vector<int> boundaryMarker;
     double elementSize = 0.025;
     bool empty() const { return tets.empty(); }
 };
@@ -130,31 +136,45 @@ public:
 
     void clearLoads();
     void addLoad(std::size_t nodeIndex, const chrono::ChVector3d& force);
+    chrono::ChVector3d nodeForce(std::size_t nodeIndex) const;
     /// A load on a node whose shell quads have all torn follows the rigid
     /// chips that replaced it. A node that is still in a live element keeps
     /// the force itself.
     void addStructuralLoad(std::size_t nodeIndex, const chrono::ChVector3d& force);
     void commitLoads();
+    /// Recompute tet trial stress from the current node pose. Used after an
+    /// explicit floor seat so Rankine/J2 see the compressed configuration.
+    void refreshTetTrials();
+    /// Chip clones must stay out of HHT; Chrono Setup() can clear Fixed.
+    void enforceRigidNodes();
 
     /// Per-quad peak von Mises stress across the shell thickness, in Pa.
     /// Plastic strain is subtracted, so a dent that has unloaded reads low.
     void evaluateStress(std::vector<float>& out) const;
     void evaluatePlasticStrain(std::vector<float>& out) const;
+    double tetPlasticStrain(std::size_t index) const;
     /// Highest outer-fiber tensile principal stress, Pa. Brittle fracture uses this.
     double peakTension() const;
     /// Throw away tet state from a rejected Newton step.
     void discardTrial();
+    /// Keep tet plastic from the last accepted Newton iterate.
+    void commitPlastic();
+    /// Forward the current HHT slice length into every live tet.
+    void setImpactStep(double h);
     /// Copy free-node positions and velocities so a rejected HHT step can
     /// be rolled back if Chrono left a non-finite iterate.
     void captureKinematics();
     void restoreKinematics();
+    /// Copy the live pose into the undeformed reference so a free thermal
+    /// swell does not fight the original rest in the next implicit step.
+    void bakeRest();
 
     /// Detach elements that have stretched, yielded, or cracked past the
     /// material limit. Returns true when the mesh gained nodes.
     bool tearFailed();
     /// On the heat clock: split tetrahedra that are heating, yielding, or
     /// loaded, then let molten ones leave as closed chips.
-    bool maintainVolume(bool refine);
+    bool maintainVolume();
 
     /// Mean node temperature, kelvin. A new part is uniform at its initial
     /// temperature, which is the stress-free temperature of the authored mesh.
@@ -178,12 +198,25 @@ public:
     /// Through-thickness thermal curvature for a Reissner midsurface, 1/m.
     /// Used when the mesh has no nodes through the thickness to fit dT/dn.
     void setThermalCurvature(double kappa);
+    /// True when live elements carry thermal strain or curvature.
+    bool thermalPrestress() const { return _thermalPrestress; }
+    /// True when the last sync or curvature write changed the thermal load.
+    bool thermalLoadChanged() const { return _thermalLoadChanged; }
+    void clearThermalLoadChanged() { _thermalLoadChanged = false; }
     void evaluateTemperature(std::vector<float>& out) const;
 
     std::size_t nodeCount() const;
     chrono::ChVector3d nodePosition(std::size_t index) const;
     chrono::ChVector3d restPosition(std::size_t index) const { return nodeRest(index); }
     chrono::ChVector3d nodeVelocity(std::size_t index) const;
+    /// Pose captured by `captureKinematics` (the start of the last accepted
+    /// attempt). Falls back to the live pose when nothing has been saved.
+    chrono::ChVector3d savedPosition(std::size_t index) const;
+    chrono::ChVector3d savedVelocity(std::size_t index) const;
+    /// Move a free node without touching rest. Used to eject a tunneled node.
+    void setNodeKinematics(std::size_t index,
+                           const chrono::ChVector3d& pos,
+                           const chrono::ChVector3d& vel);
     /// Reissner nodes carry rotation. Triangle shells are translation only.
     bool rotational() const { return _xyzNodes.empty(); }
 
@@ -215,9 +248,19 @@ public:
     /// False when every incident tet has left the solve, so floor contact
     /// must not keep pushing an under-massed orphan.
     bool nodeOnLiveTet(std::size_t index) const;
+    bool nodeOnLiveShell(std::size_t index) const;
     int skinTriangleCount() const { return _skinTriangles; }
     int tetCount() const { return static_cast<int>(_tets.size()); }
     int liveTetCount() const;
+    /// Live tets whose current signed volume has flipped or flattened.
+    int invertedTetCount() const;
+    /// Live tetrahedra, or live shell quads/triangles when there is no volume.
+    int liveElementCount() const;
+    /// True when a live brittle element is at or past handbook Rankine. Used
+    /// so a terminated contact iterate is not rewound before shatter can run.
+    bool pastBrittleRankine() const;
+    /// Authored tet count, or shell quad/triangle slots (including released).
+    int totalElementCount() const;
     bool tetLive(std::size_t index) const;
     /// False when every node is frozen (the whole solid has become chips).
     bool hasFreeNodes() const;
@@ -252,23 +295,39 @@ public:
     const std::vector<double>& contactAreas() const;
     /// Half the offset a contact sits off a node. A tet volume carries its
     /// own surface, so the node is the surface. A shell is a midsurface and
-    /// stands off by half its thickness.
+    /// stands off by half its thickness. Used by floor/arena contact.
     double contactOffset() const { return hasVolume() ? 0.0 : 0.5 * _thickness; }
+    /// Part-part penalty thickness. Volumes need a real skin (floor contact
+    /// does not): a zero band skips every node-vs-face pair.
+    double contactSkin() const {
+        if (!hasVolume())
+            return 0.5 * _thickness;
+        return std::max(1.0e-3, std::min(0.25 * std::max(_thickness, 1.0e-3), 5.0e-3));
+    }
 
     bool nodeRigid(std::size_t index) const;
     void clearLinkedNodes();
     void markLinkedNode(int index);
     std::vector<RigidShard>& shards() { return _shards; }
     const std::vector<RigidShard>& shards() const { return _shards; }
+    /// Shell boundary node tied to a tet node so a mixed part stays one solid.
+    const std::vector<std::pair<int, int>>& shellSolidTies() const { return _shellSolidTies; }
     /// Drop chips that are still moving, and the skin that belongs only to
     /// them. Settled chips stay. True when something was removed.
     bool discardAwakeShards();
+    /// Reset a chip whose pose or velocity went non-finite. Does not delete it.
+    void sanitizeShards();
     /// Free motion from gravity, contact reactions, and nodal loads.
     void advanceShards(double dt, const chrono::ChVector3d& gravity);
-    /// Sit chips on the floor and copy the rigid pose back onto their nodes.
+    /// Floor/arena contact for chips, then copy the rigid pose onto their nodes.
+    /// A chip only leaves the solve when its motion has actually died; touching
+    /// the floor is not enough.
     void finishShards(bool floorEnabled,
                       double floorHeight,
-                      const chrono::ChVector3d& arenaSize);
+                      const chrono::ChVector3d& arenaSize,
+                      const chrono::ChVector3d& gravity,
+                      double restitution,
+                      double friction);
 
 private:
     struct QuadMechanics {
@@ -284,9 +343,19 @@ private:
 
     void buildSurface(const PartDefinition& definition, bool append);
     void buildVolume(const PartDefinition& definition);
-    bool releaseMoltenTets();
-    bool refineActiveTets();
+    bool releaseMoltenTets(bool includeBrittle = true);
     int xyzMidpoint(int a, int b);
+    int xyzOnPlane(int a, int b, const chrono::ChVector3d& origin, const chrono::ChVector3d& normal);
+    std::vector<std::size_t> splitTetOnTensionPlane(std::size_t index);
+    std::vector<std::size_t> splitTetOnPlane(std::size_t index, const chrono::ChVector3d& origin,
+                                             const chrono::ChVector3d& axis,
+                                             std::map<std::pair<int, int>, int>* cuts);
+    /// Open every tet the crack plane hits. Shared edges share nodes. A child
+    /// that would be a sliver is released along its nearest face instead.
+    bool fractureCluster(const std::vector<std::size_t>& seeds, std::vector<char>& shard);
+    void releaseTetAlongFace(std::size_t index, const chrono::ChVector3d& normal);
+    /// Cut tets on the planes between plies so a laminate has real interface faces.
+    void stampPlyPlanes();
     void bisectTet(std::size_t index, int a, int b, int mid);
     int cloneNode(int original);
     int insertMidpoint(int a, int b);
@@ -297,11 +366,9 @@ private:
     int splitQuadGeometry(std::size_t quad, bool alongU);
     void isolateQuad(int quadIndex);
     void releaseShard(int quadIndex);
-    /// A node that no live shell element references has no mass. Leaving it
-    /// free makes the next implicit step singular, which is what aborts the
-    /// solve the instant a molten patch tears out.
+    /// Freeze nodes that are off every live tet and every live shell on this
+    /// part. A shattered weld partner must not pin the other part's live mesh.
     void freezeUnusedNodes();
-    bool nodeOnLiveShell(std::size_t index) const;
     bool shatterQuads();
     /// A piece that is no longer held by a clamp or a weld leaves the implicit
     /// solve. `moltenOnly` keeps a room-temperature tear as a shell and only
@@ -322,12 +389,14 @@ private:
     Material _material;
     double _thickness = 0.008;
     double _refineLimit = 0.025;
+    double _minElement = 0.002;
     double _temperature = 293.15;
     double _initialTemperature = 293.15;
     double _sharedStiffness = 1.0;
     double _sharedStrength = 1.0;
     bool _fixed = false;
     bool _shattering = false;
+    int _shatterLive0 = 0;
     std::shared_ptr<ThermalReissnerElasticity> _elasticity;
     std::shared_ptr<ReissnerJ2> _plasticity;
     std::shared_ptr<chrono::fea::ChMaterialShellReissner> _shellMaterial;
@@ -342,6 +411,9 @@ private:
     std::vector<double> _strainTemperature;
     std::vector<char> _heatActive;
     double _prescribedThermalKur = 0.0;
+    double _thermalStamp = 0.0;
+    bool _thermalPrestress = false;
+    bool _thermalLoadChanged = false;
 
     std::shared_ptr<chrono::fea::ChMesh> _mesh;
     std::vector<std::shared_ptr<chrono::fea::ChNodeFEAxyzrot>> _nodes;
@@ -367,8 +439,11 @@ private:
     std::vector<RigidShard> _shards;
     std::vector<chrono::ChVector3d> _savedPos;
     std::vector<chrono::ChVector3d> _savedVel;
+    std::vector<chrono::ChVector3d> _savedAcc;
     std::vector<chrono::ChQuaterniond> _savedRot;
     std::vector<chrono::ChQuaterniond> _savedRotDt;
+    std::vector<chrono::ChVector3d> _savedAngAcc;
+    std::vector<std::pair<int, int>> _shellSolidTies;
 };
 
 }  // namespace rcs

@@ -511,6 +511,7 @@ bool HeatField::easeStrain(std::vector<Part>& parts, double dt) {
         if (partMoved)
             moved = true;
     }
+    _strainMoved = moved;
     return moved;
 }
 
@@ -535,6 +536,7 @@ bool HeatField::advance(double dt,
     if (!sourceOn && !_dirty && !_easing) {
         _wait = 0.0;
         _sourceOn = false;
+        _strainMoved = false;
         return false;
     }
 

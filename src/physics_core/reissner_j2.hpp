@@ -72,7 +72,8 @@ private:
 /// the difference is stored as plastic strain.
 class ReissnerJ2 : public chrono::fea::ChPlasticityReissner {
 public:
-    ReissnerJ2(double yieldStress, double youngsModulus);
+    ReissnerJ2(double yieldStress, double youngsModulus, double ultimateStress = 0.0,
+               double failPlasticStrain = 0.0);
 
     void SetYieldScale(double scale) { _yieldScale = std::clamp(scale, kThermalFloor, 1.0); }
 
@@ -112,6 +113,8 @@ public:
 
 private:
     double _yield = 0.0;
+    double _ultimate = 0.0;
+    double _failPlastic = 0.0;
     double _yieldScale = 1.0;
     double _young = 1.0;
 };

@@ -1,12 +1,30 @@
 #include "physics_core/contact_load.hpp"
+#include "physics_core/physics_units.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 
 namespace rcs {
 
 using chrono::ChVector3d;
+
+namespace {
+
+void addOuter(chrono::ChMatrixDynamic<double>& m, const ChVector3d& a, const ChVector3d& b, double s) {
+    const double ax = a.x(), ay = a.y(), az = a.z();
+    const double bx = b.x(), by = b.y(), bz = b.z();
+    m(0, 0) += s * ax * bx;
+    m(0, 1) += s * ax * by;
+    m(0, 2) += s * ax * bz;
+    m(1, 0) += s * ay * bx;
+    m(1, 1) += s * ay * by;
+    m(1, 2) += s * ay * bz;
+    m(2, 0) += s * az * bx;
+    m(2, 1) += s * az * by;
+    m(2, 2) += s * az * bz;
+}
+
+}  // namespace
 
 NodeContact::NodeContact(std::shared_ptr<chrono::fea::ChNodeFEAxyz> node,
                          std::shared_ptr<const ContactWorld> world)
@@ -16,97 +34,78 @@ NodeContact::NodeContact(std::shared_ptr<chrono::fea::ChNodeFEAxyzrot> node,
                          std::shared_ptr<const ContactWorld> world)
     : chrono::ChLoadCustom(node), _rotNode(std::move(node)), _world(std::move(world)) {}
 
-void NodeContact::configure(double offset, double stiffness, double dissipation) {
+void NodeContact::configure(double offset, double stiffness, double dissipation, double mass) {
+    (void)dissipation;
     _offset = offset;
-    _stiffness = stiffness;
-    _damping = dissipation;
+    _mass = std::max(0.0, mass);
+    _stiffness = std::max(0.0, stiffness);
+    _damping = 0.0;
+    if (_mass > 0.0 && _stiffness > 0.0)
+        _damping = kContactDampingFraction * 2.0 * std::sqrt(_stiffness * _mass);
 }
 
 void NodeContact::addPlane(const ChVector3d& position,
                            const ChVector3d& velocity,
                            const ChVector3d& normal,
                            double planeOffset,
-                           ChVector3d& force)
+                           int slot,
+                           ChVector3d& force,
+                           bool jac)
 {
-    // Positive when the node has crossed the surface of the plane.
     const double gap = planeOffset + _offset - position.Dot(normal);
-    if (gap <= 0.0)
+    // A 10 µm open band keeps the penalty in the residual when Newton
+    // overshoots the plane. Dropping k to zero mid-iteration is why a
+    // second, slower landing would not converge and then froze.
+    if (gap < -1.0e-5)
         return;
     const double vn = velocity.Dot(normal);
-    // A spring that switches on at full stiffness is not differentiable at
-    // touchdown, and Newton then chatters across the surface instead of
-    // converging. Ramp the stiffness in over `kRamp` so force and slope are
-    // both continuous; beyond that it is the plain linear spring.
-    // The floor of the ramp is 20 µm, which a resting contact can resolve.
-    // HHT will not cut a step below 1 µs, and at 50 m/s that step is already
-    // 50 µm, so a fast approach widens the ramp with closing speed. The
-    // penalty stiffness itself is unchanged, and a node at rest keeps 20 µm.
-    const double closingSpeed = -vn;
-    // Full E√A at rest so a 15 m/s cube can reach yield. Fast approaches
-    // drop toward the 0.02 penalty that HHT can still take. Rankine glass
-    // then needs another drop above 25 m/s or Newton stalls; metal keeps
-    // the 0.02 floor so the same speed still yields instead of tunneling.
-    double foundation = 1.0;
-    if (_stiffness > 1.0e6) {
-        if (closingSpeed > 16.0) {
-            const double t = std::clamp((closingSpeed - 16.0) / 9.0, 0.0, 1.0);
-            foundation = 1.0 + (0.02 - 1.0) * t * t;
-        }
-        if (_softenFast && closingSpeed > 25.0)
-            foundation /= 1.0 + (closingSpeed - 25.0) / 2.0;
-    }
-    const double stiffness = _stiffness * foundation;
-    const double step = (_world && _world->stepSize > 1.0e-9) ? _world->stepSize : 5.0e-4;
-    const double travel = std::max(0.0, closingSpeed) * step;
-    const double cap = closingSpeed > 18.0 ? 2.0e-3 : (closingSpeed > 8.0 ? 5.0e-4 : 2.0e-4);
-    const double kRamp = std::max(2.0e-5, std::min(cap, travel));
-    const double stiff = gap < kRamp ? stiffness * gap * gap / (2.0 * kRamp)
-                                     : stiffness * (gap - 0.5 * kRamp);
-    // Hunt-Crossley dissipation: the stiffness itself is scaled by the closing
-    // rate, so the surface pushes harder going in than coming out and the loop
-    // encloses an area. A dashpot in parallel would instead have to be sized
-    // against the mass being stopped, and the tributary mass of one surface
-    // node is nowhere near the mass of the body arriving behind it, which is
-    // what turns a floor into a trampoline. This form needs no mass at all:
-    // the restitution falls off as roughly 1 - _damping * closing speed.
-    // For small rates this is the plain `1 + a*closing` of Hunt-Crossley. The
-    // exponential-of-tanh form keeps that slope near zero while staying smooth,
-    // strictly positive and bounded: clamping the linear form at zero puts a
-    // kink in the force that Newton has to step across, and letting it grow
-    // without limit makes a fast impact arbitrarily stiff.
-    // The cap matters as much as the coefficient. Unbounded, a fast impact
-    // makes the contact several times stiffer than the material behind it, and
-    // the Newton solve on a loose panel slamming the floor stops converging.
-    // At 0.9 the surface never gets more than about two and a half times its
-    // resting stiffness, which is enough hysteresis to hold restitution near a
-    // half without wrecking the step.
-    static const double kSaturation = [] {
-        const char* override = std::getenv("RCS_CONTACT_SATURATION");
-        return override ? std::atof(override) : 0.9;
-    }();
-    const double closing = -vn;
-    double hysteresis = std::exp(kSaturation * std::tanh(_damping * closing / kSaturation));
-    if (closingSpeed > 20.0)
-        hysteresis = 1.0 + (hysteresis - 1.0) * (20.0 / closingSpeed);
-    const double fn = stiff * hysteresis;
+    const double vStick = _world ? std::max(_world->stickSpeed, 1.0e-6) : 1.0e-3;
+    const double c = contactDashpot(_stiffness, _mass, vn, vStick);
+    // Continuum penalty: F_n = k δ − c v_n. Stabilization is inside c and
+    // is zero when the node is not closing. Unilateral: no tensile pull.
+    double fn = _stiffness * gap - c * vn;
     if (fn <= 0.0)
         return;
     _normalForce = std::max(_normalForce, fn);
     force += normal * fn;
-
+    const double mu = _world ? std::max(0.0, _world->friction) : 0.0;
     const ChVector3d vt = velocity - normal * vn;
     const double speed = vt.Length();
-    if (speed <= 1.0e-12)
+    const double ramp = std::min(1.0, speed / vStick);
+    ChVector3d tHat(0, 0, 0);
+    if (mu > 0.0 && speed > 1.0e-12) {
+        tHat = vt / speed;
+        force -= tHat * (mu * fn * ramp);
+    }
+    if (!jac && slot >= 0 && slot < 6) {
+        _planeForce[slot] = fn;
+        _planeNormal[slot] = normal;
+    }
+    if (!jac || !m_jacobians)
         return;
-    // Regularised Coulomb: full mu once sliding, ramped below the stick speed
-    // so the force stays differentiable through zero. Friction follows the
-    // elastic pressure, not the total normal force: the hysteresis term is
-    // energy going into the substrate, not extra load pressing the faces
-    // together. Letting it drive friction makes the tangential force grow
-    // with the normal approach rate, which couples the two directions and
-    // feeds the sliding motion instead of opposing it.
-    const double scale = std::min(1.0, speed / std::max(_world->stickSpeed, 1.0e-9));
-    force -= vt * (_world->friction * stiff * scale / speed);
+    // Chrono K = −dQ/dx, R = −dQ/dv. F = k δ − c v_n, δ decreasing along n.
+    addOuter(m_jacobians->K, normal, normal, _stiffness);
+    if (c > 0.0)
+        addOuter(m_jacobians->R, normal, normal, c);
+    if (mu <= 0.0 || fn <= 0.0)
+        return;
+    if (speed < vStick) {
+        const double rStick = mu * fn / vStick;
+        m_jacobians->R(0, 0) += rStick;
+        m_jacobians->R(1, 1) += rStick;
+        m_jacobians->R(2, 2) += rStick;
+        addOuter(m_jacobians->R, normal, normal, -rStick);
+    } else if (speed > 1.0e-12) {
+        const double ft = mu * fn;
+        const double s = ft / speed;
+        m_jacobians->R(0, 0) += s;
+        m_jacobians->R(1, 1) += s;
+        m_jacobians->R(2, 2) += s;
+        addOuter(m_jacobians->R, tHat, tHat, -s);
+        addOuter(m_jacobians->R, normal, normal, -s);
+        if (c > 0.0)
+            addOuter(m_jacobians->R, tHat, normal, mu * c);
+    }
 }
 
 void NodeContact::ComputeQ(chrono::ChState* state_x, chrono::ChStateDelta* state_w) {
@@ -115,6 +114,10 @@ void NodeContact::ComputeQ(chrono::ChState* state_x, chrono::ChStateDelta* state
         load_Q.setZero(ndof);
     load_Q.setZero();
     _normalForce = 0.0;
+    if (!_fillJac) {
+        for (double& fn : _planeForce)
+            fn = 0.0;
+    }
     if (!_active || !_world || _stiffness <= 0.0)
         return;
 
@@ -128,17 +131,29 @@ void NodeContact::ComputeQ(chrono::ChState* state_x, chrono::ChStateDelta* state
                                                       : ChVector3d(0, 0, 0));
 
     ChVector3d force(0, 0, 0);
+    const bool jac = _fillJac;
     if (_world->floorEnabled)
-        addPlane(position, velocity, ChVector3d(0, 1, 0), _world->floorHeight, force);
-    addPlane(position, velocity, ChVector3d(1, 0, 0), -_world->halfX, force);
-    addPlane(position, velocity, ChVector3d(-1, 0, 0), -_world->halfX, force);
-    addPlane(position, velocity, ChVector3d(0, 0, 1), -_world->halfZ, force);
-    addPlane(position, velocity, ChVector3d(0, 0, -1), -_world->halfZ, force);
-    addPlane(position, velocity, ChVector3d(0, -1, 0), -_world->ceiling, force);
+        addPlane(position, velocity, ChVector3d(0, 1, 0), _world->floorHeight, 0, force, jac);
+    addPlane(position, velocity, ChVector3d(1, 0, 0), -_world->halfX, 1, force, jac);
+    addPlane(position, velocity, ChVector3d(-1, 0, 0), -_world->halfX, 2, force, jac);
+    addPlane(position, velocity, ChVector3d(0, 0, 1), -_world->halfZ, 3, force, jac);
+    addPlane(position, velocity, ChVector3d(0, 0, -1), -_world->halfZ, 4, force, jac);
+    addPlane(position, velocity, ChVector3d(0, -1, 0), -_world->ceiling, 5, force, jac);
 
     load_Q(0) = force.x();
     load_Q(1) = force.y();
     load_Q(2) = force.z();
+}
+
+void NodeContact::ComputeJacobian(chrono::ChState* state_x, chrono::ChStateDelta* state_w) {
+    if (!m_jacobians)
+        CreateJacobianMatrices();
+    m_jacobians->K.setZero();
+    m_jacobians->R.setZero();
+    m_jacobians->M.setZero();
+    _fillJac = true;
+    ComputeQ(state_x, state_w);
+    _fillJac = false;
 }
 
 }  // namespace rcs

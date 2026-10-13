@@ -52,6 +52,7 @@ desktop.ini
 credentials.json
 
 # Logs and caches
+/logs/
 *.log
 .cache/
 .clangd/

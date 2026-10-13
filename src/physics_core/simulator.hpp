@@ -5,8 +5,10 @@
 #include "physics_core/scenario.hpp"
 
 #include "chrono/physics/ChSystemSMC.h"
+#include "chrono/timestepper/ChTimestepperExplicit.h"
 
 #include <atomic>
+#include <memory>
 #include <mutex>
 #include <thread>
 
@@ -35,9 +37,12 @@ public:
                bool mesh = true);
 
     /// One integrator step at simulated time `time`. False if the state blew up.
+    /// When `cancel` is set, HHT stops starting new increments after the
+    /// current Newton attempt returns, instead of draining the rest of `dt`.
     bool step(double dt, double time, const Environment& environment,
               const std::vector<ImpactLoad>& loads,
-              const std::vector<HeatSource>& heat = {});
+              const std::vector<HeatSource>& heat = {},
+              std::atomic<bool>* cancel = nullptr);
 
     /// Snapshot the current state as a single-frame recording, for the
     /// authoring viewport.
@@ -51,13 +56,25 @@ public:
     Assembly& assembly() { return _assembly; }
     const Assembly& assembly() const { return _assembly; }
     chrono::ChSystemSMC& system() { return _system; }
+    int newtonRejectCount() const { return _newtonRejects; }
+    /// HHT substeps that kept a finite, non-inverted iterate.
+    int hhtCommitCount() const { return _hhtCommits; }
 
 private:
     void refreshLinearSolver();
+    void ensureExplicit(bool lumped);
+    bool tryExplicitStep(double h, bool lumped);
 
     chrono::ChSystemSMC _system;
     Assembly _assembly;
+    std::unique_ptr<chrono::ChTimestepperEulerExplicitIIorder> _explicit;
+    bool _explicitLumped = false;
     bool _contactStepFailed = false;
+    int _newtonRejects = 0;
+    int _hhtCommits = 0;
+    int _prevContactCount = -1;
+    int _newtonSuccessStreak = 0;
+    double _localH = 0.0;
 };
 
 /// Runs a scenario on a worker thread so a multi-second batch never stalls
@@ -72,6 +89,7 @@ public:
     bool collect(Recording& out);
 
     bool running() const { return _running; }
+    bool cancelling() const { return _running && _control.cancel.load(); }
     float progress() const { return _control.progress.load(); }
     double simulatedTime() const { return _control.simulatedTime.load(); }
     double runDuration() const { return _control.duration.load(); }

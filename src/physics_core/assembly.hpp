@@ -7,6 +7,7 @@
 #include "physics_core/recording.hpp"
 #include "physics_core/scenario.hpp"
 
+#include "chrono/fea/ChLinkNodeNode.h"
 #include "chrono/physics/ChLoadContainer.h"
 #include "chrono/physics/ChSystem.h"
 
@@ -70,6 +71,11 @@ public:
     /// scene is still at its initial temperature and no source is on.
     void advanceHeat(double dt, double time, const Environment& environment,
                      const std::vector<HeatSource>& sources);
+    /// Thermal strain or curvature is in the elements (a continuum load).
+    bool hasThermalPrestress() const;
+    /// Strain temperature or prescribed curvature changed this step.
+    bool thermalLoadPending() const;
+    void clearThermalLoadChanged();
 
     /// Accumulate every external nodal force for the coming step. True when
     /// the implicit contact set changed and the solver needs a fresh setup.
@@ -87,23 +93,62 @@ public:
 
     /// Detach shell elements past the material's tear limit. True if nodes were added.
     bool tearOverstretched();
-    /// Refine and detach solid tetrahedra on the same slow clock as heat.
-    /// `allowRefine` is false during a combat-speed floor hit so bisection
-    /// cannot grow the live tet count while the core is still landing.
-    bool maintainVolume(double dt, bool allowRefine = true);
-    /// Split a fast floor approach so one substep moves a node by at most 2 mm.
-    /// Capped at 16 so HHT is not left to walk the user step down to 1 µs.
+    /// Detach molten tetrahedra on the same slow clock as heat. The mesh
+    /// itself is chosen at simulate start and does not grow during the run.
+    bool maintainVolume(double dt);
+    /// Split a fast floor approach so one substep does not jump through the
+    /// contact patch (closing speed times dt vs sqrt of nodal area).
     int impactSubsteps(const Environment& environment, double dt) const;
     /// Contact onset uses this as the free-flight length of one substep.
     void setContactStep(double h);
-    /// When clear, molten tetrahedra still leave but nothing is split finer.
-    void setDynamicResolution(bool enabled) { _dynamicResolution = enabled; }
     /// Throw away tet trial state from a rejected HHT step.
     void discardTrial();
+    /// Keep tet plastic from the last accepted Newton iterate.
+    void commitPlastic();
+    void enforceRigidNodes();
+    double peakPlastic() const;
     void captureKinematics();
     void restoreKinematics();
-    /// Remove chips that have not settled, so a bad one cannot abort the run.
+    /// Unused on the live HHT path. Kept so leftover call sites compile.
+    void applyFloorBounce(const Environment& environment, bool newtonFailed = false);
+    /// True when any live node is within `pad` of the floor contact plane.
+    bool touchingFloor(const Environment& environment, double pad) const;
+    /// Surface nodes currently penetrating any arena plane (floor, walls, ceiling).
+    int activeContactCount() const;
+    /// Fastest closing speed of a live contact node into an arena plane, m/s.
+    double maxApproachSpeed() const;
+    /// Soonest time for a live skin node to reach an arena plane under
+    /// `gravity`. 0 if already on/in a plane; `kNoContactTime` if none close.
+    double minTimeToContact(const chrono::ChVector3d& gravity) const;
+    /// Deepest live-node penetration into any arena plane, metres.
+    double maxContactPenetration() const;
+    /// Deepest floor overshoot of a free node, metres. 0 if none or no floor.
+    double maxFloorOvershoot(const Environment& environment) const;
+    /// True when any live brittle part is at or past Rankine on the trial pose.
+    bool pastBrittleRankine() const;
+    /// Mesh-scaled length a contact step may penetrate before it is rejected.
+    double contactLengthScale() const;
+    /// Unused on the live HHT path. Kept so leftover call sites compile.
+    void ballisticAdvance(double dt, const chrono::ChVector3d& gravity);
+    /// Unused on the live HHT path. Kept so leftover call sites compile.
+    void rigidAdvance(double dt, const Environment& environment);
+    /// Integrate the already-assembled nodal loads (gravity, user punches,
+    /// part contact) when HHT did not converge, then the caller seats the floor.
+    void explicitAdvance(double dt);
+    void refreshTetTrials();
+    /// Translational kinetic energy of live nodes and rigid chips, joules.
+    double kineticEnergy() const;
+    /// Penalty spring energy ½ k δ² on live arena contacts, joules.
+    double contactElasticEnergy() const;
+    /// Mass-weighted centre-of-mass height, metres.
+    double massHeight() const;
+    /// Project live (non-molten, non-chip) nodes out of other live volumes.
+    void correctInterpenetration();
+    /// Remove chips that have not settled. Prefer `sanitizeShards` on a
+    /// rejected step; deleting flying chips is what made a pane vanish.
     bool discardAwakeShards();
+    /// Reset non-finite rigid chips in place so they cannot abort the FEA step.
+    void sanitizeShards();
 
     /// Promote a weld that was skipped as redundant, once a tree link has broken.
     /// True when a new constraint was added.
@@ -113,6 +158,8 @@ public:
     void writeFrame(Frame& frame) const;
 
     bool finite() const;
+    /// Live tetrahedra whose current volume has flipped or flattened.
+    int invertedTetCount() const;
     /// True when at least one part still has a free FEA node for HHT to solve.
     bool hasFreeSolve() const;
     chrono::ChVector3d center() const;
@@ -137,7 +184,8 @@ private:
     void buildWeld(chrono::ChSystem& system,
                    const WeldDefinition& definition,
                    std::vector<int>& translationSet,
-                   std::vector<int>& rotationSet);
+                   std::vector<int>& rotationSet,
+                   std::vector<char>& snapped);
     void buildScrew(chrono::ChSystem& system,
                     const ScrewDefinition& definition,
                     std::vector<int>& translationSet,
@@ -179,6 +227,7 @@ private:
     void applyUserLoads(const std::vector<ImpactLoad>& loads, double time);
     void refreshAdjacency();
     void inheritWeldNodes();
+    void classifySeams(std::vector<char>& state) const;
 
     std::size_t globalNode(std::size_t part, std::size_t node) const {
         return _nodeOffset[part] + node;
@@ -199,20 +248,21 @@ private:
     HeatField _heat;
     std::vector<WeldDefinition> _weldDefs;
     double _volumeWait = 0.0;
-    bool _dynamicResolution = true;
     std::vector<Part> _parts;
     std::vector<Joint> _joints;
+    std::vector<std::shared_ptr<chrono::fea::ChLinkNodeNode>> _continuity;
     std::vector<DeferredLink> _deferred;
     chrono::ChSystem* _system = nullptr;
     chrono::ChVector3d _authoredCenter{0, 0, 0};
     chrono::ChQuaterniond _placementRotation{1, 0, 0, 0};
     chrono::ChVector3d _placementPosition{0, 0, 0};
     std::vector<std::size_t> _nodeOffset;
-    /// Parts joined by an intact joint skip mutual contact: their meshes share
-    /// a seam and would otherwise push each other apart forever.
+    /// Still used by connectedParts; part-part contact no longer blanks a
+    /// whole pair just because a weld pin remains.
     std::vector<char> _jointAdjacency;
-    /// Per part pair: whether contact between them has been armed. See
-    /// applyPartContact for why a pair starts disarmed.
+    /// Per part pair: 0 = not yet colliding, 1 = first contact step (overlap
+    /// capped), 2 = ongoing. Overlapping pairs arm immediately so a broken
+    /// weld cannot fold through, and so stacked volumes actually collide.
     std::vector<char> _contactArmed;
     /// Arena and friction as the contact elements see them.
     std::shared_ptr<ContactWorld> _contactWorld;

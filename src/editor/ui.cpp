@@ -67,6 +67,7 @@ struct HierDrag {
 
 void selectClickedPart(EditorState& state, std::size_t index) {
     state.selectedGroup.reset();
+    state.selectedWeld.reset();
     if (ImGui::GetIO().KeyCtrl) {
         auto found = std::find(state.selectedParts.begin(), state.selectedParts.end(), index);
         if (found == state.selectedParts.end())
@@ -76,6 +77,7 @@ void selectClickedPart(EditorState& state, std::size_t index) {
     } else {
         state.selectedParts = {index};
         state.selectedFaces.clear();
+        state.selectedWeld.reset();
     }
     if (state.selectedParts.empty())
         state.selectFaces = false;
@@ -401,6 +403,11 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
                                            pos[2] - centroid.z()};
             for (std::size_t i : targets)
                 applyPartTranslation(context.definition->parts[i], delta);
+            std::vector<char> inGroup(context.definition->parts.size(), 0);
+            for (std::size_t i : targets)
+                if (i < inGroup.size())
+                    inGroup[i] = 1;
+            transformAuthoredJoints(*context.definition, inGroup, delta);
             state.rebuildRequested = true;
         }
         chrono::ChVector3d euler = targets.size() == 1 ? partEuler(context.definition->parts[targets[0]])
@@ -421,6 +428,11 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
             const chrono::ChQuaterniond delta = qNew * qOld.GetConjugate();
             for (std::size_t i : targets)
                 applyPartRotation(context.definition->parts[i], delta, centroid);
+            std::vector<char> inGroup(context.definition->parts.size(), 0);
+            for (std::size_t i : targets)
+                if (i < inGroup.size())
+                    inGroup[i] = 1;
+            rotateAuthoredJoints(*context.definition, inGroup, delta, centroid);
             state.rebuildRequested = true;
         }
         if (targets.size() > 1)
@@ -455,6 +467,9 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
                          const_cast<std::vector<Material>*>(&presets),
                          static_cast<int>(presets.size()))) {
             part.material = presets[static_cast<std::size_t>(preset)];
+            part.sizing.cached = false;
+            part.volume = {};
+            part.surface = {};
             state.rebuildRequested = true;
         }
         Material& material = part.material;
@@ -465,6 +480,27 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
             material.fracture = static_cast<FractureMode>(mode);
             edited = true;
         }
+        int fabric = static_cast<int>(material.breakFabric);
+        const char* fabrics[] = {"Isotropic", "Tempered", "Grain"};
+        if (ImGui::Combo("Break fabric", &fabric, fabrics, 3)) {
+            material.breakFabric = static_cast<BreakFabric>(fabric);
+            edited = true;
+        }
+        if (material.breakFabric == BreakFabric::Grain) {
+            chrono::ChVector3d grain(material.grainDirection[0], material.grainDirection[1],
+                                     material.grainDirection[2]);
+            if (vectorControl("Grain direction", grain, 0.05f)) {
+                if (grain.Length() > 1.0e-12)
+                    grain.Normalize();
+                material.grainDirection[0] = grain.x();
+                material.grainDirection[1] = grain.y();
+                material.grainDirection[2] = grain.z();
+                edited = true;
+            }
+        }
+        if (material.breakFabric == BreakFabric::Tempered)
+            edited |= scalarControl("Residual tension (Pa)", material.residualTension, 1.0e6f, 0.0f, 5.0e8f,
+                                    "%.4g");
         edited |= ImGui::Checkbox("Dice on first crack", &material.shatterToDust);
 
         if (ImGui::TreeNode("Elastic")) {
@@ -499,6 +535,9 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
         if (edited) {
             material.allowPlasticity =
                 material.fracture == FractureMode::Ductile && material.yieldStress > 0.0;
+            part.sizing.cached = false;
+            part.volume = {};
+            part.surface = {};
             state.rebuildRequested = true;
         }
         ImGui::TextDisabled("Contact stiffness and floor restitution are under Scenario.");
@@ -543,8 +582,10 @@ void drawAssemblyPanel(EditorState& state, const UiContext& context) {
     ImGui::BeginDisabled(context.simulating);
     if (ImGui::Button("Add solid aluminum cube", {-1.0f, 0.0f}))
         state.addSolidCubeRequested = true;
+    if (ImGui::Button("Add solid aluminum sphere", {-1.0f, 0.0f}))
+        state.addSolidSphereRequested = true;
     ImGui::EndDisabled();
-    ImGui::TextDisabled("Thin walls stay shells. Thick regions are tetrahedra. Welds stay manual.");
+    ImGui::TextDisabled("Thin walls stay shells. Thick regions are tetrahedra.");
 
     if (!state.selectedParts.empty() && context.definition &&
         state.selectedParts.front() < context.definition->parts.size()) {
@@ -791,15 +832,19 @@ void drawRunPanel(EditorState& state, const UiContext& context) {
         ImGui::ProgressBar(context.progress, {-1.0f, 0.0f});
         ImGui::Text("%.2f s / %.2f s    step %lld / %lld", context.simulatedTime, context.runDuration,
                     context.simStep, context.simStepCount);
-        if (ImGui::Button("Cancel", {-1.0f, 32.0f}))
+        if (context.cancelling) {
+            ImGui::BeginDisabled();
+            ImGui::Button("Stopping...", {-1.0f, 32.0f});
+            ImGui::EndDisabled();
+            ImGui::TextDisabled("Waiting for the current solver increment to finish.");
+        } else if (ImGui::Button("Cancel", {-1.0f, 32.0f})) {
             state.cancelRequested = true;
+        }
     } else {
         if (ImGui::Button("Simulate", {-1.0f, 32.0f}))
             state.simulateRequested = true;
         scalarControl("Resolution", state.scenario.settings.meshResolution, 0.05f, 0.25f, 8.0f, "%.2f");
         ImGui::TextDisabled("1 is the part's own element size. Higher adds tetrahedra everywhere.");
-        ImGui::Checkbox("Dynamic Resolution", &state.scenario.settings.dynamicResolution);
-        ImGui::TextDisabled("When on, a hot or loaded spot is split finer than this mesh.");
     }
 
     if (!state.status.empty())
@@ -910,6 +955,8 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
     radio("Rotate", Tool::Rotate, state.selectedFaces.empty());
     ImGui::SameLine();
     radio("Splice", Tool::Splice, !state.selectedFaces.empty());
+    ImGui::SameLine();
+    radio("Weld", Tool::Weld, !state.selectedFaces.empty());
     if (state.tool == Tool::Select) {
         ImGui::BeginDisabled(state.selectedParts.empty());
         ImGui::Checkbox("Select faces", &state.selectFaces);
@@ -923,13 +970,13 @@ void drawEditorUi(EditorState& state, const UiContext& context) {
             }
         }
     }
-    if (state.selectedFaces.empty() && state.tool == Tool::Splice)
+    if (state.selectedFaces.empty() && (state.tool == Tool::Splice || state.tool == Tool::Weld))
         state.tool = Tool::Select;
     if (!state.selectedFaces.empty() && (state.tool == Tool::Move || state.tool == Tool::Rotate))
         state.tool = Tool::Select;
     ImGui::EndDisabled();
     ImGui::TextDisabled("Right drag orbits, middle drag pans, wheel zooms.");
-    ImGui::TextDisabled("Ctrl+click adds to the selection. Del deletes.");
+    ImGui::TextDisabled("Ctrl+click adds to the selection. Del deletes. Ctrl+W welds.");
 
     ImGui::End();
 
@@ -1073,8 +1120,7 @@ void drawFaceOverlays(const EditorState& state,
         }
     }
     const SplicePreview& preview = state.splicePreview;
-    if (!preview.valid || state.tool != Tool::Splice)
-        return;
+    if (preview.valid && state.tool == Tool::Splice) {
     ImVec2 ca, cb;
     if (project(preview.chordA, ca) && project(preview.chordB, cb)) {
         draw->AddLine(ca, cb, IM_COL32(80, 220, 255, 255), 2.0f);
@@ -1107,6 +1153,76 @@ void drawFaceOverlays(const EditorState& state,
         } else {
             ImVec2 mid{(sa.x + sb.x) * 0.5f, (sa.y + sb.y) * 0.5f - 10.0f};
             text(mid, formatMillimetres(preview.edgeLength[i]).c_str());
+        }
+    }
+    }
+
+    const ImU32 weldColour = state.selectedWeld ? IM_COL32(90, 255, 130, 255) : IM_COL32(40, 200, 80, 255);
+    const float weldThick = state.selectedWeld ? 3.5f : 2.5f;
+    for (const auto& loop : state.weldOutlines) {
+        if (loop.size() < 2)
+            continue;
+        const std::size_t segs = loop.size() >= 3 ? loop.size() : loop.size() - 1;
+        for (std::size_t i = 0; i < segs; ++i) {
+            ImVec2 a, b;
+            if (!project(loop[i], a) || !project(loop[(i + 1) % loop.size()], b))
+                continue;
+            draw->AddLine(a, b, weldColour, weldThick);
+        }
+    }
+
+    const WeldPreview& weld = state.weldPreview;
+    if (!weld.valid || state.tool != Tool::Weld)
+        return;
+    for (const auto& dest : weld.destLoops) {
+        for (std::size_t i = 0; i < dest.loop.size(); ++i) {
+            ImVec2 sa, sb;
+            if (!project(dest.loop[i], sa) ||
+                !project(dest.loop[(i + 1) % dest.loop.size()], sb))
+                continue;
+            ImVec2 mid{(sa.x + sb.x) * 0.5f, (sa.y + sb.y) * 0.5f - 10.0f};
+            if (i < dest.edgeLength.size())
+                text(mid, formatMillimetres(dest.edgeLength[i]).c_str());
+        }
+    }
+    for (std::size_t i = 0; i < weld.outline.size(); ++i) {
+        ImVec2 sa, sb;
+        if (!project(weld.outline[i], sa) ||
+            !project(weld.outline[(i + 1) % weld.outline.size()], sb))
+            continue;
+        draw->AddLine(sa, sb, IM_COL32(255, 255, 255, 255), 2.0f);
+    }
+    for (const auto& hit : weld.outlineHits) {
+        ImVec2 hp;
+        if (!project(hit.point, hp))
+            continue;
+        if (hit.square)
+            draw->AddRect({hp.x - 8.0f, hp.y - 8.0f}, {hp.x + 8.0f, hp.y + 8.0f},
+                          IM_COL32(255, 255, 255, 255), 0.0f, 0, 2.0f);
+        else
+            draw->AddCircle(hp, 14.0f, IM_COL32(255, 255, 255, 255), 20, 1.5f);
+        text({hp.x, hp.y - 20.0f}, formatDegrees(hit.interiorDeg).c_str());
+    }
+    for (int c = 0; c < 2; ++c) {
+        const WeldChord& chord = weld.chords[c];
+        if (chord.length < 1.0e-9)
+            continue;
+        ImVec2 ca, cb;
+        if (project(chord.a, ca) && project(chord.b, cb)) {
+            draw->AddLine(ca, cb, IM_COL32(80, 220, 255, 255), 2.0f);
+            text({(ca.x + cb.x) * 0.5f, (ca.y + cb.y) * 0.5f - 14.0f},
+                 formatMillimetres(chord.length).c_str());
+        }
+        for (int h = 0; h < 2; ++h) {
+            ImVec2 hp;
+            if (!project(chord.hits[h].point, hp))
+                continue;
+            if (chord.square[h])
+                draw->AddRect({hp.x - 8.0f, hp.y - 8.0f}, {hp.x + 8.0f, hp.y + 8.0f},
+                              IM_COL32(80, 220, 255, 255), 0.0f, 0, 2.0f);
+            else
+                draw->AddCircle(hp, 14.0f, IM_COL32(80, 220, 255, 255), 20, 1.5f);
+            text({hp.x, hp.y - 20.0f}, formatDegrees(chord.interiorDeg[h]).c_str());
         }
     }
 }

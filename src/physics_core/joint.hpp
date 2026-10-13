@@ -12,9 +12,11 @@
 
 namespace rcs {
 
-/// A manual weld. The user states which two parts are joined; every pair of
-/// coincident boundary nodes inside the (optional) region becomes one weld
-/// link, so a bead can fail progressively instead of all at once.
+/// A manual weld. The user states which two parts are joined; nodes along
+/// the (optional) bead become one weld link each, so a seam can fail
+/// progressively instead of all at once. Break force is
+/// weldShearStrength times tributary area: spacing*throat on an edge, or
+/// a share of the enclosed face on a closed bead. Uses the weaker parent.
 struct WeldDefinition {
     std::string label = "Weld";
     std::size_t partA = 0;
@@ -22,9 +24,16 @@ struct WeldDefinition {
     double tolerance = 2.0e-3;   ///< node pairing distance, m
     double throat = 0.0;         ///< bead throat, m; 0 means min part thickness
     double strengthScale = 1.0;  ///< derating factor for a poor bead
+    /// Peel strength, Pa. Zero uses the shear allowable as the peel strength.
+    double peelStrength = 0.0;
     bool useRegion = false;
     chrono::ChVector3d regionMin{0, 0, 0};
     chrono::ChVector3d regionMax{0, 0, 0};
+    /// Closed perimeter in authored metres. Empty keeps the old behaviour:
+    /// every coincident boundary pair inside the optional AABB. A nonempty
+    /// bead keeps only pairs whose midpoint sits on this loop, so a flush
+    /// face weld does not glue the whole skin.
+    std::vector<chrono::ChVector3d> bead;
 };
 
 /// A manual fastener at a point. A bolt pattern is several of these; CAD
@@ -57,7 +66,16 @@ struct JointLink {
     std::size_t nodeB = 0;
     double breakForce = 0.0;
     double breakTorque = 0.0;
+    /// Peel capacity, N. Zero means the link is rated on |force| alone.
+    double breakPeel = 0.0;
+    /// Opening already present when the link was tied. Later damage is only
+    /// growth past this, so a midsurface seam is not born broken.
+    double restGap = 0.0;
+    /// Opening at which the cohesive law is exhausted, metres.
+    double criticalOpening = 0.0;
+    chrono::ChVector3d peelAxis{0.0, 1.0, 0.0};
     double filteredForce = 0.0;
+    chrono::ChVector3d filteredForceVec{0, 0, 0};
     double filteredTorque = 0.0;
     double utilisation = 0.0;
     int overloadSteps = 0;

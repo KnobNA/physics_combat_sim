@@ -296,6 +296,7 @@ set(COMBAT_SIM_PHYSICS_SOURCES
     src/physics_core/assembly.cpp
     src/physics_core/cad.cpp
     src/physics_core/simulator.cpp
+    src/physics_core/physics_units.cpp
 )
 
 add_executable(combat_sim
@@ -339,21 +340,70 @@ set_target_properties(combat_sim_physics_smoke PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG}
 )
 
+# ---------------------------------------------------------------------------
+# GoogleTest unit suite (known I/O per physics calculation; no Simulator::step)
+# ---------------------------------------------------------------------------
+set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
+set(BUILD_GMOCK OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.14.0
+)
+FetchContent_MakeAvailable(googletest)
+enable_testing()
+include(GoogleTest)
+
+add_executable(combat_sim_unit_tests
+    tests/unit/test_loads.cpp
+    tests/unit/test_materials.cpp
+    tests/unit/test_constitutive.cpp
+    tests/unit/test_fracture.cpp
+    tests/unit/test_welds.cpp
+    tests/unit/test_mesh_geom.cpp
+    tests/unit/test_contact_gains.cpp
+    tests/unit/test_recording.cpp
+    tests/unit/test_joints.cpp
+    ${COMBAT_SIM_PHYSICS_SOURCES}
+)
+target_include_directories(combat_sim_unit_tests PRIVATE src)
+target_link_libraries(combat_sim_unit_tests PRIVATE
+    GTest::gtest_main
+    tetgen
+    ${CHRONO_TARGETS}
+    MKL::MKL
+)
+add_dependencies(combat_sim_unit_tests chrono_build)
+set_target_properties(combat_sim_unit_tests PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE}
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG ${CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG}
+)
+gtest_discover_tests(combat_sim_unit_tests
+    DISCOVERY_MODE PRE_TEST
+    WORKING_DIRECTORY $<TARGET_FILE_DIR:combat_sim_unit_tests>
+)
+
 if(DEFINED CHRONO_DATA_DIR)
     target_compile_definitions(combat_sim PRIVATE "CHRONO_DATA_DIR=\"${CHRONO_DATA_DIR}\"")
     target_compile_definitions(combat_sim_physics_smoke PRIVATE "CHRONO_DATA_DIR=\"${CHRONO_DATA_DIR}\"")
+    target_compile_definitions(combat_sim_unit_tests PRIVATE "CHRONO_DATA_DIR=\"${CHRONO_DATA_DIR}\"")
 endif()
 
 if(MSVC)
     target_compile_options(combat_sim PRIVATE /bigobj /utf-8)
     target_compile_options(combat_sim_physics_smoke PRIVATE /bigobj /utf-8)
+    target_compile_options(combat_sim_unit_tests PRIVATE /bigobj /utf-8)
     if(DEFINED CHRONO_MSVC_RUNTIME_LIBRARY)
         set_target_properties(combat_sim PROPERTIES MSVC_RUNTIME_LIBRARY ${CHRONO_MSVC_RUNTIME_LIBRARY})
         set_target_properties(combat_sim_physics_smoke PROPERTIES MSVC_RUNTIME_LIBRARY ${CHRONO_MSVC_RUNTIME_LIBRARY})
+        set_target_properties(combat_sim_unit_tests PROPERTIES MSVC_RUNTIME_LIBRARY ${CHRONO_MSVC_RUNTIME_LIBRARY})
     endif()
     set_property(TARGET combat_sim PROPERTY VS_DEBUGGER_ENVIRONMENT
         "MKL_INTERFACE_LAYER=LP64\nMKL_THREADING_LAYER=TBB")
     set_property(TARGET combat_sim_physics_smoke PROPERTY VS_DEBUGGER_ENVIRONMENT
+        "MKL_INTERFACE_LAYER=LP64\nMKL_THREADING_LAYER=TBB")
+    set_property(TARGET combat_sim_unit_tests PROPERTY VS_DEBUGGER_ENVIRONMENT
         "MKL_INTERFACE_LAYER=LP64\nMKL_THREADING_LAYER=TBB")
 endif()
 
@@ -362,15 +412,17 @@ if(COMMAND add_CHRONO_DLLS_copy_command)
 endif()
 
 # Always copy Chrono (and SDL2 if shared) next to the executable.
-foreach(_chrono_tgt IN ITEMS Chrono::Chrono_core Chrono::Chrono_pardisomkl Chrono::pardisomkl)
-    if(TARGET ${_chrono_tgt})
-        add_custom_command(TARGET combat_sim POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                $<TARGET_FILE:${_chrono_tgt}>
-                $<TARGET_FILE_DIR:combat_sim>
-            COMMENT "Copying ${_chrono_tgt} next to combat_sim"
-        )
-    endif()
+foreach(_exe IN ITEMS combat_sim combat_sim_unit_tests)
+    foreach(_chrono_tgt IN ITEMS Chrono::Chrono_core Chrono::Chrono_pardisomkl Chrono::pardisomkl)
+        if(TARGET ${_chrono_tgt})
+            add_custom_command(TARGET ${_exe} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    $<TARGET_FILE:${_chrono_tgt}>
+                    $<TARGET_FILE_DIR:${_exe}>
+                COMMENT "Copying ${_chrono_tgt} next to ${_exe}"
+            )
+        endif()
+    endforeach()
 endforeach()
 
 # Pardiso loads MKL kernels (and Intel OpenMP) by DLL name at runtime.
@@ -410,23 +462,27 @@ foreach(_dir IN LISTS _mkl_dll_dirs)
 endforeach()
 if(_mkl_runtime_dlls)
     list(REMOVE_DUPLICATES _mkl_runtime_dlls)
-    foreach(_dll IN LISTS _mkl_runtime_dlls)
-        add_custom_command(TARGET combat_sim POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                "${_dll}"
-                $<TARGET_FILE_DIR:combat_sim>
-            COMMENT "Copying MKL runtime DLL next to combat_sim"
-        )
+    foreach(_exe IN ITEMS combat_sim combat_sim_unit_tests)
+        foreach(_dll IN LISTS _mkl_runtime_dlls)
+            add_custom_command(TARGET ${_exe} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "${_dll}"
+                    $<TARGET_FILE_DIR:${_exe}>
+                COMMENT "Copying MKL runtime DLL next to ${_exe}"
+            )
+        endforeach()
     endforeach()
 endif()
 
 if(EXISTS "${CHRONO_BINARY_DIR}/bin/Release/yaml-cpp.dll")
-    add_custom_command(TARGET combat_sim POST_BUILD
-        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-            "${CHRONO_BINARY_DIR}/bin/$<CONFIG>/yaml-cpp.dll"
-            $<TARGET_FILE_DIR:combat_sim>
-        COMMENT "Copying yaml-cpp next to combat_sim"
-    )
+    foreach(_exe IN ITEMS combat_sim combat_sim_unit_tests)
+        add_custom_command(TARGET ${_exe} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                "${CHRONO_BINARY_DIR}/bin/$<CONFIG>/yaml-cpp.dll"
+                $<TARGET_FILE_DIR:${_exe}>
+            COMMENT "Copying yaml-cpp next to ${_exe}"
+        )
+    endforeach()
 endif()
 
 if(TARGET SDL2::SDL2)
