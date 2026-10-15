@@ -222,7 +222,11 @@ TEST(makeSteppedSolid, WebFinerThanBossAndResolutionScalesBoth) {
     }
 }
 
-TEST(makeTestCube, PanelsStayTetrahedralSolids) {
+// Issue #1: the 8 mm / 400 mm panels are thin walls, so the idealization
+// policy may make them shells or properly layered solids
+// (IdealizationPolicy.SlenderSolidsHaveLayersThroughThickness). Whichever it
+// picks, a tet fill must stay inside the panel and never fill the box cavity.
+TEST(makeTestCube, PanelsNeverFillTheCavity) {
     rcs::AssemblyDefinition box = rcs::makeTestCube();
     for (auto& part : box.parts)
         rcs::applyResolutionSizing(part, 1.0);
@@ -230,7 +234,6 @@ TEST(makeTestCube, PanelsStayTetrahedralSolids) {
     const double inner = 0.5 * (0.40 - 0.008) - 0.004;
     for (auto& part : box.parts) {
         ASSERT_TRUE(rcs::ensurePartMesh(part)) << part.name;
-        EXPECT_FALSE(part.volume.empty()) << part.name;
         EXPECT_LT(part.volume.tets.size(), 8000u) << part.name;
         for (const auto& tet : part.volume.tets) {
             chrono::ChVector3d center{0, 0, 0};
@@ -244,7 +247,10 @@ TEST(makeTestCube, PanelsStayTetrahedralSolids) {
     }
 }
 
-TEST(ensurePartMesh, SlenderHyperelasticStaysShell) {
+// Issue #2: shells use a linear small-strain law, so a finite-strain
+// (hyperelastic) material must not be placed on one. Refusing to mesh it is
+// also a valid outcome under the policy.
+TEST(ensurePartMesh, SlenderHyperelasticIsNotALinearShell) {
     rcs::PartDefinition sheet;
     sheet.name = "Rubber sheet";
     sheet.material = rcs::rubber();
@@ -257,9 +263,9 @@ TEST(ensurePartMesh, SlenderHyperelasticStaysShell) {
     sheet.patch.divU = 4;
     sheet.patch.divV = 4;
     rcs::applyResolutionSizing(sheet, 1.0);
-    ASSERT_TRUE(rcs::ensurePartMesh(sheet));
-    EXPECT_TRUE(sheet.volume.empty());
-    EXPECT_EQ(sheet.sizing.throughThickness, 0);
+    if (!rcs::ensurePartMesh(sheet))
+        return;
+    EXPECT_FALSE(sheet.volume.empty());
 }
 
 TEST(ensurePartMesh, BulkyHyperelasticStaysTets) {
@@ -362,7 +368,7 @@ rcs::PartDefinition thinClosedPlate(const rcs::Material& material) {
 }
 
 TEST(ensurePartMesh, ThinClosedSheetsStayShells) {
-    const std::vector<rcs::Material> materials = {rcs::rubber(), rcs::aluminum6061(), rcs::glass(), rcs::wood()};
+    const std::vector<rcs::Material> materials = {rcs::aluminum6061(), rcs::glass(), rcs::wood()};
     for (const rcs::Material& material : materials) {
         rcs::PartDefinition plate = thinClosedPlate(material);
         rcs::applyResolutionSizing(plate, 1.0);
@@ -374,6 +380,18 @@ TEST(ensurePartMesh, ThinClosedSheetsStayShells) {
         EXPECT_EQ(part.tetCount(), 0) << material.name;
         EXPECT_GT(part.triangles().size(), 0u) << material.name;
     }
+}
+
+// Issue #2: the rubber entry used to sit in the test above. A thin rubber
+// sheet must not land on a linear shell (or meshing refuses it).
+TEST(ensurePartMesh, ThinClosedRubberSheetIsNotALinearShell) {
+    rcs::PartDefinition plate = thinClosedPlate(rcs::rubber());
+    rcs::applyResolutionSizing(plate, 1.0);
+    if (!rcs::ensurePartMesh(plate))
+        return;
+    rcs::Part part;
+    part.build(plate);
+    EXPECT_GT(part.tetCount(), 0);
 }
 
 TEST(ensurePartMesh, BulkyCubeKeepsComparableTetEdges) {
@@ -441,12 +459,13 @@ rcs::PartDefinition thinCurvedShell() {
     return part;
 }
 
-TEST(ensurePartMesh, CurvedThinRubberStaysShellAndBends) {
+// Issue #2: thin rubber is meshed under the compatibility policy (not as a
+// linear shell), and a clamped rubber sheet still bends under a light load.
+TEST(ensurePartMesh, CurvedThinRubberMeshesUnderPolicyAndBends) {
     rcs::PartDefinition curved = thinCurvedShell();
     rcs::applyResolutionSizing(curved, 1.0);
-    ASSERT_TRUE(rcs::ensurePartMesh(curved));
-    EXPECT_TRUE(curved.volume.empty());
-    EXPECT_FALSE(curved.surface.empty());
+    if (rcs::ensurePartMesh(curved))
+        EXPECT_FALSE(curved.volume.empty());
 
     rcs::PartDefinition sheet;
     sheet.name = "Rubber sheet";
@@ -459,8 +478,8 @@ TEST(ensurePartMesh, CurvedThinRubberStaysShellAndBends) {
     sheet.patch.uSize = 0.2;
     sheet.patch.vSize = 0.2;
     rcs::applyResolutionSizing(sheet, 0.25);
-    ASSERT_TRUE(rcs::ensurePartMesh(sheet));
-    EXPECT_TRUE(sheet.volume.empty());
+    if (!rcs::ensurePartMesh(sheet))
+        GTEST_SKIP() << "policy refuses slender rubber; the bending check needs a finite-strain shell";
 
     rcs::AssemblyDefinition assembly;
     assembly.parts.push_back(sheet);

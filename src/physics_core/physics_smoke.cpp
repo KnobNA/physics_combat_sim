@@ -2671,7 +2671,8 @@ void checkMesh() {
         std::printf("editor hollow wall %s tets %zu shells %zu verts %zu\n", part.name.c_str(),
                     part.volume.tets.size(), part.surface.triangles.size(),
                     part.volume.vertices.size() + part.surface.vertices.size());
-        check(!part.volume.empty(), "editor hollow wall tet-fills the 8 mm panel");
+        // Issue #1: an 8 mm / 400 mm panel is a thin wall, so the idealization
+        // policy may make it a shell; only a tet fill is checked below.
         check(part.volume.tets.size() < 8000, "editor hollow wall stays under the tet budget");
         if (!part.volume.empty())
             expectField(part, part.name.c_str());

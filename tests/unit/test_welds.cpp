@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -144,20 +145,21 @@ TEST(makeTestCube, TwelveWeldsLieOnKissingFaces) {
     EXPECT_EQ(backSeams, 2);
 }
 
+// Every seam needs nodes on the bead on both sides, whether the policy makes
+// the panels shells or solids (issue #1). Checked on the built parts, so a
+// Reissner patch counts as much as a tet fill.
 TEST(makeTestCube, MeshedSeamsKeepKissingNodes) {
     rcs::AssemblyDefinition box = rcs::makeTestCube();
     for (auto& part : box.parts)
         rcs::applyResolutionSizing(part, 1.0);
     rcs::seedWeldBeads(box);
-    std::size_t tetsMin = static_cast<std::size_t>(-1);
-    std::size_t tetsMax = 0;
     const double inner = 0.5 * (0.40 - 0.008) - 0.004;
-    for (auto& part : box.parts) {
+    std::vector<rcs::Part> built(box.parts.size());
+    int elementsMin = std::numeric_limits<int>::max();
+    int elementsMax = 0;
+    for (std::size_t i = 0; i < box.parts.size(); ++i) {
+        auto& part = box.parts[i];
         ASSERT_TRUE(rcs::ensurePartMesh(part)) << part.name;
-        ASSERT_FALSE(part.volume.empty()) << part.name;
-        EXPECT_TRUE(part.surface.empty()) << part.name;
-        tetsMin = std::min(tetsMin, part.volume.tets.size());
-        tetsMax = std::max(tetsMax, part.volume.tets.size());
         EXPECT_LT(part.volume.tets.size(), 8000u) << part.name;
         for (const auto& tet : part.volume.tets) {
             chrono::ChVector3d center{0, 0, 0};
@@ -168,22 +170,23 @@ TEST(makeTestCube, MeshedSeamsKeepKissingNodes) {
                          std::abs(center.z()) < inner)
                 << part.name;
         }
+        built[i].build(part);
+        elementsMin = std::min(elementsMin, built[i].totalElementCount());
+        elementsMax = std::max(elementsMax, built[i].totalElementCount());
     }
-    EXPECT_GE(tetsMin, 20u);
-    EXPECT_LT(tetsMax, tetsMin * 25u);
+    EXPECT_GE(elementsMin, 16);
+    EXPECT_LT(elementsMax, elementsMin * 25);
 
     const double capture = 1.5 * 0.008;
     for (const auto& weld : box.welds) {
-        const auto& a = box.parts[weld.partA].volume;
-        const auto& b = box.parts[weld.partB].volume;
-        int hitsA = 0;
-        int hitsB = 0;
-        for (const auto& p : a.vertices)
-            hitsA += rcs::distanceToBead(weld.bead, p) <= capture ? 1 : 0;
-        for (const auto& p : b.vertices)
-            hitsB += rcs::distanceToBead(weld.bead, p) <= capture ? 1 : 0;
-        EXPECT_GE(hitsA, 4) << weld.label << " missed " << box.parts[weld.partA].name;
-        EXPECT_GE(hitsB, 4) << weld.label << " missed " << box.parts[weld.partB].name;
+        auto hits = [&](const rcs::Part& part) {
+            int count = 0;
+            for (std::size_t n = 0; n < part.nodeCount(); ++n)
+                count += rcs::distanceToBead(weld.bead, part.nodePosition(n)) <= capture ? 1 : 0;
+            return count;
+        };
+        EXPECT_GE(hits(built[weld.partA]), 4) << weld.label << " missed " << box.parts[weld.partA].name;
+        EXPECT_GE(hits(built[weld.partB]), 4) << weld.label << " missed " << box.parts[weld.partB].name;
     }
 }
 
@@ -246,7 +249,9 @@ TEST(makeTestCube, WeldSnapKeepsOuterSkin) {
     EXPECT_EQ(welded, 12);
 }
 
-TEST(makeTestCube, RubberShellKeepsWeldsAndFloor) {
+// Issue #2: the rubber box may be shells or solids under the compatibility
+// policy; either way the welds must hold and the box must land on the floor.
+TEST(makeTestCube, RubberBoxKeepsWeldsAndFloor) {
     rcs::AssemblyDefinition box = rcs::makeTestCube();
     for (auto& part : box.parts) {
         part.material = rcs::rubber();
@@ -270,8 +275,6 @@ TEST(makeTestCube, RubberShellKeepsWeldsAndFloor) {
     const double wall = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     EXPECT_FALSE(rec.diverged);
     EXPECT_LT(wall, 20.0) << "s/step crawl commits=" << sim.hhtCommitCount();
-    for (const auto& part : sim.assembly().parts())
-        EXPECT_FALSE(part.hasVolume());
     int links = 0;
     int broken = 0;
     for (const auto& joint : sim.assembly().joints()) {
