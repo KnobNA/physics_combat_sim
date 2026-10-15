@@ -364,6 +364,8 @@ add_executable(combat_sim_unit_tests
     tests/unit/test_contact_gains.cpp
     tests/unit/test_recording.cpp
     tests/unit/test_joints.cpp
+    tests/unit/test_seam_coupling.cpp
+    tests/unit/test_thermal_stress.cpp
     ${COMBAT_SIM_PHYSICS_SOURCES}
 )
 target_include_directories(combat_sim_unit_tests PRIVATE src)
