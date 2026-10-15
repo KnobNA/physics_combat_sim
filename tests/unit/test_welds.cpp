@@ -199,11 +199,17 @@ TEST(makeTestCube, WeldSnapKeepsOuterSkin) {
         chrono::ChVector3d lo{0, 0, 0};
         chrono::ChVector3d hi{0, 0, 0};
     };
+    // Reference skin from each panel built on its own, so the check works
+    // whether the idealization policy makes the panels tets or shells (#1).
     std::vector<Box> before;
     for (auto& part : cube.parts) {
         ASSERT_TRUE(rcs::ensurePartMesh(part)) << part.name;
-        Box box{part.volume.vertices.front(), part.volume.vertices.front()};
-        for (const auto& p : part.volume.vertices) {
+        rcs::Part alone;
+        alone.build(part);
+        ASSERT_GT(alone.nodeCount(), 0u) << part.name;
+        Box box{alone.nodePosition(0), alone.nodePosition(0)};
+        for (std::size_t n = 1; n < alone.nodeCount(); ++n) {
+            const chrono::ChVector3d p = alone.nodePosition(n);
             box.lo = {std::min(box.lo.x(), p.x()), std::min(box.lo.y(), p.y()), std::min(box.lo.z(), p.z())};
             box.hi = {std::max(box.hi.x(), p.x()), std::max(box.hi.y(), p.y()), std::max(box.hi.z(), p.z())};
         }
