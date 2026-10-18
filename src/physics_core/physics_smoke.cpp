@@ -378,6 +378,7 @@ void checkGlassShatters() {
     const auto advice = simulator.assembly().adviseLoad(0, scenario.loads, scenario.settings.timestep);
     std::printf("glass load on %zu nodes, %.2f m/s per step\n", advice.nodeCount, advice.deltaVPerStep);
     const int before = simulator.assembly().parts()[0].liveElementCount();
+    const std::size_t nodesBefore = simulator.assembly().parts()[0].nodeCount();
     double peakDuring = 0.0;
     double endTension = 0.0;
     bool finite = true;
@@ -408,7 +409,10 @@ void checkGlassShatters() {
     expectFinite(finite, "glass punch stays in the solver");
     expectRange(peakDuring, 0.75 * rcs::glass().fractureStrength, 5.0 * rcs::glass().fractureStrength,
                 "glass punch reaches Rankine tension");
-    check(!chips.empty() || (before > 0 && after < before), "glass face shatters into more than one piece");
+    // Issue #4: a crack that opens faces and keeps every element live (more
+    // nodes, no chips) counts as shattering just as much as chips do.
+    check(!chips.empty() || (before > 0 && after < before) || glassPart.nodeCount() > nodesBefore,
+          "glass face shatters into more than one piece");
     expectRange(endTension / std::max(peakDuring, 1.0), 0.0, 0.70, "shatter relieves the peak tension");
     check(!chips.empty(), "detached chips leave the shell solve");
     expectRange(worstAspect, 1.0, 20.0, "glass shards are not long needles");
@@ -3797,6 +3801,7 @@ void checkChips() {
     SmokeSim simulator;
     simulator.reset(clampedPlate(rcs::glass(), 4), scenario);
     const int before = simulator.assembly().parts()[0].liveElementCount();
+    const std::size_t nodesBefore = simulator.assembly().parts()[0].nodeCount();
     bool finite = true;
     double t = 0.0;
     const double dt = scenario.settings.timestep;
@@ -3814,7 +3819,8 @@ void checkChips() {
                 after, shards, peakShards, simulator.newtonRejectCount());
     expectFinite(finite && pane.finite() && simulator.assembly().finite(),
                  "brittle peel with Newton rejects stays finite");
-    check(shards > 0 || peakShards > 0 || after < before, "brittle punch peels chips");
+    check(shards > 0 || peakShards > 0 || after < before || pane.nodeCount() > nodesBefore,
+          "brittle punch opens a crack (chips or live crack faces)");
     check(shards == peakShards || shards > 0, "flying chips stay after a rejected Newton step");
     expectRange(double(after) / std::max(double(before), 1.0), 0.05, 4.0,
                 "live glass is not discarded on reject");
