@@ -15,14 +15,14 @@ This is a batch FEA tool, not a game physics sandbox and not yet a full SIL (ROS
 
 ## Status
 
-Early development. The default scene is a **400 mm hollow aluminium box**: six 8 mm panels meshed as tetrahedra and joined by twelve edge welds. OBJ / STL import, weld tools, plasticity, brittle / ductile / elastomer paths, and shell / solid classification are in place and still being hardened. Expect rough edges; unit and smoke targets below catch many of them.
+Early development. The default scene is a **400 mm hollow aluminium box**: six 8 mm panels meshed as shells, because each wall is thin relative to its span (t/L = 0.02), and joined by twelve edge welds. OBJ / STL import, weld tools, plasticity, brittle / ductile / elastomer paths, and shell / solid classification are in place and still being hardened. Expect rough edges; unit and smoke targets below catch many of them.
 
 ## Features
 
 - **Assemblies of parts** — each panel or imported body is its own FEA mesh, not one fused solid.
 - **Manual joints** — welds (edge beads with shear / peel / cohesive opening) and screws; links can fail progressively under load.
 - **Continuum materials** — aluminium 6061-T6, mild steel, AR500, soda-lime and tempered glass, rubber, hardwood; handbook-style thermal softening where applicable.
-- **Mesh strategy** — TetGen volume fills for stocky / authored solids; Reissner or BST shells for slender walls; mixed classification from local thickness vs span.
+- **Mesh strategy** — shell or solid from thickness over span, for every material. Reissner or BST shells for slender metal and brittle walls; TetGen fills stocky regions and closed finite-strain walls. `throughThickness` sets solid layer count, not the element family.
 - **Contact and loads** — gravity, optional floor plane, blunt applied forces, optional simple aerodynamics.
 - **Batch HHT integrate** — Pardiso (Intel oneMKL) sparse direct solve; record frames, then play / loop / scrub.
 - **Editor viewport** — Magnum + ImGui: select / move / rotate / splice / weld tools, stress and temperature maps, weld utilisation on playback.
@@ -40,12 +40,12 @@ CAD / test cube  →  mesh (tet / shell)  →  Chrono FEA system
 ```
 
 1. **Definition** — parts carry material, thickness, and either an authored panel, a surface mesh (OBJ/STL), or a volume mesh produced at simulate time.
-2. **Meshing** — `ensurePartMesh` decides shell vs solid from geometry (and authored through-thickness for ductile solids like the test panels). TetGen fills volumes; slender closed sheets stay midsurface shells.
+2. **Meshing** — `ensurePartMesh` decides shell vs solid from thickness over span. `throughThickness` only sets how many layers a solid gets. Slender metal and brittle walls are midsurface shells. A finite-strain material has no linear shell, so a thin rubber patch is refused and a closed rubber body is tet-filled.
 3. **Assembly** — kissing skins get coincident node ties (`ChLinkNodeNode`); shell seams keep rest gap (`OffsetNodeWeld`); mixed shell–solid uses frame links where needed.
 4. **Solve** — each user timestep may cut back on contact onset; Newton / HHT residuals drive rejects. Failed weld links disable without aborting the whole run when possible.
 5. **Record** — node poses, stress peaks, temperatures, and joint state are stored for offline scrubbing so the viewport stays interactive during the worker solve.
 
-The built-in test cube stands in for a CAD robot: six independent solids, twelve welds, drop or rest on a floor. That is the reference path for “does a welded box stay together.”
+The built-in test cube stands in for a CAD robot: six independent shell panels, twelve welds, drop or rest on a floor. That is the reference path for “does a welded box stay together.”
 
 ## Requirements
 

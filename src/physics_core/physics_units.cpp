@@ -1,4 +1,5 @@
 #include "physics_core/physics_units.hpp"
+#include "physics_core/element_policy.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -200,8 +201,7 @@ void mooneyRivlinCauchy(const chrono::ChMatrix33<>& stretch, double youngs, doub
 }
 
 bool volumeHyperelastic(const Material& material) {
-    return material.fracture == FractureMode::Compliant && material.yieldStress <= 0.0 &&
-           material.poissonRatio >= 0.45;
+    return usesHyperelasticLaw(material);
 }
 
 void henckyVoigt(const chrono::ChMatrix33<>& stretch, ChVectorDynamic<>& strain) {

@@ -43,8 +43,9 @@ void henckyVoigt(const chrono::ChMatrix33<>& stretch, chrono::ChVectorDynamic<>&
 /// uniaxial. Thermal strain scales U by 1/(1+αΔT). Used for yield=0 solids.
 void mooneyRivlinCauchy(const chrono::ChMatrix33<>& stretch, double youngs, double nu,
                         double thermalStrain, chrono::ChVectorDynamic<>& stress);
-/// True when a bulky part uses Mooney-Rivlin (nearly incompressible, no yield)
-/// rather than J2. Slenderness, not this flag, decides shell versus tet fill.
+/// True when tets use Mooney-Rivlin. Same predicate as ThermalTet4: the yield
+/// passed in is 0 when plasticity is off, and Rankine is off. Shell placement
+/// asks compatibility(), not this flag.
 bool volumeHyperelastic(const Material& material);
 
 /// Strength multiplier for opening: 1 across the grain, 3 along the fiber.

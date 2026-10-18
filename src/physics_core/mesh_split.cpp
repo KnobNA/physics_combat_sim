@@ -1,5 +1,6 @@
 #include "physics_core/mesh_split.hpp"
 #include "physics_core/assembly.hpp"
+#include "physics_core/element_policy.hpp"
 #include "physics_core/physics_units.hpp"
 
 #define TETLIBRARY
@@ -710,12 +711,26 @@ std::vector<double> vertexSizeField(const SurfaceMesh& source, const std::vector
     return size;
 }
 
-bool faceIsThinWall(double thickness, double inplane, double minElement) {
+/// One thin-wall test. Span is the larger in-plane size, not the diagonal, and
+/// not a mesh-size knob. The same cutoff is used for patches, closed bodies,
+/// open sheets, and weld seeding.
+constexpr double kThinWallSlenderness = 0.15;
+
+bool isSlenderWall(double thickness, double span) {
     if (thickness >= 1.0e20 || thickness <= 1.0e-12)
         return false;
-    if (thickness < 3.0 * std::max(minElement, 1.0e-9))
-        return true;
-    return thickness / std::max(inplane, 1.0e-9) < 0.15;
+    return thickness / std::max(span, 1.0e-9) < kThinWallSlenderness;
+}
+
+bool faceIsThinWall(double thickness, double inplane) {
+    return isSlenderWall(thickness, inplane);
+}
+
+/// Small-strain shells are legal for this material. Hyperelastic laws are not:
+/// a patch is refused and a closed body is tet-filled instead.
+bool linearShellAllowed(const Material& material) {
+    return compatibility(material, ElementFamily::ReissnerShell).allowed &&
+           compatibility(material, ElementFamily::KirchhoffTriShell).allowed;
 }
 
 /// In-plane extent of each face's connected region of similar ray thickness.
@@ -807,7 +822,9 @@ std::vector<double> regionSpans(const SurfaceMesh& mesh, const std::vector<doubl
             vMin = std::min(vMin, v);
             vMax = std::max(vMax, v);
         }
-        const double extent = std::hypot(uMax - uMin, vMax - vMin);
+        const double du = uMax >= uMin ? uMax - uMin : 0.0;
+        const double dv = vMax >= vMin ? vMax - vMin : 0.0;
+        const double extent = std::max(du, dv);
         for (int face : faces)
             span[static_cast<std::size_t>(face)] = std::max(extent, 1.0e-9);
     }
@@ -827,7 +844,7 @@ void classifyWalls(const SurfaceMesh& mesh, const std::vector<double>& thickness
     for (std::size_t i = 0; i < count; ++i) {
         const double t = i < thickness.size() ? thickness[i] : 1.0e30;
         const double width = i < span.size() ? span[i] : 0.0;
-        if (faceIsThinWall(t, width, minElement))
+        if (faceIsThinWall(t, width))
             slender[i] = 1;
         else if (t < 1.0e20)
             stocky[i] = 1;
@@ -1087,13 +1104,11 @@ bool meshClosedBody(PartDefinition& part, const SurfaceMesh& source, double h) {
     int bulkCount = 0;
     double thinArea = 0.0;
     double bulkArea = 0.0;
-    // throughThickness >= 2 is an authored solid (the 8 mm test-cube panels).
-    // Treating those as mid-plane shells puts the weld 4 mm off the bead, and
-    // the coincident link stalls HHT at ~2 min/step. The same geometric test
-    // applies to every material: a slender wall is a shell, a bulky region
-    // is a tet fill. A nearly incompressible wall is never a linear tet.
-    const bool lockProne = volumeHyperelastic(part.material);
-    if (part.sizing.throughThickness < 2 || lockProne) {
+    // Shell versus solid is geometry only. throughThickness is how many layers
+    // a solid extrusion asked for; it does not skip this test, and the
+    // material does not either. A finite-strain material is stripped back to
+    // a tet fill after the geometric decision, below.
+    {
         std::vector<char> shellFace;
         classifyWalls(source, thickness, part.sizing.minElement, shellFace, band);
         (void)band;
@@ -1137,8 +1152,6 @@ bool meshClosedBody(PartDefinition& part, const SurfaceMesh& source, double h) {
         // solid to tet. If almost all area is thin-wall, the part is a shell.
         if (thinCount > 0 && thinArea > 3.0 * std::max(bulkArea, 1.0e-18))
             bulkCount = 0;
-    } else {
-        bulkCount = static_cast<int>(source.triangles.size());
     }
 
     auto finishVolume = [&]() {
@@ -1158,14 +1171,9 @@ bool meshClosedBody(PartDefinition& part, const SurfaceMesh& source, double h) {
         double extent[3] = {hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z()};
         std::sort(extent, extent + 3);
         // A plate has one small dimension and two comparable large ones. A bar
-        // has two small dimensions, so it stays a tet body.
-        // A thin brittle plate is a shell too. Linear tets stay a rigid lid,
-        // chip a corner, then the parent solve stops.
-        const bool plateFabric =
-            volumeHyperelastic(part.material) || part.material.fracture == FractureMode::Brittle;
-        const bool authoredSolid = part.sizing.throughThickness >= 2 && !plateFabric;
-        if (!authoredSolid && extent[0] > 1.0e-9 && extent[0] / std::max(extent[1], 1.0e-9) < 0.15 &&
-            extent[1] / std::max(extent[2], 1.0e-9) > 0.5) {
+        // has two small dimensions, so it stays a tet body. Span is the middle
+        // extent, the same larger in-plane size a square patch uses.
+        if (isSlenderWall(extent[0], extent[1]) && extent[1] / std::max(extent[2], 1.0e-9) > 0.5) {
             thin.assign(source.triangles.size(), 1);
             dropped.assign(source.triangles.size(), 0);
             thinCount = static_cast<int>(source.triangles.size());
@@ -1176,6 +1184,15 @@ bool meshClosedBody(PartDefinition& part, const SurfaceMesh& source, double h) {
             }
             part.thickness = extent[0];
         }
+    }
+
+    // Geometry may call faces shells. A finite-strain material has no linear
+    // shell, so a closed body is tet-filled instead of mid-surfaced.
+    if (!linearShellAllowed(part.material)) {
+        thin.assign(source.triangles.size(), 0);
+        dropped.assign(source.triangles.size(), 0);
+        thinCount = 0;
+        bulkCount = static_cast<int>(source.triangles.size());
     }
 
     if (thinCount > 0 && bulkCount == 0) {
@@ -1356,26 +1373,24 @@ bool ensurePartMesh(PartDefinition& part) {
         int divV = std::max(1, static_cast<int>(std::ceil(part.patch.vSize / localH)));
         const int cap = tetBudgetCap(part.sizing, part.material);
         const double span = std::max(part.patch.uSize, part.patch.vSize);
-        const bool slender = thickness / std::max(span, 1.0e-9) < 0.15;
-        // Kirchhoff plate theory: a wall whose thickness/span is below ~0.15
-        // carries load in bending and membrane, not as a 3D continuum. One
-        // linear tet through that thickness has no plate bending; three tets
-        // of ν≈0.49 lock volumetrically. Reissner shells are the thin-structure
-        // model for every material. A bulky patch still tet-fills below.
-        if (slender)
+        const bool slender = isSlenderWall(thickness, span);
+        // A slender patch is a Reissner shell when that element is legal.
+        // Finite-strain materials have no such shell: refuse the patch rather
+        // than extrude locking tets. A bulky patch stays a solid even when the
+        // tet budget is tight; coarsen it, do not flip it back to a shell.
+        if (slender) {
+            if (!linearShellAllowed(part.material))
+                return false;
             return keepAsShell(thickness, localH, divU, divV);
+        }
         layers = std::max(layers, 3);
         while (6 * divU * divV * layers > cap && (divU > 1 || divV > 1)) {
             localH *= 1.25;
             divU = std::max(1, static_cast<int>(std::ceil(part.patch.uSize / localH)));
             divV = std::max(1, static_cast<int>(std::ceil(part.patch.vSize / localH)));
         }
-        while (6 * divU * divV * layers > cap && layers > 3)
+        while (6 * divU * divV * layers > cap && layers > 1)
             --layers;
-        // A nearly incompressible sheet locks if it is extruded with too few
-        // linear tets. The same budget rule shells every material.
-        if (6 * divU * divV * layers > cap || layers < 3)
-            return keepAsShell(thickness, localH, divU, divV);
         part.patch.divU = divU;
         part.patch.divV = divV;
         part.sizing.maxElement = std::max(localH, part.sizing.minElement);
@@ -1417,32 +1432,6 @@ bool ensurePartMesh(PartDefinition& part) {
     }
 
     const SurfaceMesh& source = part.source;
-    // A plate that still carries its patch (one face left after the other
-    // panels are deleted) stays a Reissner grid. Falling through to the solid
-    // fill removes that grid and the part locks.
-    if ((volumeHyperelastic(part.material) || part.material.fracture == FractureMode::Brittle) &&
-        part.patch.uSize > 1.0e-6 && part.patch.vSize > 1.0e-6 && !source.vertices.empty()) {
-        chrono::ChVector3d boxLo = source.vertices.front();
-        chrono::ChVector3d boxHi = boxLo;
-        for (const chrono::ChVector3d& p : source.vertices) {
-            boxLo = {std::min(boxLo.x(), p.x()), std::min(boxLo.y(), p.y()), std::min(boxLo.z(), p.z())};
-            boxHi = {std::max(boxHi.x(), p.x()), std::max(boxHi.y(), p.y()), std::max(boxHi.z(), p.z())};
-        }
-        double span[3] = {boxHi.x() - boxLo.x(), boxHi.y() - boxLo.y(), boxHi.z() - boxLo.z()};
-        std::sort(span, span + 3);
-        const double plateArea = std::max(span[1] * span[2], 1.0e-12);
-        const double patchArea = part.patch.uSize * part.patch.vSize;
-        const bool plate = span[0] <= 1.0e-9 || (span[0] / std::max(span[1], 1.0e-9) < 0.15 &&
-                                                  span[1] / std::max(span[2], 1.0e-9) > 0.5);
-        const bool areaOk = patchArea > 0.25 * plateArea && patchArea < 4.0 * plateArea;
-        if (plate && areaOk) {
-            const double thickness = std::max(part.thickness, span[0] > 1.0e-9 ? span[0] : part.thickness);
-            double localH = h;
-            int divU = std::max(1, static_cast<int>(std::ceil(part.patch.uSize / localH)));
-            int divV = std::max(1, static_cast<int>(std::ceil(part.patch.vSize / localH)));
-            return keepAsShell(thickness, localH, divU, divV);
-        }
-    }
     const bool closed = closedEnough(source) && std::abs(meshVolume(source)) > 1.0e-12;
     part.surface = {};
     part.volume = {};
@@ -1477,21 +1466,12 @@ bool ensurePartMesh(PartDefinition& part) {
         }
         span = std::max({span, hi.x() - lo.x(), hi.y() - lo.y(), hi.z() - lo.z()});
     }
-    std::vector<char> shellFace;
-    std::vector<char> band;
-    classifyWalls(source, thickness, part.sizing.minElement, shellFace, band);
-    (void)band;
-    int thinCount = 0;
-    for (char face : shellFace)
-        thinCount += face ? 1 : 0;
     int layers = extrusionLayers(thick, h);
-    const bool slender = thick / std::max(span, 1.0e-9) < 0.15 ||
-                         thinCount * 2 >= static_cast<int>(source.triangles.size()) ||
-                         (volumeHyperelastic(part.material) && layers < 3);
+    const bool slender = isSlenderWall(thick, span);
     // One linear tet through a thin open sheet has no plate bending. A welded
-    // glass pane then rode into the floor as a rigid lid. The same is true of
-    // a slender elastomer: locking tets are not a substitute for a shell.
-    if (slender) {
+    // glass pane then rode into the floor as a rigid lid. A finite-strain
+    // sheet cannot use that shell, so it falls through to the extrusion.
+    if (slender && linearShellAllowed(part.material)) {
         part.surface = source;
         part.surface.thickness.resize(part.surface.triangles.size());
         for (std::size_t i = 0; i < part.surface.triangles.size(); ++i) {
@@ -1714,10 +1694,10 @@ void seedWeldBeads(AssemblyDefinition& assembly) {
             return;
         const double thickness = std::max(part.thickness, part.sizing.minElement);
         const double span = std::max(part.patch.uSize, part.patch.vSize);
-        // A slender patch is a Reissner shell. Baking it to `source` made
-        // ensurePartMesh extrude one tet through the thickness and killed
-        // plate bending. The thickness/span test is constitutive-agnostic.
-        if (thickness / std::max(span, 1.0e-9) < 0.15)
+        // A slender patch stays a Reissner grid when the shell is legal, and
+        // stays a patch (so meshing can refuse it) when the shell is not.
+        // Baking either one into `source` would pick a different family.
+        if (isSlenderWall(thickness, span))
             return;
         SurfaceMesh mid = sheetFromPatch(part.patch);
         chrono::ChVector3d u = part.patch.uAxis;
@@ -1780,13 +1760,17 @@ void seedWeldBeads(AssemblyDefinition& assembly) {
             }
         }
 
-        // Authored solids keep the bead on existing thickness-edge and
-        // kiss-strip faces. Interior Steiner points on a 400 mm skin made
-        // tetgen emit 10× the budget and left the seam off the kissing strip.
-        const bool interiorA = a.patch.uSize > 1.0e-6 && a.patch.vSize > 1.0e-6 &&
-                               a.sizing.throughThickness < 2;
-        const bool interiorB = b.patch.uSize > 1.0e-6 && b.patch.vSize > 1.0e-6 &&
-                               b.sizing.throughThickness < 2;
+        // Interior Steiner points belong on parts that will be solids. A
+        // slender wall is a shell (or a refused patch); stamping the skin of
+        // a 400 mm panel made tetgen blow the budget. throughThickness is not
+        // the family switch.
+        auto willBeSolid = [](const PartDefinition& part) {
+            const double span = std::max(part.patch.uSize, part.patch.vSize);
+            const double thickness = std::max(part.thickness, part.sizing.minElement);
+            return part.patch.uSize > 1.0e-6 && part.patch.vSize > 1.0e-6 && !isSlenderWall(thickness, span);
+        };
+        const bool interiorA = willBeSolid(a);
+        const bool interiorB = willBeSolid(b);
         for (const ChVector3d& sample : samples) {
             if (!a.source.triangles.empty())
                 insertSkinPoint(a.source, sample, capture, interiorA);
