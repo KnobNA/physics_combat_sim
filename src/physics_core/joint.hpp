@@ -1,5 +1,7 @@
 #pragma once
 
+#include "physics_core/interface.hpp"
+
 #include "chrono/core/ChVector3.h"
 #include "chrono/fea/ChLinkNodeFrame.h"
 #include "chrono/fea/ChLinkNodeNode.h"
@@ -26,6 +28,8 @@ struct WeldDefinition {
     double strengthScale = 1.0;  ///< derating factor for a poor bead
     /// Peel strength, Pa. Zero uses the shear allowable as the peel strength.
     double peelStrength = 0.0;
+    /// Explicit seam rating. Zero fields are derived from the two parents.
+    InterfaceDefinition interface;
     bool useRegion = false;
     chrono::ChVector3d regionMin{0, 0, 0};
     chrono::ChVector3d regionMax{0, 0, 0};
@@ -60,6 +64,9 @@ struct JointLink {
     std::shared_ptr<chrono::fea::ChLinkNodeNode> pointLink;
     /// Position tie between a shell node (xyzrot) and a solid node (xyz).
     std::shared_ptr<chrono::fea::ChLinkNodeFrame> frameLink;
+    /// xyz-xyz tie that keeps the built separation instead of collapsing it.
+    /// Not a coincident point link: the nodes stay where the mesh put them.
+    std::shared_ptr<chrono::fea::ChLinkNodeNode> offsetLink;
     std::size_t partA = 0;
     std::size_t nodeA = 0;
     std::size_t partB = 0;

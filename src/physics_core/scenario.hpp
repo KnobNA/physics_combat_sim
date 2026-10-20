@@ -39,9 +39,10 @@ struct Environment {
     /// Penalty contact, per node. Stiffness and damping are clamped per node
     /// to whatever the timestep can integrate stably.
     ///
-    /// The floor is fixed concrete. Deformable rebound comes from continuum
-    /// elasticity, not this coefficient. `floorRestitution` is only the
-    /// rigid-chip bounce in finishShards. Friction is the dry-concrete range.
+    /// The floor is fixed concrete. `floorRestitution` is the impulse bounce
+    /// of rigid chips and sets the Hunt-Crossley damping of deformable
+    /// contact; structural ringing adds to or takes from that rebound.
+    /// Friction is the dry-concrete range.
     double contactStiffness = 1.0e6;  ///< N/m
     double contactDamping = 2.0e4;    ///< N*s/m, clamped to the stable limit
     double floorRestitution = 0.15;

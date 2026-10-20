@@ -96,6 +96,11 @@ private:
     void elasticLaw(chrono::ChMatrixDynamic<>& C) const;
     void trialStress(chrono::ChVectorDynamic<>& stress, chrono::ChVectorDynamic<>& strain);
     void deformationalSpeed(chrono::ChVectorDynamic<>& speed) const;
+    /// Volumetric dashpot η = ρ c L for the hyperelastic law, Pa·s; 0 for
+    /// other laws. Linear in the volume rate so it always dissipates and is
+    /// smooth through zero; a compression-only switch is a kink Newton
+    /// cycles across on a nearly incompressible elastomer.
+    double bulkViscosity() const;
     /// Fraction of the elastic law still carried. Damage fades it near tear.
     /// The yield return caps the force; the tangent stays elastic so a soft
     /// punch can still converge. Fast impacts use contact substeps instead.

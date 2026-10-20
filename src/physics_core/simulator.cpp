@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <sstream>
 #include <thread>
@@ -24,10 +25,171 @@
 namespace rcs {
 namespace {
 
+/// One MKL thread. Pardiso's parallel reductions do not repeat bit for bit,
+/// and two identical drops then land a fraction of a millimetre apart.
 int solverThreadCount() {
-    const int hardware = static_cast<int>(std::thread::hardware_concurrency());
-    return std::clamp(hardware, 1, 8);
+    _putenv("MKL_NUM_THREADS=1");
+    _putenv("MKL_DYNAMIC=FALSE");
+    return 1;
 }
+
+/// Chrono's HHT with a backtracking line search on the Newton update, as
+/// Abaqus/Standard and Adams do. Element tangents here are approximate (the
+/// Reissner shell's assumed-strain shear, the corotated tet), and without a
+/// line search an inexact tangent can lock Newton into a two-iterate cycle
+/// that no step cut breaks. The equations, predictor and convergence test
+/// are Chrono's; only the length of each update changes, and only when the
+/// full update raised the residual.
+class LineSearchHht : public chrono::ChTimestepperHHT {
+public:
+    explicit LineSearchHht(chrono::ChIntegrableIIorder* integrable) : chrono::ChTimestepperHHT(integrable) {}
+
+private:
+    void coefficients() {
+        _alpha = GetAlpha();
+        _gamma = (1.0 - 2.0 * _alpha) / 2.0;
+        _beta = std::pow(1.0 - _alpha, 2) / 4.0;
+    }
+
+    void InitializeStep() override {
+        coefficients();
+        integrable->StateSetup(X, V, A);
+        Ds.setZero(integrable->GetNumCoordsVelLevel(), integrable);
+        Dl.setZero(integrable->GetNumConstraints());
+        _xNew.setZero(integrable->GetNumCoordsPosLevel(), integrable);
+        _vNew.setZero(integrable->GetNumCoordsVelLevel(), integrable);
+        _aNew.setZero(integrable->GetNumCoordsVelLevel(), integrable);
+        R.setZero(integrable->GetNumCoordsVelLevel());
+        _rOld.setZero(integrable->GetNumCoordsVelLevel());
+        Qc.setZero(integrable->GetNumConstraints());
+        L.setZero(integrable->GetNumConstraints());
+        _lNew.setZero(integrable->GetNumConstraints());
+        integrable->StateGather(X, V, T);
+        integrable->StateGatherAcceleration(A);
+        integrable->StateGatherReactions(L);
+    }
+
+    void PrepareStep() override {
+        coefficients();
+        if (step_control)
+            _aNew = A;
+        else
+            _aNew.setZero(integrable->GetNumCoordsVelLevel(), integrable);
+        _vNew = V + _aNew * h;
+        _xNew = X + _vNew * h + _aNew * (h * h);
+        integrable->LoadResidual_F(_rOld, -_alpha / (1.0 + _alpha));
+        integrable->LoadResidual_CqL(_rOld, L, -_alpha / (1.0 + _alpha));
+        CalcErrorWeights(A, reltol, abstolS, ewtS);
+        _lNew = L;
+        CalcErrorWeights(L, reltol, abstolL, ewtL);
+        _havePrevious = false;
+    }
+
+    void place(const chrono::ChStateDelta& a) {
+        _xNew = X + V * h + A * (h * h * (0.5 - _beta)) + a * (h * h * _beta);
+        _vNew = V + A * (h * (1.0 - _gamma)) + a * (h * _gamma);
+    }
+
+    /// HHT residual at the current iterate, into R and Qc. Returns |R|² + |Qc|².
+    double residual() {
+        integrable->StateScatter(_xNew, _vNew, T + h, chrono::UpdateFlags::UPDATE_ALL_NO_VISUAL);
+        R = _rOld;
+        Qc.setZero();
+        integrable->LoadResidual_F(R, 1.0);
+        integrable->LoadResidual_CqL(R, _lNew, 1.0);
+        integrable->LoadResidual_Mv(R, _aNew, -1.0 / (1.0 + _alpha));
+        integrable->LoadConstraint_C(Qc, 1.0 / (_beta * h * h), 1.0 / (_gamma * h), Qc_do_clamp, Qc_clamping);
+        return R.squaredNorm() + Qc.squaredNorm();
+    }
+
+    void Increment() override {
+        double merit = residual();
+        // The last full update made things worse: walk back along it.
+        if (_havePrevious && merit > _previousMerit) {
+            double step = 1.0;
+            double bestStep = 1.0;
+            double bestMerit = merit;
+            for (int cut = 0; cut < kCuts; ++cut) {
+                step *= 0.5;
+                _aNew = _previousA + _previousDs * step;
+                _lNew = _previousL + _previousDl * step;
+                place(_aNew);
+                const double trial = residual();
+                if (trial < bestMerit) {
+                    bestMerit = trial;
+                    bestStep = step;
+                }
+                if (trial < _previousMerit)
+                    break;
+            }
+            if (bestStep != step) {
+                _aNew = _previousA + _previousDs * bestStep;
+                _lNew = _previousL + _previousDl * bestStep;
+                place(_aNew);
+                bestMerit = residual();
+            }
+            merit = bestMerit;
+        }
+
+        integrable->StateSolveCorrection(Ds, Dl, R, Qc, 1.0 / (1.0 + _alpha), -h * _gamma, -h * h * _beta, _xNew,
+                                         _vNew, T + h, false, chrono::UpdateFlags::UPDATE_ALL_NO_VISUAL, call_setup,
+                                         call_analyze);
+        _previousA = _aNew;
+        _previousL = _lNew;
+        _previousDs = Ds;
+        _previousDl = Dl;
+        _previousMerit = merit;
+        _havePrevious = true;
+        if (verbose) {
+            Eigen::Index imax = 0;
+            Ds.cwiseAbs().maxCoeff(&imax);
+            Eigen::Index rmax = 0;
+            R.cwiseAbs().maxCoeff(&rmax);
+            std::cout << "    dsMax idx " << imax << " ds " << Ds(imax) << " R " << R(imax) << " | rMax idx " << rmax
+                      << " R " << R(rmax) << " ds " << Ds(rmax) << " n " << Ds.size() << "\n";
+        }
+        _lNew += Dl;
+        _aNew += Ds;
+        place(_aNew);
+    }
+
+    void ResetStep() override {
+        integrable->StateScatter(X, V, T, chrono::UpdateFlags::UPDATE_ALL_NO_VISUAL);
+        _rOld.setZero();
+        _aNew.setZero(integrable->GetNumCoordsVelLevel(), integrable);
+        _havePrevious = false;
+    }
+
+    void AcceptStep() override {
+        X = _xNew;
+        V = _vNew;
+        A = _aNew;
+        L = _lNew;
+    }
+
+    void FinalizeStep() override {
+        integrable->StateScatter(X, V, T, chrono::UpdateFlags::UPDATE_ALL);
+        integrable->StateScatterAcceleration(A);
+        integrable->StateScatterReactions(L);
+        integrable->StateOnEndStep(T);
+    }
+
+    static constexpr int kCuts = 5;
+    double _alpha = -0.05;
+    double _gamma = 0.55;
+    double _beta = 0.275625;
+    chrono::ChState _xNew;
+    chrono::ChStateDelta _vNew;
+    chrono::ChStateDelta _aNew;
+    chrono::ChVectorDynamic<> _lNew;
+    chrono::ChVectorDynamic<> _rOld;
+    chrono::ChStateDelta _previousA;
+    chrono::ChStateDelta _previousDs;
+    chrono::ChVectorDynamic<> _previousL;
+    chrono::ChVectorDynamic<> _previousDl;
+    double _previousMerit = 0.0;
+    bool _havePrevious = false;
+};
 
 void configureHht(chrono::ChTimestepperHHT& hht) {
     hht.SetAlpha(-0.05);
@@ -61,6 +223,54 @@ bool tryHhtStep(chrono::ChSystemSMC& system, double h) {
     return !threw;
 }
 
+/// Velocities and element internal forces (elastic, plastic, damping) at the
+/// current state, in system velocity coordinates. Node loads are left out:
+/// gravity and contact enter the balance through their exact potentials.
+struct InternalState {
+    chrono::ChStateDelta v;
+    chrono::ChVectorDynamic<> f;
+    double kinetic = 0.0;  ///< ½ vᵀ M v with the integrator's own mass matrix
+};
+
+InternalState internalState(chrono::ChSystem& system, const Assembly& assembly) {
+    InternalState s;
+    const auto nx = system.GetNumCoordsPosLevel();
+    const auto nv = system.GetNumCoordsVelLevel();
+    chrono::ChState x(nx, &system);
+    s.v.setZero(nv, &system);
+    double t = 0.0;
+    system.StateGather(x, s.v, t);
+    s.f.setZero(nv);
+    for (const auto& part : assembly.parts()) {
+        if (!part.mesh())
+            continue;
+        for (const auto& element : part.mesh()->GetElements())
+            element->EleIntLoadResidual_F(s.f, 1.0);
+    }
+    // Joint reactions: a weld holding back thermal growth carries a large
+    // force that only cancels the element force when both are counted.
+    if (system.GetNumConstraints() > 0) {
+        chrono::ChVectorDynamic<> l;
+        l.setZero(system.GetNumConstraints());
+        system.StateGatherReactions(l);
+        system.LoadResidual_CqL(s.f, l, 1.0);
+    }
+    chrono::ChVectorDynamic<> mv;
+    mv.setZero(nv);
+    system.LoadResidual_Mv(mv, s.v, 1.0);
+    s.kinetic = 0.5 * s.v.dot(mv);
+    return s;
+}
+
+/// Work done on the nodes by internal forces over one increment, trapezoid
+/// rule, the way an implicit code accumulates internal energy. Positive when
+/// stored strain energy is released into motion.
+double internalWork(const InternalState& a, const InternalState& b, double h) {
+    if (a.f.size() != b.f.size() || a.v.size() != b.v.size() || a.f.size() != a.v.size())
+        return 0.0;
+    return 0.25 * h * (a.f + b.f).dot(a.v + b.v);
+}
+
 bool assemblyHasRotNodes(const Assembly& assembly) {
     for (const auto& part : assembly.parts()) {
         if (!part.nodes().empty())
@@ -88,9 +298,9 @@ Simulator::Simulator() {
     // arrives as a shove while nothing is touching the box. HHT iterates the
     // correction out, and if a step still will not converge it cuts the step
     // instead of keeping the bad one.
-    _system.SetTimestepperType(ChTimestepper::Type::HHT);
-    if (auto hht = std::dynamic_pointer_cast<ChTimestepperHHT>(_system.GetTimestepper()))
-        configureHht(*hht);
+    auto hht = chrono_types::make_shared<LineSearchHht>(&_system);
+    configureHht(*hht);
+    _system.SetTimestepper(hht);
 
     // Every external force (gravity, drag, contact, user loads) is assembled
     // per node in Assembly::applyLoads, so Chrono must not add its own.
@@ -154,6 +364,8 @@ bool Simulator::step(double dt, double time, const Environment& environment,
         refreshLinearSolver();
     }
     bool rejected = false;
+    bool advanced = false;
+    bool incomplete = false;
     try {
         if (_assembly.hasFreeSolve()) {
             auto hht = std::dynamic_pointer_cast<chrono::ChTimestepperHHT>(_system.GetTimestepper());
@@ -169,30 +381,51 @@ bool Simulator::step(double dt, double time, const Environment& environment,
             const double mass = std::max(_assembly.mass(), 1.0e-12);
             const double mgd =
                 mass * g * std::max(_assembly.contactLengthScale(), 1.0e-4);
-            const double bounceHeight =
-                g > 1.0e-12 ? _assembly.kineticEnergy() / (mass * g) : 0.0;
+            // A millimetre hover after a bounce is not free flight. MixedJoints
+            // seating left nC=0 then took h=dt, Newton ran gap ~ 1e23, and
+            // HHT threw. Keep contact-sized h while any node is within the
+            // penalty gap cap of the floor.
+            const bool nearFloor =
+                _assembly.touchingFloor(environment, kContactGapCap);
             // Quasi-static seating: KE is tiny vs mgδ and nothing is still
             // slamming the plane. Same residual, full dt, no extra cutbacks.
-            const bool seated = contacts > 0 &&
+            // After a 1 mm bounce nC drops to 0 while still on the floor;
+            // treating that as seated avoids EVERY_ITERATION on 121 nodes.
+            const bool seated = (contacts > 0 || nearFloor) &&
                                 _assembly.kineticEnergy() <= 0.05 * std::max(mgd, 1.0e-12) &&
                                 _assembly.maxApproachSpeed() <= 2.0e-3;
-            // Leftover hops under 5 cm: same residual as the last hit, try
-            // the user dt and reuse K.
-            const bool ringDown = contacts > 0 && bounceHeight <= 0.05 && !seated;
-            const bool hardOnset = contactOnset && !ringDown && !seated;
+            const bool hardOnset = contactOnset && !seated;
+            // Stop an increment at first touch only when the approach would
+            // overshoot the contact skin within that increment. A body
+            // settling a fraction of a millimetre is an ordinary implicit
+            // contact increment, as in an implicit FE code; capping it to
+            // the time-to-contact of a hovering skin drives h to h_min.
             auto capFreeFlight = [&](double proposed) {
                 const double tau = _assembly.minTimeToContact(environment.gravity);
-                if (tau >= kNoContactTime)
+                if (tau >= proposed)
+                    return proposed;
+                // Quasi-static approach only (the seated test): an impact
+                // integrated inside one long increment lands at an arbitrary
+                // point of the contact period, and the rebound depends on it.
+                const double speed =
+                    std::sqrt(2.0 * _assembly.kineticEnergy() / mass) + g * proposed;
+                const double ke = 0.5 * mass * speed * speed;
+                if (ke <= 0.05 * std::max(mgd, 1.0e-12) &&
+                    speed * proposed <= _assembly.contactLengthScale())
                     return proposed;
                 return std::min(proposed, std::max(kHhtMinStep, tau));
             };
             // Contact loads already occupy Jacobian slots (zero when open).
             // Do not ForceUpdate: sparsity did not change. Reform K numerically
             // on the increment that reaches the plane.
-            if (contacts == 0 || seated || (contactOnset && ringDown))
+            if (seated)
                 _localH = dt;
-            else if (hardOnset)
-                _localH = contactH;
+            else if (contacts == 0 && !nearFloor)
+                _localH = dt;
+            else if (hardOnset) {
+                const double halfPeriod = _assembly.contactHalfPeriod();
+                _localH = halfPeriod < kNoContactTime ? std::min(dt, std::max(kHhtMinStep, halfPeriod)) : contactH;
+            }
             if (hht) {
                 hht->SetMinStepSize(kHhtMinStep);
                 hht->SetStepControl(false);
@@ -209,33 +442,61 @@ bool Simulator::step(double dt, double time, const Environment& environment,
             int maxIters = seated ? 40 : 12;
             int sameHFails = 0;
             bool reformK = hardOnset || _newtonSuccessStreak < 1;
-            auto commitIncrement = [&](double taken, bool keepPlastic) {
+            auto commitIncrement = [&](double taken, bool keepPlastic, int kind, double energyBefore) {
                 if (keepPlastic)
                     _assembly.commitPlastic();
                 else
                     _assembly.discardTrial();
+                _assembly.commitContactApproach();
                 ++_newtonSuccessStreak;
                 ++_hhtCommits;
+                advanced = true;
+                if (kind == 0)
+                    ++_stats.converged;
+                else if (kind == 1)
+                    ++_stats.terminatedAccepts;
+                else
+                    ++_stats.explicitSlices;
+                if (_stats.minStep <= 0.0 || taken < _stats.minStep)
+                    _stats.minStep = taken;
+                const double gained =
+                    (_assembly.kineticEnergy() + mass * g * _assembly.massHeight() +
+                     _assembly.contactElasticEnergy()) -
+                    energyBefore;
+                _stats.maxEnergyGain = std::max(_stats.maxEnergyGain, gained);
+                _stats.maxPenetration =
+                    std::max(_stats.maxPenetration, _assembly.maxContactPenetration());
                 remaining -= taken;
                 sameHFails = 0;
                 maxIters = seated ? 40 : 12;
                 reformK = false;
+                const int contactsBefore = contacts;
                 contacts = _assembly.activeContactCount();
-                if (contacts == 0) {
-                    _localH = dt;
-                    if (remaining > 1.0e-15) {
-                        const double tau = _assembly.minTimeToContact(environment.gravity);
-                        h = remaining;
-                        if (tau < kNoContactTime) {
-                            h = std::min(remaining, std::max(kHhtMinStep, tau));
-                            if (tau <= h)
-                                reformK = true;
-                        }
-                    }
-                } else if (seated) {
-                    _localH = dt;
+                if (contactsBefore == 0 && contacts > 0 && !seated) {
+                    // First touch: size the next increment from the contact
+                    // period, not from how much of the step happened to remain
+                    // before touch, so nearby drops integrate the same impact.
+                    // Skip when KE is already quasi-static: MixedJoints seating
+                    // chattered off the floor, then this reset drained at 25 µs.
+                    const double keNow = _assembly.kineticEnergy();
+                    const bool impact = keNow > 0.05 * std::max(mgd, 1.0e-12);
+                    const double halfPeriod = _assembly.contactHalfPeriod();
+                    const double onset = halfPeriod < kNoContactTime ? halfPeriod : taken;
+                    if (impact)
+                        _localH = std::min(dt, std::max(kHhtMinStep, onset));
                     if (remaining > 1.0e-15)
-                        h = remaining;
+                        h = std::min(_localH, remaining);
+                } else if (contacts == 0) {
+                    if (_assembly.touchingFloor(environment, kContactGapCap)) {
+                        const double grown = std::min(std::max(taken, kHhtMinStep) * 2.0, dt);
+                        _localH = grown;
+                        if (remaining > 1.0e-15)
+                            h = std::min(grown, remaining);
+                    } else {
+                        _localH = dt;
+                        if (remaining > 1.0e-15)
+                            h = capFreeFlight(remaining);
+                    }
                 } else {
                     const double grown = std::min(std::max(taken, kHhtMinStep) * 2.0, dt);
                     _localH = grown;
@@ -252,15 +513,15 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                     rejected = true;
                     break;
                 }
+                // A sliver smaller than h_min is leftover rounding, not a
+                // physical increment. Factoring it threw on the hollow box
+                // (h = 7.84e-7 at t = 0.668 s).
+                if (remaining < kHhtMinStep)
+                    break;
                 h = std::min(h, remaining);
-                if (contacts == 0) {
-                    const double tau = _assembly.minTimeToContact(environment.gravity);
-                    if (tau < kNoContactTime) {
-                        if (tau <= h)
-                            reformK = true;
-                        h = std::min(h, std::max(kHhtMinStep, tau));
-                    }
-                }
+                if (contacts == 0)
+                    h = capFreeFlight(h);
+                const double tau = _assembly.minTimeToContact(environment.gravity);
                 if (remaining >= kHhtMinStep)
                     h = std::max(h, kHhtMinStep);
                 const bool atMin = h <= kHhtMinStep * 1.01;
@@ -268,51 +529,70 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                 _assembly.captureKinematics();
                 const unsigned terminated0 = hht ? hht->GetNumTerminated() : 0;
                 const double time0 = _system.GetChTime();
-                const double ke0 = _assembly.kineticEnergy();
                 const double height0 = _assembly.massHeight();
                 const double contact0 = _assembly.contactElasticEnergy();
                 const double pen0 = _assembly.maxContactPenetration();
                 const double close0 = std::max(0.0, _assembly.maxApproachSpeed());
                 if (hht) {
-                    hht->SetMaxIters(maxIters);
-                    // Last cutback at h_min, or a seated static increment:
-                    // keep a finite iterate so the mesh advances, then drop
-                    // it if mechanical energy or penetration jumped.
-                    hht->AcceptTerminatedStep(atMin || seated);
+                    // Contact status changes inside this increment. Like an
+                    // implicit FE contact search, re-form the tangent at every
+                    // iterate so the active set and its stiffness agree, and
+                    // allow the extra iterations an active-set change needs.
+                    const bool crossing = !seated && (contacts > 0 || tau <= h * 1.01);
+                    hht->SetMaxIters(crossing ? std::max(maxIters, 30) : maxIters);
+                    hht->AcceptTerminatedStep(false);
                     hht->SetJacobianUpdateMethod(
-                        (reformK || sameHFails > 0)
-                            ? chrono::ChTimestepperImplicit::JacobianUpdate::EVERY_STEP
+                        (crossing || reformK || sameHFails > 0)
+                            ? chrono::ChTimestepperImplicit::JacobianUpdate::EVERY_ITERATION
                             : chrono::ChTimestepperImplicit::JacobianUpdate::AUTOMATIC);
                 }
+                const InternalState internal0 = internalState(_system, _assembly);
                 const bool threw = !tryHhtStep(_system, h);
                 const bool finite = !threw && _assembly.finite();
                 const bool inverted = finite && _assembly.invertedTetCount() > 0;
                 const bool terminated = hht && !threw && hht->GetNumTerminated() > terminated0;
-                // Slack is 2% of mgδ, not of current KE. A 2% of KE allowance
-                // compounds across last-cutbacks and was launching later hops.
-                // Contact ½kδ² is included so a real rebound (spring → KE) is
-                // not mistaken for injection.
-                const double e0 = ke0 + mass * g * height0 + contact0;
-                const double e1 = _assembly.kineticEnergy() + mass * g * _assembly.massHeight() +
+                // Energy balance: KE + gravity + contact potential may change
+                // only by the work internal forces did (strain released or
+                // stored, damping and plasticity removed). Slack is 2% of mgδ
+                // per increment. Without the internal term a panel springing
+                // back from its sag reads as injected energy.
+                const InternalState internal1 = finite ? internalState(_system, _assembly) : internal0;
+                const double wInternal = finite ? internalWork(internal0, internal1, h) : 0.0;
+                const double e0 = internal0.kinetic + mass * g * height0 + contact0 + wInternal;
+                const double e1 = internal1.kinetic + mass * g * _assembly.massHeight() +
                                   _assembly.contactElasticEnergy();
-                const bool energyOk = e1 <= e0 + 0.02 * std::max(mgd, 1.0e-12);
+                // Slack is 2% of the larger of the gravity scale and the
+                // energy actually moving this increment, so a run without
+                // gravity still has a meaningful tolerance.
+                const double energyScale = std::max(
+                    {mgd, internal0.kinetic, internal1.kinetic, std::abs(wInternal), 1.0e-9});
+                // HHT with alpha < 0 is dissipative on its own; penalty contact
+                // is what can inject energy. Without contact the f.v estimate
+                // also misreads a thermal-strain jump that the integrator
+                // damps out within one increment.
+                const bool contactIncrement =
+                    contacts > 0 || contact0 > 0.0 || _assembly.activeContactCount() > 0;
+                const bool energyOk = !contactIncrement || e1 <= e0 + 0.02 * energyScale;
                 const bool penetrationOk =
                     _assembly.maxContactPenetration() <=
                     pen0 + close0 * h + _assembly.contactLengthScale();
                 const bool lastCutback = finite && !inverted && energyOk && penetrationOk &&
                                          (atMin || (seated && terminated));
                 const bool converged = finite && !inverted && !terminated;
-                if (converged) {
-                    commitIncrement(h, true);
+                if (converged && energyOk && penetrationOk) {
+                    commitIncrement(h, true, 0, e0);
                     continue;
                 }
                 if (lastCutback) {
-                    commitIncrement(h, false);
+                    commitIncrement(h, false, 1, e0);
                     continue;
                 }
                 _assembly.restoreKinematics();
                 _assembly.discardTrial();
                 _system.SetChTime(time0);
+                // Loads and constraint Jacobians are cached from the last
+                // Newton iterate; HHT reads them before its first scatter.
+                _system.Update(chrono::UpdateFlags::UPDATE_ALL_NO_VISUAL);
                 if (cancel && cancel->load()) {
                     rejected = true;
                     break;
@@ -320,10 +600,15 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                 _newtonSuccessStreak = 0;
                 contacts = _assembly.activeContactCount();
                 ++sameHFails;
-                // Seated: extra Newton on the same h. A slam whose predictor
-                // already missed the plane cuts immediately; one more attempt
-                // only at h_min before the explicit fallback.
-                const int extra = seated ? 3 : (atMin ? 2 : 1);
+                ++_stats.cutbacks;
+                ++_stats.rejects;
+                // A Newton failure may converge with more iterations on the
+                // same h (seated: a few, otherwise one more). A converged step
+                // that failed the energy or penetration check gives the same
+                // answer again, so it cuts h at once. Rejected time is never
+                // skipped: every second of a run is a committed increment.
+                const bool newtonFailed = threw || terminated || !finite;
+                const int extra = newtonFailed ? (seated ? 3 : (atMin ? 2 : 1)) : 0;
                 if (sameHFails < extra) {
                     maxIters = std::min(40, (seated ? 24 : 12) * (1 << sameHFails));
                     reformK = true;
@@ -331,14 +616,6 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                 }
                 sameHFails = 0;
                 maxIters = seated ? 40 : 12;
-                if (seated) {
-                    rejected = true;
-                    remaining -= h;
-                    _localH = dt;
-                    h = remaining > 1.0e-15 ? remaining : dt;
-                    reformK = true;
-                    continue;
-                }
                 if (!atMin) {
                     h *= 0.5;
                     if (h < kHhtMinStep)
@@ -347,9 +624,9 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                     reformK = true;
                     continue;
                 }
-                // Solver threw or the state is non-finite at h_min. One
-                // explicit slice, then HHT again — never drain remaining
-                // on restored poses (that was the 0.2 s freeze).
+                // One explicit slice, then stop. Walking the rest of the user
+                // step at h_min on a restored pose repeats the same rejected
+                // factorization thousands of times.
                 if (contacts > 0) {
                     const bool lumped = _system.GetNumConstraints() == 0 &&
                                         !assemblyHasRotNodes(_assembly);
@@ -378,18 +655,17 @@ bool Simulator::step(double dt, double time, const Environment& environment,
                         if (hht)
                             hht->SetTime(_system.GetChTime());
                         refreshLinearSolver();
-                        commitIncrement(hExp, false);
+                        commitIncrement(hExp, false, 2, expE0);
                         continue;
                     }
                     _assembly.restoreKinematics();
                     _assembly.discardTrial();
                     _system.SetChTime(expT0);
+                    _system.Update(chrono::UpdateFlags::UPDATE_ALL_NO_VISUAL);
                 }
                 rejected = true;
-                remaining -= std::min(remaining, kHhtMinStep);
-                _localH = kHhtMinStep;
-                h = kHhtMinStep;
-                reformK = true;
+                incomplete = true;
+                break;
             }
             if (!_assembly.finite()) {
                 _assembly.restoreKinematics();
@@ -432,6 +708,10 @@ bool Simulator::step(double dt, double time, const Environment& environment,
         ++_newtonRejects;
     if (!rejected)
         _assembly.clearThermalLoadChanged();
+    // A finite mesh that could not accept all of this user step has not
+    // advanced to t + dt. Reporting success would silently drop the rest.
+    if (_assembly.hasFreeSolve() && (!advanced || incomplete))
+        return false;
     return _assembly.finite();
 }
 

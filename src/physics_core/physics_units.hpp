@@ -167,9 +167,52 @@ constexpr double kNoContactTime = 1.0e30;
 constexpr double kContactPenaltyScale = 0.1;
 /// Viscous contact damping as a fraction of critical on the material k.
 constexpr double kContactDampingFraction = 0.5;
+/// Softened-contact depth, metres. Below it pressure rises quadratically
+/// (k δ²/2δ₀) and damping ramps in, so force and tangent are continuous at
+/// touch; beyond it the penalty is linear, k (δ − δ₀/2).
+constexpr double kContactSoftening = 1.0e-5;
+/// Largest gap the penalty may use. MixedJoints glass seating produced
+/// Newton iterates at gap ~ 1e99 m (fn ~ 1e109) while committed energy
+/// stayed millijoules; a 10 mm cap leaves real seating (microns) unchanged.
+constexpr double kContactGapCap = 1.0e-2;
 /// Extra critical damping while the gap is closing, Abaqus-style contact
 /// stabilization. The ramp is 0 at rest so a seated body is not glued.
 constexpr double kContactStabFraction = 1.0;
+
+/// Slowest approach treated as an impact. Hunt-Crossley damping grows as
+/// 1/v⁻, which is singular for resting contact; a node that arrives slower
+/// than this is resting contact and gets the damping of an impact at it.
+constexpr double kContactImpactSpeedFloor = 0.1;
+
+/// Flores et al. (2011) Hunt-Crossley factor D in F = F_s (1 + D dδ/dt),
+/// D = 8(1 - e) / (5 e v⁻). A struck mass rebounds at restitution e.
+inline double huntCrossleyFactor(double restitution, double approachSpeed) {
+    const double e = std::clamp(restitution, 0.02, 0.98);
+    const double v = std::max(approachSpeed, kContactImpactSpeedFloor);
+    return 8.0 * (1.0 - e) / (5.0 * e * v);
+}
+
+/// Hunt-Crossley multiplier on the spring force, F = F_s · s, and the
+/// dashpot coefficient −F_s ds/dvn per unit F_s. Closing (vn ≤ 0) is the
+/// linear 1 − D vn. Separating uses e^{−D vn}, which matches its value and
+/// slope at vn = 0 but never reaches zero: a hard tensile cut at vn = 1/D
+/// (about 1 cm/s for slow contact) is a kink Newton cycles across.
+struct HuntCrossleyScale {
+    double scale = 1.0;
+    double damping = 0.0;
+};
+inline HuntCrossleyScale huntCrossleyScale(double D, double vn, double approachSpeed = kContactImpactSpeedFloor) {
+    // D is sized at v⁻. A Newton overshoot with |vn| ≫ v⁻ must not
+    // evaluate 1 + D|vn| at that iterate: MixedJoints seating hit fn=inf
+    // at vn ~ 1e209 with vApp=0 (D from the 0.1 m/s floor).
+    const double vRef = std::max(std::max(0.0, approachSpeed), kContactImpactSpeedFloor);
+    if (vn <= 0.0) {
+        const double vnLaw = std::max(vn, -vRef);
+        return {1.0 - D * vnLaw, D};
+    }
+    const double decay = std::exp(-D * vn);
+    return {decay, D * decay};
+}
 
 /// Penalty dashpot: 0.5-of-critical always, plus stabilization that tracks
 /// closing speed and vanishes when the node is not approaching the plane.

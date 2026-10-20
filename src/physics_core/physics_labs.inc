@@ -295,7 +295,10 @@ void checkMotion() {
                     last.live);
         check(finite, "M5 sphere lands without diverging");
         expectRange(last.lowest, -0.005, 0.02, "M5 sphere rest gap stays millimetre-scale");
-        check(last.ke > 0.05, "M5 sphere spin is not wiped on floor contact");
+        // Friction turns slip into rolling. Angular momentum about the contact
+        // point is kept, so a solid sphere rolls on with 2/7 of its spin
+        // energy; "wiped" is losing most of that too.
+        check(last.ke > 0.5 * (2.0 / 7.0) * start.ke, "M5 sphere spin is not wiped on floor contact");
     }
     {
         rcs::AssemblyDefinition cube;

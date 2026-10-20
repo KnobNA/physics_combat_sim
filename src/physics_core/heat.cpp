@@ -533,7 +533,18 @@ bool HeatField::advance(double dt,
             break;
         }
     }
-    if (!sourceOn && !_dirty && !_easing) {
+    bool partAwayFromAmbient = false;
+    for (const Part& part : parts) {
+        for (std::size_t n = 0; n < part.nodeCount(); ++n) {
+            if (std::abs(part.nodeTemperature(n) - _ambient) > kWake) {
+                partAwayFromAmbient = true;
+                break;
+            }
+        }
+        if (partAwayFromAmbient)
+            break;
+    }
+    if (!sourceOn && !_dirty && !_easing && !partAwayFromAmbient) {
         _wait = 0.0;
         _sourceOn = false;
         _strainMoved = false;
@@ -665,7 +676,7 @@ bool HeatField::advance(double dt,
             const double airT = _air[static_cast<std::size_t>(cell)];
             const double nodeT = part.nodeTemperature(n);
             const bool cellHot = std::abs(airT - _ambient) > kWake;
-            const bool nodeHot = part.heatActive(n) || std::abs(nodeT - part.initialTemperature()) > kWake;
+            const bool nodeHot = std::abs(nodeT - _ambient) > kWake;
             if (!cellHot && !nodeHot)
                 continue;
             const double mass = n < part.nodeMass().size() ? part.nodeMass()[n] : 0.0;

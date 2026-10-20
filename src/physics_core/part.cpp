@@ -18,6 +18,40 @@ namespace {
 
 using chrono::ChVector3d;
 
+class FdReissner4 : public chrono::fea::ChElementShellReissner4 {
+public:
+    void ComputeKRMmatricesGlobal(chrono::ChMatrixRef H, double Kf, double Rf, double Mf) override {
+        chrono::fea::ChElementShellReissner4::ComputeKRMmatricesGlobal(H, 0.0, Rf, Mf);
+        if (Kf == 0.0)
+            return;
+        chrono::ChVectorDynamic<> f0(24), f1(24);
+        ComputeInternalForces(f0);
+        const double d = 1.0e-7;
+        for (int n = 0; n < 4; ++n) {
+            auto node = std::static_pointer_cast<chrono::fea::ChNodeFEAxyzrot>(GetNode(n));
+            const ChVector3d p = node->GetPos();
+            const chrono::ChQuaternion<> q = node->GetRot();
+            for (int k = 0; k < 6; ++k) {
+                ChVector3d e(0, 0, 0);
+                e[k % 3] = d;
+                if (k < 3) {
+                    node->SetPos(p + e);
+                } else {
+                    chrono::ChQuaternion<> dq;
+                    dq.SetFromRotVec(e);
+                    node->SetRot(q * dq);
+                }
+                ComputeInternalForces(f1);
+                node->SetPos(p);
+                node->SetRot(q);
+                for (int r = 0; r < 24; ++r)
+                    H(r, 6 * n + k) += Kf * (-(f1(r) - f0(r)) / d);
+            }
+        }
+        ComputeInternalForces(f0);
+    }
+};
+
 /// Orthonormal frame of a quad from its four corners: e1 runs along the
 /// averaged 0->1 direction, n is the outward normal, e2 completes the triad.
 bool quadFrame(const ChVector3d p[4], ChVector3d& e1, ChVector3d& e2, ChVector3d& n) {
@@ -209,7 +243,7 @@ void Part::build(const PartDefinition& definition) {
             const int i11 = iu * stride + iv;
             const int i01 = (iu - 1) * stride + iv;
 
-            auto element = chrono_types::make_shared<ChElementShellReissner4>();
+            auto element = chrono_types::make_shared<FdReissner4>();
             element->SetNodes(_nodes[i00], _nodes[i10], _nodes[i11], _nodes[i01]);
             element->AddLayer(_thickness, 0, makeQuadMaterial(_elements.size()));
             _mesh->AddElement(element);
@@ -971,8 +1005,7 @@ void Part::evaluateStress(std::vector<float>& out) const {
     for (std::size_t t = 0; t < _tetElements.size(); ++t) {
         if (!_tetElements[t] || (t < _tetLive.size() && !_tetLive[t]))
             continue;
-        const double scale = thermalStiffnessRetention(_material, _temperature);
-        tetPeak = std::max(tetPeak, _tetElements[t]->vonMises() * scale);
+        tetPeak = std::max(tetPeak, _tetElements[t]->vonMises());
     }
     if (!_quads.empty()) {
         if (!out.empty() && tetPeak > 0.0)
@@ -1004,8 +1037,7 @@ void Part::evaluateStress(std::vector<float>& out) const {
         if (host == faceHost.end())
             return;
         const auto& element = _tetElements[host->second];
-        const double scale = thermalStiffnessRetention(_material, _temperature);
-        out[t] = static_cast<float>(element->vonMises() * scale);
+        out[t] = static_cast<float>(element->vonMises());
     };
     for (std::size_t t = 0; t < _triangles.size(); ++t)
         paint(t);
@@ -1077,12 +1109,18 @@ void Part::discardTrial() {
     for (const auto& tet : _tetElements)
         if (tet)
             tet->discardTrial();
+    for (const auto& shell : _elements)
+        if (shell)
+            shell->DiscardPlasticTrial();
 }
 
 void Part::commitPlastic() {
     for (const auto& tet : _tetElements)
         if (tet)
             tet->commitPlastic();
+    for (const auto& shell : _elements)
+        if (shell)
+            shell->EleDoIntegration();
 }
 
 void Part::refreshTetTrials() {
@@ -1427,12 +1465,12 @@ double Part::tetPlasticStrain(std::size_t index) const {
 }
 
 int Part::cloneNode(int original) {
-    const double share = std::max(1.0e-6, (original >= 0 && static_cast<std::size_t>(original) < _nodeMass.size())
-                                              ? _nodeMass[static_cast<std::size_t>(original)] * 0.25
-                                              : 1.0e-4);
-    if (original >= 0 && static_cast<std::size_t>(original) < _nodeMass.size() &&
-        _nodeMass[static_cast<std::size_t>(original)] > share)
-        _nodeMass[static_cast<std::size_t>(original)] -= share;
+    double share = 0.0;
+    if (original >= 0 && static_cast<std::size_t>(original) < _nodeMass.size()) {
+        const double available = _nodeMass[static_cast<std::size_t>(original)];
+        share = 0.5 * std::max(0.0, available);
+        _nodeMass[static_cast<std::size_t>(original)] = available - share;
+    }
 
     int clone = 0;
     if (!_xyzNodes.empty()) {
@@ -1506,7 +1544,7 @@ int Part::insertMidpoint(int a, int b) {
     _mesh->AddNode(node);
     _nodes.push_back(node);
     const int index = static_cast<int>(_nodes.size()) - 1;
-    _nodeMass.push_back(std::max(1.0e-6, takeA + takeB));
+    _nodeMass.push_back(takeA + takeB);
     _loads.emplace_back(0, 0, 0);
     const double tempA = nodeTemperature(ia);
     const double tempB = nodeTemperature(ib);
@@ -1557,7 +1595,7 @@ bool Part::splitQuad(std::size_t quad, bool alongU) {
 
     _quads[quad] = kept;
 
-    auto element = chrono_types::make_shared<ChElementShellReissner4>();
+    auto element = chrono_types::make_shared<FdReissner4>();
     element->SetNodes(_nodes[opened[0]], _nodes[opened[1]], _nodes[opened[2]], _nodes[opened[3]]);
     element->AddLayer(_thickness, 0.0, makeQuadMaterial(_elements.size()));
     _mesh->AddElement(element);
@@ -2277,48 +2315,26 @@ bool Part::shatterQuads() {
             break;
         if (candidate.quad >= _quads.size())
             continue;
-        if (candidate.over) {
-            detachQuad(candidate.quad);
-        } else {
-            const double longest = std::max(candidate.edgeU, candidate.edgeV);
-            const double shortest = std::min(candidate.edgeU, candidate.edgeV);
-            const double aspect = shortest > 1.0e-9 ? longest / shortest : 1.0;
-            if (longest < minEdge || aspect > 8.0)
-                detachQuad(candidate.quad);
-            else {
-                bool alongU = candidate.edgeV >= candidate.edgeU;
-                if ((_material.breakFabric == BreakFabric::Grain || !_material.plies.empty()) &&
-                    candidate.quad < _quads.size()) {
-                    const auto& quad = _quads[candidate.quad];
-                    bool finiteQuad = true;
-                    for (int node : quad)
-                        finiteQuad = finiteQuad && node >= 0 && static_cast<std::size_t>(node) < _nodes.size();
-                    if (finiteQuad) {
-                        const ChVector3d u = _nodes[static_cast<std::size_t>(quad[1])]->GetPos() -
-                                             _nodes[static_cast<std::size_t>(quad[0])]->GetPos();
-                        const ChVector3d v = _nodes[static_cast<std::size_t>(quad[3])]->GetPos() -
-                                             _nodes[static_cast<std::size_t>(quad[0])]->GetPos();
-                        ChVector3d fiber(_material.grainDirection[0], _material.grainDirection[1],
-                                         _material.grainDirection[2]);
-                        if (!_material.plies.empty())
-                            fiber = {_material.plies.front().direction[0], _material.plies.front().direction[1],
-                                     _material.plies.front().direction[2]};
-                        if (fiber.Length2() > 0.25 && u.Length2() > 1.0e-12 && v.Length2() > 1.0e-12) {
-                            fiber.Normalize();
-                            alongU = std::abs(u.GetNormalized().Dot(fiber)) >= std::abs(v.GetNormalized().Dot(fiber));
-                        }
-                    }
-                }
-                if (!splitQuad(candidate.quad, alongU))
-                    continue;
-            }
+        // Open the shared edges and keep the quad in the solve. Deleting it
+        // and promoting a rigid chip is element erosion, not a crack.
+        isolateQuad(static_cast<int>(candidate.quad));
+        if (candidate.quad < _elements.size() && _elements[candidate.quad]) {
+            const auto& quad = _quads[candidate.quad];
+            bool finiteQuad = true;
+            for (int node : quad)
+                finiteQuad = finiteQuad && node >= 0 && static_cast<std::size_t>(node) < _nodes.size() &&
+                             _nodes[static_cast<std::size_t>(node)];
+            if (finiteQuad)
+                _elements[candidate.quad]->SetNodes(_nodes[static_cast<std::size_t>(quad[0])],
+                                                    _nodes[static_cast<std::size_t>(quad[1])],
+                                                    _nodes[static_cast<std::size_t>(quad[2])],
+                                                    _nodes[static_cast<std::size_t>(quad[3])]);
         }
         changed = true;
         _shattering = true;
         ++made;
     }
     if (changed) {
-        promoteLooseFragments();
         freezeUnusedNodes();
         rebuildTrianglesFromQuads();
     }
@@ -3065,14 +3081,13 @@ bool Part::fractureCluster(const std::vector<std::size_t>& seeds, std::vector<ch
         if (tet < _tetElements.size() && _tetElements[tet])
             volume += std::abs(_tetElements[tet]->volume());
     }
-    const double speck = 0.125 * _material.minimumShardSize * _material.minimumShardSize * _material.minimumShardSize;
-    const bool erase = _material.shatterToDust || (_material.minimumShardSize > 0.0 && volume < speck);
+    // A resolved crack stays in the FEA solve. minimumShardSize and
+    // shatterToDust are display data; they do not decide which side is live.
+    (void)volume;
     for (std::size_t tet : positive) {
         if (shard.size() <= tet)
             shard.resize(tet + 1, 0);
-        shard[tet] = erase ? 1 : 0;
-        if (tet < _tetElements.size() && _tetElements[tet])
-            _tetElements[tet]->commitDamage(1.0);
+        shard[tet] = 0;
     }
     return true;
 }
@@ -3201,11 +3216,15 @@ std::vector<std::size_t> Part::splitTetOnPlane(std::size_t index, const chrono::
     const ChVector3d p2 = p[2];
     const ChVector3d p3 = p[3];
     const double oldVolume = std::abs((p1 - p0).Dot((p2 - p0).Cross(p3 - p0))) / 6.0;
-    const double oldShare = _material.density * oldVolume / 4.0;
-    for (int node : parent)
-        if (node >= 0 && static_cast<std::size_t>(node) < _nodeMass.size())
-            _nodeMass[static_cast<std::size_t>(node)] =
-                std::max(0.0, _nodeMass[static_cast<std::size_t>(node)] - oldShare);
+    const double portion = _material.density * oldVolume / 4.0;
+    double carried = 0.0;
+    for (int node : parent) {
+        if (node < 0 || static_cast<std::size_t>(node) >= _nodeMass.size())
+            continue;
+        const double take = std::min(_nodeMass[static_cast<std::size_t>(node)], std::max(0.0, portion));
+        _nodeMass[static_cast<std::size_t>(node)] -= take;
+        carried += take;
+    }
 
     auto addChild = [&](int n0, int n1, int n2, int n3) -> std::size_t {
         const ChVector3d q0 = _xyzNodes[static_cast<std::size_t>(n0)]->GetPos();
@@ -3232,7 +3251,8 @@ std::vector<std::size_t> Part::splitTetOnPlane(std::size_t index, const chrono::
                           _xyzNodes[static_cast<std::size_t>(n2)], _xyzNodes[static_cast<std::size_t>(n3)]);
         element->copyPlasticFrom(*parentElement);
         _mesh->AddElement(element);
-        const double share = _material.density * (volume / 6.0) / 4.0;
+        const double piece = volume / 6.0;
+        const double share = carried > 0.0 && oldVolume > 0.0 ? (carried * (piece / oldVolume)) / 4.0 : 0.0;
         for (int node : {n0, n1, n2, n3})
             if (static_cast<std::size_t>(node) < _nodeMass.size())
                 _nodeMass[static_cast<std::size_t>(node)] += share;

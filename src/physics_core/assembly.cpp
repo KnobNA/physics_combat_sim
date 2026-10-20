@@ -22,22 +22,6 @@ constexpr int kOverloadHoldSteps = 8;
 /// Time constant of the reaction low-pass filter, seconds.
 constexpr double kReactionFilterTau = 8.0e-3;
 
-void snapWeldNode(Part& part, std::size_t index, const ChVector3d& p) {
-    if (!part.xyzNodes().empty()) {
-        if (index >= part.xyzNodes().size() || !part.xyzNodes()[index])
-            return;
-        part.xyzNodes()[index]->SetPos(p);
-        part.xyzNodes()[index]->SetX0(p);
-        return;
-    }
-    if (index >= part.nodes().size() || !part.nodes()[index])
-        return;
-    part.nodes()[index]->SetPos(p);
-    auto rest = part.nodes()[index]->GetX0();
-    rest.SetPos(p);
-    part.nodes()[index]->SetX0(rest);
-}
-
 ContactGains nodeFaceGains(const Part& nodePart, const Part& facePart, std::size_t node, int a, int b,
                            int c, double patchArea) {
     const auto& nm = nodePart.nodeMass();
@@ -329,10 +313,18 @@ void Assembly::createLink(chrono::ChSystem& system,
     if (!rotA && !rotB) {
         auto link = chrono_types::make_shared<fea::ChLinkNodeNode>();
         link->Initialize(_parts[partA].xyzNodes()[nodeA], _parts[partB].xyzNodes()[nodeB]);
+        const ChVector3d sep =
+            _parts[partA].nodePosition(nodeA) - _parts[partB].nodePosition(nodeB);
+        // A shell midsurface does not sit on the mating face. Collapsing that
+        // gap, or rewriting the rest pose to hide it, strains the mesh.
+        const bool shellSeam = !_parts[partA].hasVolume() || !_parts[partB].hasVolume();
+        if (shellSeam || sep.Length() > 1.0e-6) {
+            link->SetRestOffset(sep);
+            entry.offsetLink = link;
+        } else {
+            entry.pointLink = link;
+        }
         system.Add(link);
-        entry.pointLink = link;
-        // Keep the authored flag. Volume parts lock rotation with a flange
-        // of several point links, not by clearing this bit.
     } else if (rotA != rotB) {
         const std::size_t xyzPart = rotA ? partB : partA;
         const std::size_t xyzNode = rotA ? nodeB : nodeA;
@@ -346,8 +338,10 @@ void Assembly::createLink(chrono::ChSystem& system,
     } else {
         const auto& a = _parts[partA].nodes()[nodeA];
         const auto& b = _parts[partB].nodes()[nodeB];
-        auto link = chrono_types::make_shared<ChLinkMateGeneric>(
-            true, true, true, lockRotation, lockRotation, lockRotation);
+        // A weld bead is rigid in rotation too. One row of position-only
+        // ties along an edge leaves a hinge about that edge.
+        auto link = chrono_types::make_shared<ChLinkMateGeneric>(true, true, true, lockRotation,
+                                                                 lockRotation, lockRotation);
         link->Initialize(a, b, ChFrame<>(0.5 * (a->GetPos() + b->GetPos()), a->GetRot()));
         system.Add(link);
         entry.link = link;
@@ -356,7 +350,7 @@ void Assembly::createLink(chrono::ChSystem& system,
     joint.links.push_back(entry);
 }
 
-void Assembly::addLink(chrono::ChSystem& system,
+bool Assembly::addLink(chrono::ChSystem& system,
                        Joint& joint,
                        std::size_t partA,
                        std::size_t nodeA,
@@ -366,7 +360,10 @@ void Assembly::addLink(chrono::ChSystem& system,
                        double breakTorque,
                        bool wantRotationLock,
                        std::vector<int>& translationSet,
-                       std::vector<int>& rotationSet)
+                       std::vector<int>& rotationSet,
+                       double breakPeel,
+                       double criticalOpening,
+                       const chrono::ChVector3d& peelAxis)
 {
     const int ga = static_cast<int>(globalNode(partA, nodeA));
     const int gb = static_cast<int>(globalNode(partB, nodeB));
@@ -379,18 +376,30 @@ void Assembly::addLink(chrono::ChSystem& system,
         skipped.nodeB = nodeB;
         skipped.breakForce = breakForce;
         skipped.breakTorque = breakTorque;
+        skipped.breakPeel = breakPeel;
+        skipped.criticalOpening = criticalOpening;
+        skipped.peelAxis = peelAxis;
         skipped.wantRotation = wantRotationLock;
         skipped.label = joint.label;
         skipped.kind = joint.kind;
         _deferred.push_back(skipped);
-        return;
+        return false;
     }
 
-    const bool lockRotation = wantRotationLock;
-    if (wantRotationLock)
-        unite(rotationSet, ga, gb);
+    // A rotation lock between nodes already rotationally joined through
+    // another path is redundant and leaves the constraint block singular.
+    const bool lockRotation = wantRotationLock && unite(rotationSet, ga, gb);
     createLink(system, joint, partA, nodeA, partB, nodeB, breakForce, breakTorque, wantRotationLock,
                lockRotation);
+    if (!joint.links.empty()) {
+        JointLink& entry = joint.links.back();
+        entry.breakPeel = breakPeel;
+        entry.criticalOpening = criticalOpening;
+        entry.peelAxis = peelAxis;
+        const chrono::ChVector3d sep = _parts[partB].nodePosition(nodeB) - _parts[partA].nodePosition(nodeA);
+        entry.restGap = sep.Length();
+    }
+    return true;
 }
 
 void Assembly::buildWeld(chrono::ChSystem& system,
@@ -632,51 +641,19 @@ void Assembly::buildWeld(chrono::ChSystem& system,
     if (pairs.empty())
         return;
 
-    auto trySnap = [&](Part& part, std::size_t partIndex, std::size_t node, const ChVector3d& target,
-                       double maxMove) {
-        const std::size_t g = globalNode(partIndex, node);
-        if (g >= snapped.size() || snapped[g])
-            return;
-        const ChVector3d p = part.nodePosition(node);
-        if ((p - target).Length() > maxMove)
-            return;
-        if ((p - target).Length() >= 1.0e-9)
-            snapWeldNode(part, node, target);
-        snapped[g] = 1;
-    };
-
-    // Snap each tet node at most once. A box corner is shared by three seams;
-    // the first weld places it, later seams tie the other panel to that pose.
-    if (!a.rotational() && !b.rotational()) {
-        for (Pair& pair : pairs) {
-            const std::size_t ga = globalNode(definition.partA, pair.nodeA);
-            const std::size_t gb = globalNode(definition.partB, pair.nodeB);
-            const bool lockedA = ga < snapped.size() && snapped[ga];
-            const bool lockedB = gb < snapped.size() && snapped[gb];
-            const ChVector3d pa = a.nodePosition(pair.nodeA);
-            const ChVector3d pb = b.nodePosition(pair.nodeB);
-            ChVector3d target;
-            if (lockedA)
-                target = pa;
-            else if (lockedB)
-                target = pb;
-            else
-                target = 0.5 * (pa + pb);
-            // Kissing tet skins only need a sub-millimetre close. 0.6 t was
-            // for mid-plane shells whose edges sit 0.5√2 t apart; on a solid
-            // panel it yanks the outer CAD edge into the face.
-            const double snapReach = volumeWeld ? kiss : std::max(kiss, shellGap);
-            trySnap(a, definition.partA, pair.nodeA, target, snapReach);
-            trySnap(b, definition.partB, pair.nodeB, target, snapReach);
-            pair.position = 0.5 * (a.nodePosition(pair.nodeA) + b.nodePosition(pair.nodeB));
-        }
-    }
+    (void)snapped;
+    (void)kiss;
 
     const double throat =
         definition.throat > 0.0 ? definition.throat : std::min(a.thickness(), b.thickness());
-    const double allowable =
+    const double parentAllowable =
         std::min(a.material().weldShearStrength, b.material().weldShearStrength) *
         definition.strengthScale;
+    double allowable = definition.interface.shearStrength > 0.0
+                           ? definition.interface.shearStrength * definition.strengthScale
+                           : parentAllowable;
+    if (definition.interface.boundedByParents)
+        allowable = std::min(allowable, parentAllowable);
     const bool closedLoop = definition.bead.size() >= 3;
     const double faceArea = closedLoop ? closedBeadArea(definition.bead) : 0.0;
     const double peri = closedLoop ? beadPerimeter(definition.bead) : 0.0;
@@ -713,25 +690,24 @@ void Assembly::buildWeld(chrono::ChSystem& system,
         }
         const double breakForce = allowable * area;
         const double breakTorque = breakForce * throat;
+        const double peelPa = definition.interface.peelStrength > 0.0
+                                  ? definition.interface.peelStrength * definition.strengthScale
+                                  : (definition.peelStrength > 0.0
+                                         ? definition.peelStrength * definition.strengthScale
+                                         : allowable);
+        const double derivedGc =
+            std::min(modeIReleaseRate(a.material()), modeIReleaseRate(b.material()));
+        const double release = definition.interface.releaseRate > 0.0 ? definition.interface.releaseRate
+                                                                      : derivedGc;
+        const double opening = cohesiveCriticalOpening(std::max(allowable, peelPa), release, throat);
+        chrono::ChVector3d tangent = definition.bead.size() >= 2 ? definition.bead[1] - definition.bead[0]
+                                                                 : chrono::ChVector3d{1, 0, 0};
+        chrono::ChVector3d axis = tangent.Cross(b.center() - a.center());
+        if (axis.Length2() < 1.0e-12)
+            axis = {0, 1, 0};
         addLink(system, joint, definition.partA, pairs[i].nodeA, definition.partB, pairs[i].nodeB,
-                breakForce, breakTorque, true, translationSet, rotationSet);
-        if (!joint.links.empty()) {
-            JointLink& entry = joint.links.back();
-            const double peelPa = definition.peelStrength > 0.0
-                                      ? definition.peelStrength * definition.strengthScale
-                                      : allowable;
-            entry.breakPeel = peelPa * area;
-            const double weakerGc = std::max(modeIReleaseRate(a.material()), modeIReleaseRate(b.material()));
-            entry.criticalOpening = cohesiveCriticalOpening(std::max(allowable, peelPa), weakerGc, throat);
-            chrono::ChVector3d tangent = definition.bead.size() >= 2 ? definition.bead[1] - definition.bead[0]
-                                                                     : chrono::ChVector3d{1, 0, 0};
-            chrono::ChVector3d axis = tangent.Cross(b.center() - a.center());
-            if (axis.Length2() < 1.0e-12)
-                axis = {0, 1, 0};
-            entry.peelAxis = axis.GetNormalized();
-            const chrono::ChVector3d sep0 = b.nodePosition(pairs[i].nodeB) - a.nodePosition(pairs[i].nodeA);
-            entry.restGap = sep0.Length();
-        }
+                breakForce, breakTorque, true, translationSet, rotationSet, peelPa * area, opening,
+                axis.GetNormalized());
     }
 
     if (!joint.links.empty())
@@ -815,7 +791,8 @@ void Assembly::buildScrew(chrono::ChSystem& system,
     // Extra flange pairs lock rotation; they are not extra bolts. Splitting
     // the proof load made a 0.3× tug pop the first pair.
     addLink(system, joint, definition.partA, flange[0].a, definition.partB, flange[0].b, breakForce,
-            breakForce * d * 0.5, definition.locksRotation, translationSet, rotationSet);
+            breakForce * d * 0.5, definition.locksRotation, translationSet, rotationSet, 0.0, 0.0,
+            {0.0, 1.0, 0.0});
     for (std::size_t i = 1; i < flange.size(); ++i)
         createLink(system, joint, definition.partA, flange[i].a, definition.partB, flange[i].b, breakForce,
                    breakForce * d * 0.5, definition.locksRotation, definition.locksRotation);
@@ -854,6 +831,13 @@ void Assembly::place(const InitialState& state) {
             } else if (entry.pointLink) {
                 entry.pointLink->Initialize(_parts[entry.partA].xyzNodes()[entry.nodeA],
                                             _parts[entry.partB].xyzNodes()[entry.nodeB]);
+            } else if (entry.offsetLink) {
+                entry.offsetLink->Initialize(_parts[entry.partA].xyzNodes()[entry.nodeA],
+                                             _parts[entry.partB].xyzNodes()[entry.nodeB]);
+                const ChVector3d sep = _parts[entry.partA].nodePosition(entry.nodeA) -
+                                       _parts[entry.partB].nodePosition(entry.nodeB);
+                entry.offsetLink->SetRestOffset(sep);
+                entry.restGap = sep.Length();
             } else if (entry.frameLink) {
                 const bool rotA = _parts[entry.partA].rotational();
                 const std::size_t xyzPart = rotA ? entry.partB : entry.partA;
@@ -1036,14 +1020,110 @@ bool Assembly::applyLoads(const Environment& environment,
         _contactWorld->stepSize = dt;
     // The floor, the walls and the ceiling are implicit loads. They are only
     // refreshed here; the integrator evaluates them inside the step.
-    const bool contactsChanged = syncContacts(environment);
-    applyPartContact(environment, dt);
+    bool contactsChanged = syncContacts(environment);
+    ++_penaltyStamp;
+    ++_pairStamp;
+    _pairsChanged = false;
+    // A rebuilt skin or a frozen node can leave a pair pointing at a node
+    // the solver no longer integrates. Every pair is found again from scratch.
+    if (contactsChanged)
+        sweepPairContacts(true);
+    if (_contactContainer)
+        applyPartContact(environment, dt);
+    sweepPairContacts();
+    contactsChanged = contactsChanged || _pairsChanged;
     applyShardContact(environment, dt);
     applyUserLoads(loads, time);
 
     for (auto& part : _parts)
         part.commitLoads();
     return contactsChanged;
+}
+
+void Assembly::requestPairContact(std::size_t nodeSide,
+                                  std::size_t node,
+                                  std::size_t faceSide,
+                                  const std::array<int, 3>& tri,
+                                  const ChVector3d& normal,
+                                  double wa,
+                                  double wb,
+                                  double wc,
+                                  double reach,
+                                  double stiffness,
+                                  double friction,
+                                  double stickSpeed) {
+    const std::size_t count = _parts.size();
+    const std::uint64_t key = (static_cast<std::uint64_t>(nodeSide * count + faceSide) << 32) |
+                              static_cast<std::uint64_t>(node);
+    PairContact& slot = _pairContacts[key];
+    if (!slot.load || slot.tri != tri) {
+        std::vector<std::shared_ptr<chrono::ChLoadable>> loadables;
+        std::vector<NodeFaceContact::Corner> corners;
+        auto add = [&](Part& part, std::size_t index) {
+            NodeFaceContact::Corner corner;
+            if (index < part.xyzNodes().size() && part.xyzNodes()[index])
+                corner.xyz = part.xyzNodes()[index];
+            else if (index < part.nodes().size() && part.nodes()[index])
+                corner.rot = part.nodes()[index];
+            else
+                return false;
+            const bool fixed = corner.xyz ? corner.xyz->IsFixed() : corner.rot->IsFixed();
+            if (!fixed) {
+                if (corner.xyz)
+                    loadables.push_back(corner.xyz);
+                else
+                    loadables.push_back(corner.rot);
+            }
+            corners.push_back(corner);
+            return true;
+        };
+        bool ok = add(_parts[nodeSide], node);
+        for (int k = 0; k < 3 && ok; ++k)
+            ok = add(_parts[faceSide], static_cast<std::size_t>(tri[k]));
+        if (slot.load) {
+            auto& list = _contactContainer->GetLoadList();
+            list.erase(std::remove(list.begin(), list.end(), std::static_pointer_cast<chrono::ChLoadBase>(slot.load)),
+                       list.end());
+            slot.load.reset();
+            _pairsChanged = true;
+        }
+        if (!ok || loadables.empty()) {
+            _pairContacts.erase(key);
+            return;
+        }
+        slot.load = chrono_types::make_shared<NodeFaceContact>(loadables, std::move(corners));
+        slot.tri = tri;
+        _contactContainer->Add(slot.load);
+        _pairsChanged = true;
+    }
+    slot.stamp = _pairStamp;
+    slot.load->configure(normal, {1.0, -wa, -wb, -wc}, reach, stiffness, friction, stickSpeed,
+                         _contactWorld ? _contactWorld->restitution : 0.15);
+}
+
+void Assembly::sweepPairContacts(bool all) {
+    for (auto it = _pairContacts.begin(); it != _pairContacts.end();) {
+        if (!all && it->second.stamp == _pairStamp) {
+            ++it;
+            continue;
+        }
+        if (it->second.load && _contactContainer) {
+            auto& list = _contactContainer->GetLoadList();
+            list.erase(std::remove(list.begin(), list.end(),
+                                   std::static_pointer_cast<chrono::ChLoadBase>(it->second.load)),
+                       list.end());
+        }
+        it = _pairContacts.erase(it);
+        _pairsChanged = true;
+    }
+}
+
+double Assembly::penaltyDamping(std::uint64_t key, double vn) {
+    ApproachLatch& latch = _penaltyApproach[key];
+    if (latch.stamp + 1 != _penaltyStamp && latch.stamp != _penaltyStamp)
+        latch.speed = std::max(0.0, -vn);
+    latch.stamp = _penaltyStamp;
+    return huntCrossleyFactor(_contactWorld ? _contactWorld->restitution : 0.15, latch.speed);
 }
 
 void Assembly::applyGravity(const chrono::ChVector3d& gravity) {
@@ -1154,8 +1234,16 @@ void Assembly::applyShardContact(const Environment& environment, double dt) {
                     const double mass = other.nodeMass()[i];
                     const double patch = 0.5 * face.Length();
                     const ContactGains gains = continuumGains(owner.material().youngsModulus, patch, mass);
+                    const std::uint64_t key =
+                        (std::uint64_t{1} << 63) |
+                        ((static_cast<std::uint64_t>(&owner - _parts.data()) * 1000003u +
+                          static_cast<std::uint64_t>(&shard - owner.shards().data())) * 131u +
+                         static_cast<std::uint64_t>(&other - _parts.data())) << 24 ^
+                        static_cast<std::uint64_t>(i);
+                    const double spring = gains.stiffness * overlap;
+                    const double D = penaltyDamping(key, vn);
                     const double fn =
-                        gains.stiffness * overlap - contactDashpot(gains.stiffness, mass, vn, 1.0e-3) * vn;
+                        spring * huntCrossleyScale(D, vn, _penaltyApproach[key].speed).scale;
                     if (fn <= 0.0)
                         continue;
                     other.addLoad(i, outward * fn);
@@ -1278,7 +1366,7 @@ bool Assembly::syncContacts(const Environment& environment) {
             if (i >= area.size() || area[i] <= 0.0)
                 return false;
             if (i < part.xyzNodes().size() && part.xyzNodes()[i] && !part.xyzNodes()[i]->IsFixed())
-                return part.nodeOnLiveTet(i);
+                return part.hasVolume() ? part.nodeOnLiveTet(i) : part.nodeOnLiveShell(i);
             if (i < part.nodes().size() && part.nodes()[i] && !part.nodes()[i]->IsFixed())
                 return true;
             return false;
@@ -1385,6 +1473,9 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
         Part& nodePart = _parts[nodeSide];
         Part& facePart = _parts[faceSide];
         const double reach = nodePart.contactSkin() + facePart.contactSkin();
+        // A pair is built a skin depth before it touches, so the step that
+        // closes the gap already carries the contact stiffness.
+        const double search = 2.0 * reach;
         const auto& faces = facePart.triangles();
         if (faces.empty() || nodePart.nodeCount() == 0)
             return false;
@@ -1507,34 +1598,12 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
                     wa = wb = wc = 1.0 / 3.0;
                 }
                 const auto& tri = faces[static_cast<std::size_t>(bestTri)];
-                const ChVector3d faceVelocity = facePart.nodeVelocity(tri[0]) * wa +
-                                                facePart.nodeVelocity(tri[1]) * wb +
-                                                facePart.nodeVelocity(tri[2]) * wc;
-                const ChVector3d relative = nodePart.nodeVelocity(i) - faceVelocity;
-                const double vn = relative.Dot(normal);
                 const double patch =
                     0.5 * (bestB - bestA).Cross(bestC - bestA).Length();
                 const ContactGains gains =
                     nodeFaceGains(nodePart, facePart, i, tri[0], tri[1], tri[2], patch);
-                const double overlap = std::min(reach + best, 3.0 * std::max(reach, 1.0e-3));
-                const double mNode = i < nodePart.nodeMass().size() ? nodePart.nodeMass()[i] : 0.0;
-                double fn = forceScale * (gains.stiffness * overlap -
-                                          contactDashpot(gains.stiffness, mNode, vn, vStick) * vn);
-                if (fn <= 0.0)
-                    continue;
-                ChVector3d force = normal * fn;
-                const ChVector3d vt = relative - normal * vn;
-                const double vtMagnitude = vt.Length();
-                if (vtMagnitude > 1.0e-9) {
-                    double ft = mu * fn;
-                    if (vtMagnitude < vStick)
-                        ft *= vtMagnitude / vStick;
-                    force -= vt * (ft / vtMagnitude);
-                }
-                nodePart.addLoad(i, force);
-                facePart.addLoad(static_cast<std::size_t>(tri[0]), force * -wa);
-                facePart.addLoad(static_cast<std::size_t>(tri[1]), force * -wb);
-                facePart.addLoad(static_cast<std::size_t>(tri[2]), force * -wc);
+                requestPairContact(nodeSide, i, faceSide, {tri[0], tri[1], tri[2]}, normal, wa, wb, wc, reach,
+                                   forceScale * gains.stiffness, mu, vStick);
                 continue;
             }
             if (skipProximity)
@@ -1549,6 +1618,11 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
                 std::fill(seen.begin(), seen.end(), 0);
                 stamp = 1;
             }
+            double nearest = search;
+            int pick = -1;
+            ChVector3d pickNormal;
+            std::array<double, 3> pickW{};
+            double pickPatch = 0.0;
             for (int dx = -1; dx <= 1; ++dx) {
                 for (int dy = -1; dy <= 1; ++dy) {
                     for (int dz = -1; dz <= 1; ++dz) {
@@ -1598,7 +1672,7 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
                 // same plane, is not inside the shell, and treating that
                 // lateral gap as penetration kicks crack faces apart.
                 const double planeGap = (p - a).Dot(nHat);
-                if (std::abs(planeGap) >= reach)
+                if (std::abs(planeGap) >= search)
                     continue;
                 const ChVector3d projected = p - nHat * planeGap;
                 double wa, wb, wc;
@@ -1607,55 +1681,36 @@ void Assembly::applyPartContact(const Environment& environment, double dt) {
                 if (wa <= 1.0e-3 || wb <= 1.0e-3 || wc <= 1.0e-3)
                     continue;
                 const double distance = std::abs(planeGap);
-                touching = true;
-                if (!apply)
+                touching = touching || distance < reach;
+                if (!apply || distance >= nearest)
                     continue;
-
-                ChVector3d normal = planeGap >= 0.0 ? nHat : -nHat;
-                if (!self) {
-                    ChVector3d& previous = _contactNormal[nodeSide * count + faceSide];
-                    if (previous.Length() > 0.5) {
-                        if (normal.Dot(previous) < 0.0)
-                            normal = -normal;
-                        if (normal.Dot(previous) < 0.5)
-                            normal = previous;
-                    }
-                    previous = normal;
-                }
-
-                const ChVector3d faceVelocity = facePart.nodeVelocity(tri[0]) * wa +
-                                                facePart.nodeVelocity(tri[1]) * wb +
-                                                facePart.nodeVelocity(tri[2]) * wc;
-                const ChVector3d relative = nodePart.nodeVelocity(i) - faceVelocity;
-                const double vn = relative.Dot(normal);
-                (void)fresh;
-                const ContactGains gains =
-                    nodeFaceGains(nodePart, facePart, i, tri[0], tri[1], tri[2], 0.5 * faceLen);
-                const double overlap = reach - distance;
-                const double mNode = i < nodePart.nodeMass().size() ? nodePart.nodeMass()[i] : 0.0;
-                double fn = forceScale * (gains.stiffness * overlap -
-                                          contactDashpot(gains.stiffness, mNode, vn, vStick) * vn);
-                if (fn <= 0.0)
-                    continue;
-
-                ChVector3d force = normal * fn;
-                const ChVector3d vt = relative - normal * vn;
-                const double vtMagnitude = vt.Length();
-                if (vtMagnitude > 1.0e-9) {
-                    double ft = mu * fn;
-                    if (vtMagnitude < vStick)
-                        ft *= vtMagnitude / vStick;
-                    force -= vt * (ft / vtMagnitude);
-                }
-
-                nodePart.addLoad(i, force);
-                facePart.addLoad(static_cast<std::size_t>(tri[0]), force * -wa);
-                facePart.addLoad(static_cast<std::size_t>(tri[1]), force * -wb);
-                facePart.addLoad(static_cast<std::size_t>(tri[2]), force * -wc);
+                nearest = distance;
+                pick = t;
+                pickNormal = planeGap >= 0.0 ? nHat : -nHat;
+                pickW = {wa, wb, wc};
+                pickPatch = 0.5 * faceLen;
                         }
                     }
                 }
             }
+            if (pick < 0)
+                continue;
+            ChVector3d normal = pickNormal;
+            if (!self) {
+                ChVector3d& previous = _contactNormal[nodeSide * count + faceSide];
+                if (previous.Length() > 0.5) {
+                    if (normal.Dot(previous) < 0.0)
+                        normal = -normal;
+                    if (normal.Dot(previous) < 0.5)
+                        normal = previous;
+                }
+                previous = normal;
+            }
+            (void)fresh;
+            const auto& tri = faces[static_cast<std::size_t>(pick)];
+            const ContactGains gains = nodeFaceGains(nodePart, facePart, i, tri[0], tri[1], tri[2], pickPatch);
+            requestPairContact(nodeSide, i, faceSide, {tri[0], tri[1], tri[2]}, normal, pickW[0], pickW[1],
+                               pickW[2], reach, forceScale * gains.stiffness, mu, vStick);
         }
         return touching;
     };
@@ -1753,6 +1808,7 @@ bool Assembly::updateJoints(double dt) {
         };
         drop(entry.link);
         drop(entry.pointLink);
+        drop(entry.offsetLink);
         drop(entry.frameLink);
         entry.broken = true;
         entry.filteredForce = 0.0;
@@ -1765,7 +1821,7 @@ bool Assembly::updateJoints(double dt) {
 
     for (auto& joint : _joints) {
         for (auto& entry : joint.links) {
-            if (entry.broken || (!entry.link && !entry.pointLink && !entry.frameLink))
+            if (entry.broken || (!entry.link && !entry.pointLink && !entry.offsetLink && !entry.frameLink))
                 continue;
 
             if (entry.partA < _parts.size() && entry.partB < _parts.size()) {
@@ -1807,6 +1863,9 @@ bool Assembly::updateJoints(double dt) {
                 torque = reaction.torque.Length();
             } else if (entry.pointLink) {
                 forceVec = entry.pointLink->GetReactionOnNode1();
+                force = forceVec.Length();
+            } else if (entry.offsetLink) {
+                forceVec = entry.offsetLink->GetReactionOnNode1();
                 force = forceVec.Length();
             } else if (entry.frameLink) {
                 forceVec = entry.frameLink->GetReactionOnNode();
@@ -1866,7 +1925,7 @@ bool Assembly::updateJoints(double dt) {
         }
 
         for (auto& entry : joint.links) {
-            if (entry.broken || (!entry.link && !entry.pointLink && !entry.frameLink))
+            if (entry.broken || (!entry.link && !entry.pointLink && !entry.offsetLink && !entry.frameLink))
                 continue;
             double utilisation =
                 entry.breakForce > 0.0 ? entry.filteredForce / entry.breakForce : 0.0;
@@ -1985,6 +2044,9 @@ int Assembly::activeContactCount() const {
                 ++count;
         }
     }
+    for (const auto& [key, pair] : _pairContacts)
+        if (pair.load && pair.load->gap() > 0.0)
+            ++count;
     return count;
 }
 
@@ -2052,6 +2114,40 @@ double Assembly::minTimeToContact(const chrono::ChVector3d& gravity) const {
         }
     }
     return soonest;
+}
+
+double Assembly::contactHalfPeriod() const {
+    if (!_contactWorld)
+        return kNoContactTime;
+    double shortest = kNoContactTime;
+    for (std::size_t p = 0; p < _parts.size(); ++p) {
+        const Part& part = _parts[p];
+        const double offset = part.contactOffset();
+        const std::size_t nMax = p < _contacts.size() ? _contacts[p].size() : 0;
+        for (std::size_t i = 0; i < nMax; ++i) {
+            const auto& contact = _contacts[p][i];
+            if (!contact || !contact->active() || contact->stiffness() <= 0.0)
+                continue;
+            if (_contactWorld->floorEnabled &&
+                part.nodePosition(i).y() >= _contactWorld->floorHeight + offset)
+                continue;
+            const double m = i < part.nodeMass().size() ? part.nodeMass()[i] : 0.0;
+            if (m <= 1.0e-12)
+                continue;
+            shortest = std::min(shortest, 3.14159265358979323846 * std::sqrt(m / contact->stiffness()));
+        }
+    }
+    return shortest;
+}
+
+void Assembly::commitContactApproach() {
+    for (auto& contacts : _contacts)
+        for (auto& contact : contacts)
+            if (contact)
+                contact->commitApproach();
+    for (auto& [key, pair] : _pairContacts)
+        if (pair.load)
+            pair.load->commitApproach();
 }
 
 double Assembly::maxContactPenetration() const {
@@ -2213,8 +2309,12 @@ double Assembly::contactElasticEnergy() const {
             return;
         const auto spring = [&](const chrono::ChVector3d& n, double plane) {
             const double gap = plane + offset - p.Dot(n);
-            if (gap > 0.0)
-                energy += 0.5 * k * gap * gap;
+            if (gap <= 0.0)
+                return;
+            const double soft = kContactSoftening;
+            energy += gap < soft ? k * gap * gap * gap / (6.0 * soft)
+                                 : k * (soft * soft / 6.0 + 0.5 * (gap - soft) * (gap - soft) +
+                                        0.5 * soft * (gap - soft));
         };
         if (_contactWorld->floorEnabled)
             spring(chrono::ChVector3d(0, 1, 0), _contactWorld->floorHeight);
@@ -2234,6 +2334,9 @@ double Assembly::contactElasticEnergy() const {
             add(part.nodePosition(i), offset, _contacts[p][i]->stiffness());
         }
     }
+    for (const auto& [key, pair] : _pairContacts)
+        if (pair.load)
+            energy += pair.load->elasticEnergy();
     return energy;
 }
 
@@ -2810,6 +2913,7 @@ bool Assembly::tearOverstretched() {
                 };
                 drop(entry.link);
                 drop(entry.pointLink);
+                drop(entry.offsetLink);
                 drop(entry.frameLink);
                 entry.broken = true;
                 changed = true;
@@ -2888,6 +2992,15 @@ bool Assembly::respan() {
         }
         createLink(*_system, *joint, skipped.partA, skipped.nodeA, skipped.partB, skipped.nodeB,
                    skipped.breakForce, skipped.breakTorque, skipped.wantRotation, lockRotation);
+        if (!joint->links.empty()) {
+            JointLink& created = joint->links.back();
+            created.breakPeel = skipped.breakPeel;
+            created.criticalOpening = skipped.criticalOpening;
+            created.peelAxis = skipped.peelAxis;
+            const chrono::ChVector3d sep = _parts[skipped.partB].nodePosition(skipped.nodeB) -
+                                           _parts[skipped.partA].nodePosition(skipped.nodeA);
+            created.restGap = sep.Length();
+        }
         added = true;
     }
     _deferred.swap(still);

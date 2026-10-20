@@ -3,6 +3,7 @@
 #include "physics_core/assembly.hpp"
 #include "physics_core/recording.hpp"
 #include "physics_core/scenario.hpp"
+#include "physics_core/solver_stats.hpp"
 
 #include "chrono/physics/ChSystemSMC.h"
 #include "chrono/timestepper/ChTimestepperExplicit.h"
@@ -59,6 +60,7 @@ public:
     int newtonRejectCount() const { return _newtonRejects; }
     /// HHT substeps that kept a finite, non-inverted iterate.
     int hhtCommitCount() const { return _hhtCommits; }
+    const SolverStats& stats() const { return _stats; }
 
 private:
     void refreshLinearSolver();
@@ -72,6 +74,7 @@ private:
     bool _contactStepFailed = false;
     int _newtonRejects = 0;
     int _hhtCommits = 0;
+    SolverStats _stats;
     int _prevContactCount = -1;
     int _newtonSuccessStreak = 0;
     double _localH = 0.0;

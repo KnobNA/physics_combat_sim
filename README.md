@@ -41,11 +41,13 @@ CAD / test cube  →  mesh (tet / shell)  →  Chrono FEA system
 
 1. **Definition** — parts carry material, thickness, and either an authored panel, a surface mesh (OBJ/STL), or a volume mesh produced at simulate time.
 2. **Meshing** — `ensurePartMesh` decides shell vs solid from thickness over span. `throughThickness` only sets how many layers a solid gets. Slender metal and brittle walls are midsurface shells. A finite-strain material has no linear shell, so a thin rubber patch is refused and a closed rubber body is tet-filled.
-3. **Assembly** — kissing skins get coincident node ties (`ChLinkNodeNode`); shell seams keep rest gap (`OffsetNodeWeld`); mixed shell–solid uses frame links where needed.
+3. **Assembly** — coincident volume nodes share a zero-length tie. A shell seam keeps the separation the mesh already has, including a midsurface offset of half the thickness. Mixed shell–solid uses a frame link where one side carries rotation.
 4. **Solve** — each user timestep may cut back on contact onset; Newton / HHT residuals drive rejects. Failed weld links disable without aborting the whole run when possible.
 5. **Record** — node poses, stress peaks, temperatures, and joint state are stored for offline scrubbing so the viewport stays interactive during the worker solve.
 
 The built-in test cube stands in for a CAD robot: six independent shell panels, twelve welds, drop or rest on a floor. That is the reference path for “does a welded box stay together.”
+
+Idealization and joints key off geometry and material fields (thickness over span, continuum mode, strengths, release rate), not the material’s name. The welded box is a fixture of that rule, not a privileged path. A brittle crack is a face separation inside the existing mesh: both sides stay in the FEA solve. It is not an XFEM enrichment.
 
 ## Requirements
 

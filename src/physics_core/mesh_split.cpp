@@ -1375,14 +1375,13 @@ bool ensurePartMesh(PartDefinition& part) {
         const double span = std::max(part.patch.uSize, part.patch.vSize);
         const bool slender = isSlenderWall(thickness, span);
         // A slender patch is a Reissner shell when that element is legal.
-        // Finite-strain materials have no such shell: refuse the patch rather
-        // than extrude locking tets. A bulky patch stays a solid even when the
+        // Finite-strain materials have no such shell, so they get a layered
+        // hyperelastic solid, as rubber sheet is modelled in production FE.
+        // A small-strain shell at rubber stretches twists and wrinkles until
+        // Newton cannot follow it. A bulky patch stays a solid even when the
         // tet budget is tight; coarsen it, do not flip it back to a shell.
-        if (slender) {
-            if (!linearShellAllowed(part.material))
-                return false;
+        if (slender && linearShellAllowed(part.material))
             return keepAsShell(thickness, localH, divU, divV);
-        }
         layers = std::max(layers, 3);
         while (6 * divU * divV * layers > cap && (divU > 1 || divV > 1)) {
             localH *= 1.25;

@@ -57,3 +57,9 @@ credentials.json
 .cache/
 .clangd/
 .cache/clangd/
+
+# Cursor session artifacts (debug logs, plans, agent state)
+.cursor/
+
+# AGPL TetGen is vendored locally for the Windows build and must stay untracked.
+/external/tetgen/

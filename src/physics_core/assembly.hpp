@@ -16,7 +16,9 @@
 #include <utility>
 
 #include <cstddef>
+#include <cstdint>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace rcs {
@@ -113,13 +115,19 @@ public:
     void applyFloorBounce(const Environment& environment, bool newtonFailed = false);
     /// True when any live node is within `pad` of the floor contact plane.
     bool touchingFloor(const Environment& environment, double pad) const;
-    /// Surface nodes currently penetrating any arena plane (floor, walls, ceiling).
+    /// Surface nodes currently penetrating any arena plane (floor, walls,
+    /// ceiling) or another part's face.
     int activeContactCount() const;
     /// Fastest closing speed of a live contact node into an arena plane, m/s.
     double maxApproachSpeed() const;
     /// Soonest time for a live skin node to reach an arena plane under
     /// `gravity`. 0 if already on/in a plane; `kNoContactTime` if none close.
     double minTimeToContact(const chrono::ChVector3d& gravity) const;
+    /// Shortest half period π√(m/k) over penetrating contact nodes, seconds.
+    /// `kNoContactTime` when nothing touches.
+    double contactHalfPeriod() const;
+    /// Latch each clear node's velocity as its contact approach velocity.
+    void commitContactApproach();
     /// Deepest live-node penetration into any arena plane, metres.
     double maxContactPenetration() const;
     /// Deepest floor overshoot of a free node, metres. 0 if none or no floor.
@@ -202,7 +210,7 @@ private:
                     bool wantRotationLock,
                     bool lockRotation);
 
-    void addLink(chrono::ChSystem& system,
+    bool addLink(chrono::ChSystem& system,
                  Joint& joint,
                  std::size_t partA,
                  std::size_t nodeA,
@@ -212,7 +220,10 @@ private:
                  double breakTorque,
                  bool wantRotationLock,
                  std::vector<int>& translationSet,
-                 std::vector<int>& rotationSet);
+                 std::vector<int>& rotationSet,
+                 double breakPeel,
+                 double criticalOpening,
+                 const chrono::ChVector3d& peelAxis);
 
     void applyGravity(const chrono::ChVector3d& gravity);
     void applyAerodynamics(const Environment& environment);
@@ -240,6 +251,9 @@ private:
         std::size_t nodeB = 0;
         double breakForce = 0.0;
         double breakTorque = 0.0;
+        double breakPeel = 0.0;
+        double criticalOpening = 0.0;
+        chrono::ChVector3d peelAxis{0.0, 1.0, 0.0};
         bool wantRotation = false;
         std::string label;
         JointKind kind = JointKind::Weld;
@@ -276,6 +290,43 @@ private:
     std::vector<std::array<std::size_t, 3>> _contactShape;
     /// Last part-pair contact normal, so a closest-point jump cannot kick sideways.
     std::vector<chrono::ChVector3d> _contactNormal;
+    /// Hunt-Crossley approach speed per shard penalty contact, latched when
+    /// the contact opens. A contact not seen on the previous evaluation is
+    /// new and re-latches.
+    struct ApproachLatch {
+        double speed = 0.0;
+        unsigned stamp = 0;
+    };
+    std::unordered_map<std::uint64_t, ApproachLatch> _penaltyApproach;
+    unsigned _penaltyStamp = 0;
+    double penaltyDamping(std::uint64_t key, double vn);
+    /// Implicit node-to-face contacts between parts, keyed by part pair and
+    /// node. A pair not found on a user step is removed; a pair whose
+    /// triangle changed is rebuilt. Either changes the solver structure.
+    struct PairContact {
+        std::shared_ptr<NodeFaceContact> load;
+        std::array<int, 3> tri{-1, -1, -1};
+        unsigned stamp = 0;
+    };
+    std::unordered_map<std::uint64_t, PairContact> _pairContacts;
+    unsigned _pairStamp = 0;
+    bool _pairsChanged = false;
+    /// Pool the contact of `node` on `nodePart` against triangle `tri` of
+    /// `facePart` for this user step.
+    void requestPairContact(std::size_t nodeSide,
+                            std::size_t node,
+                            std::size_t faceSide,
+                            const std::array<int, 3>& tri,
+                            const chrono::ChVector3d& normal,
+                            double wa,
+                            double wb,
+                            double wc,
+                            double reach,
+                            double stiffness,
+                            double friction,
+                            double stickSpeed);
+    /// Drop the pair contacts not requested this user step, or all of them.
+    void sweepPairContacts(bool all = false);
     struct LoadTarget {
         std::size_t part = 0;
         std::size_t node = 0;

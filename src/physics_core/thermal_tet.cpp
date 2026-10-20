@@ -439,6 +439,14 @@ void ThermalTet4::copyPlasticFrom(const ThermalTet4& other) {
     _damage = other._damage;
 }
 
+double ThermalTet4::bulkViscosity() const {
+    if (_yield > 0.0 || _rankineTension > 0.0)
+        return 0.0;
+    const double length = std::cbrt(std::max(6.0 * _volume, 1.0e-18));
+    const double wave = std::sqrt(std::max(_youngs * _stiffness, 1.0) / _density);
+    return _density * wave * length;
+}
+
 void ThermalTet4::ComputeKRMmatricesGlobal(chrono::ChMatrixRef H, double Kfactor, double Rfactor, double Mfactor) {
     if (!_ready)
         rebuildReference();
@@ -457,6 +465,17 @@ void ThermalTet4::ComputeKRMmatricesGlobal(chrono::ChMatrixRef H, double Kfactor
     chrono::fea::ChMatrixCorotation::ComputeCK(_K, _rotation, 4, CK);
     chrono::fea::ChMatrixCorotation::ComputeKCt(CK, _rotation, 4, CKCt);
     H = (Kfactor + Rfactor * _beta) * CKCt;
+    if (const double eta = bulkViscosity(); eta > 0.0 && Rfactor != 0.0) {
+        ChMatrixDynamic<> volumetric(6, 6);
+        volumetric.setZero();
+        for (int i = 0; i < 3; ++i)
+            for (int j = 0; j < 3; ++j)
+                volumetric(i, j) = eta;
+        const ChMatrixDynamic<> damp = _volume * (_B.transpose() * volumetric * _B);
+        chrono::fea::ChMatrixCorotation::ComputeCK(damp, _rotation, 4, CK);
+        chrono::fea::ChMatrixCorotation::ComputeKCt(CK, _rotation, 4, CKCt);
+        H += Rfactor * CKCt;
+    }
     if (Mfactor != 0.0) {
         const double lump = _volume * _density / 4.0;
         for (int id = 0; id < 12; ++id)
@@ -508,18 +527,12 @@ void ThermalTet4::ComputeInternalForces(ChVectorDynamic<>& Fi) {
     ChVectorDynamic<> speed(12);
     deformationalSpeed(speed);
     localForce += _beta * (_K * speed);
-    if (_yield <= 0.0 && _rankineTension <= 0.0) {
+    if (const double eta = bulkViscosity(); eta > 0.0) {
         const ChVectorDynamic<> rate = _B * speed;
-        const double tr = rate(0) + rate(1) + rate(2);
-        if (tr < 0.0) {
-            const double length = std::cbrt(std::max(6.0 * _volume, 1.0e-18));
-            const double wave = std::sqrt(std::max(_youngs * _stiffness, 1.0) / _density);
-            const double q = _density * wave * length * (-tr);
-            ChVectorDynamic<> bulk(6);
-            bulk.setZero(6);
-            bulk(0) = bulk(1) = bulk(2) = q;
-            localForce += _B.transpose() * bulk * _volume;
-        }
+        ChVectorDynamic<> bulk(6);
+        bulk.setZero(6);
+        bulk(0) = bulk(1) = bulk(2) = eta * (rate(0) + rate(1) + rate(2));
+        localForce += _B.transpose() * bulk * _volume;
     }
     localForce *= -1.0;
     chrono::fea::ChMatrixCorotation::ComputeCK(localForce, _rotation, 4, Fi);

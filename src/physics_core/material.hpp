@@ -162,18 +162,10 @@ inline double thermalStiffnessRetention(const Material& material, double kelvin)
         temperatures = t;
         values = v;
         count = 4;
-    } else if (material.meltTemperature >= 1400.0) {
-        // Eurocode 3 Table 3.1, k_E. Structural steel is effectively gone
-        // by 1200 °C, well before the liquidus.
-        static const double t[] = {293.15, 373.0, 473.0, 573.0, 673.0, 773.0, 873.0,
-                                   973.0, 1073.0, 1173.0, 1273.0, 1373.0, 1473.0};
-        static const double v[] = {1.0, 1.0, 0.90, 0.80, 0.70, 0.60, 0.31, 0.13, 0.09, 0.0675, 0.045, 0.0225, 0.008};
-        axis = mapThermalAxis(kelvin, material.softenTemperature, material.meltTemperature, 600.0, 1780.0);
-        temperatures = t;
-        values = v;
-        count = 13;
     } else {
-        // 6061 modulus, from Kaufman, Properties of Aluminum Alloys.
+        // Ductile metals share one handbook curve. Solidus and the softening
+        // temperature place the material on that curve; a 2 K change of
+        // solidus must not switch tables.
         static const double t[] = {293.15, 373.0, 473.0, 573.0, 673.0, 773.0, 855.0};
         static const double v[] = {1.0, 0.97, 0.91, 0.76, 0.52, 0.25, 0.08};
         axis = mapThermalAxis(kelvin, material.softenTemperature, material.meltTemperature, 420.0, 855.0);
@@ -208,20 +200,8 @@ inline double thermalStrengthRetention(const Material& material, double kelvin) 
         temperatures = t;
         values = v;
         count = 4;
-    } else if (material.meltTemperature >= 1400.0) {
-        // Eurocode 3 k_y. Quenched wear plate tempers earlier than mild steel,
-        // so a yield above 1 GPa walks the same table at a faster rate.
-        static const double t[] = {293.15, 673.0, 773.0, 873.0, 973.0, 1073.0, 1173.0, 1273.0, 1373.0, 1473.0};
-        static const double v[] = {1.0, 1.0, 0.78, 0.47, 0.23, 0.11, 0.06, 0.04, 0.02, 0.008};
-        double lookup = kelvin;
-        if (material.yieldStress >= 1.0e9)
-            lookup = 293.15 + (kelvin - 293.15) * 1.45;
-        axis = mapThermalAxis(lookup, material.softenTemperature, material.meltTemperature, 600.0, 1780.0);
-        temperatures = t;
-        values = v;
-        count = 10;
     } else {
-        // 6061-T6 yield, ASM. About 80% at 150 °C, 12% at 260 °C, a few
+        // Ductile yield retention. Yield stress is not a table switch.
         // percent near the 582 °C solidus.
         static const double t[] = {293.15, 373.0, 422.0, 477.0, 533.0, 589.0, 700.0, 855.0};
         static const double v[] = {1.0, 0.95, 0.78, 0.38, 0.12, 0.06, 0.025, 0.012};
